@@ -1,0 +1,180 @@
+From 4097b33aaf369aa38231d27606de144fd5eb6756 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 04:53:24 -0700
+Subject: [PATCH] =?UTF-8?q?censor-range-ui:=20=E6=B6=88=E9=9F=B3=E8=8C=83?=
+ =?UTF-8?q?=E5=9B=B4=20presets=20(0.3/0.5/0.7=20s,=20custom=20values=20kep?=
+ =?UTF-8?q?t)=20instead=20of=20a=20ms=20spin=20box;=20delay=20row=20with?=
+ =?UTF-8?q?=20an=20Auto=20checkbox=20and=20a=20hint;=20manual=20delay=20fl?=
+ =?UTF-8?q?oor=20raised=20to=20range=20+=201.3=20s=20(X-ASR=204-character?=
+ =?UTF-8?q?=20words=20need=20up=20to=201.26=20s=20under=20full=20CPU=20loa?=
+ =?UTF-8?q?d)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp | 68 +++++++++++++++++++++++++++++++------------
+ src/plugin-config.hpp | 10 +++++--
+ 2 files changed, 57 insertions(+), 21 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index ccaa3b4..eba023c 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -594,25 +594,36 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     comboEffect->addItem("小黄人音效", 2);
+     comboEffect->addItem("电报音效", 3);
+     layoutAudio->addRow("替换成：", comboEffect);
+-    spinCensorPadding = new QSpinBox();
+-    spinCensorPadding->setRange(0, 5000);
+-    spinCensorPadding->setSingleStep(100);
+-    spinCensorPadding->setSuffix(" ms");
+-    spinCensorPadding->setToolTip("在命中词开始前和结束后各多消音这么长。\n会连带消掉相邻的正常声音；完全没识别出的词无法补救。");
+-    layoutAudio->addRow("命中词前后各多消：", spinCensorPadding);
+-    chkDelayAuto = new QCheckBox(QString("声音延迟自动设置（推荐）：前后多消 + %1 秒识别时间").arg(autoMargin));
+-    chkDelayAuto->setToolTip(QString("开启时声音延迟 = 前后多消 + %1 秒，只需调整前后多消。\n"
+-                                     "关闭后可手动设置，但不能低于 前后多消 + %2 秒，否则词头会在消音前播出。")
++    // The model's word timings are off by up to about 0.4 s (mostly the word's tail), so
++    // the range is extended on both sides; 0.2 s audibly leaked in listening tests (2026-11-08).
++    comboCensorRange = new QComboBox();
++    comboCensorRange->addItem("更窄：词前后各多盖 0.3 秒（可能漏出字头字尾）", 300);
++    comboCensorRange->addItem("标准：词前后各多盖 0.5 秒（推荐）", 500);
++    comboCensorRange->addItem("更宽：词前后各多盖 0.7 秒", 700);
++    comboCensorRange->setToolTip("识别给出的字词时间和实际发音有偏差（最多约 0.4 秒，多在词尾），\n"
++                                 "所以命中词前后要多盖一段。范围越宽越不容易漏，但会连带消掉旁边的正常字。\n"
++                                 "完全没识别出的词无法补救。");
++    layoutAudio->addRow("消音范围：", comboCensorRange);
++    chkDelayAuto = new QCheckBox("自动（推荐）");
++    chkDelayAuto->setToolTip(QString("自动：声音延迟 = 消音范围 + %1 秒识别时间，换消音范围时跟着变。\n"
++                                     "手动：不能低于 消音范围 + %2 秒，否则较长的词会在消音前播出。")
+                                  .arg(autoMargin, minMargin));
+-    layoutAudio->addRow("", chkDelayAuto);
+     spinDelay = new QSpinBox();
+     spinDelay->setRange(0, 10000);
+     spinDelay->setSingleStep(50);
+     spinDelay->setSuffix(" ms");
+     spinDelay->setToolTip("声音推迟播出的时长，让识别来得及在播出前找到并消掉命中词。\n"
+                           "OBS“设置 → 高级 → 串流延迟”只推迟已编码的推流，不参与消音；开启时观众还要再多等这么久。");
+-    layoutAudio->addRow("声音延迟：", spinDelay);
+-    connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
++    {
++        QHBoxLayout *row = new QHBoxLayout();
++        row->addWidget(spinDelay);
++        row->addWidget(chkDelayAuto);
++        row->addStretch();
++        layoutAudio->addRow("声音延迟：", row);
++    }
++    lblDelayHint = hint("");
++    layoutAudio->addRow("", lblDelayHint);
++    connect(comboCensorRange, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { updateDelayUI(); });
+     connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
+     comboSyncMode = new QComboBox();
+     comboSyncMode->addItem("自动（推荐）", 0);
+@@ -727,7 +738,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     // Qt 6.6 shipped with OBS 31.0 lacks, and the plugin would then fail to load.
+     WheelGuard *wheelGuard = new WheelGuard(scroll, this);
+     for (QWidget *w : std::initializer_list<QWidget *>{comboBroadcastMode, comboVoiceSource, comboEffect,
+-                                                       comboSyncMode, comboModel, spinCensorPadding,
++                                                       comboSyncMode, comboModel, comboCensorRange,
+                                                        spinDelay, spinModelOffset}) {
+         w->setFocusPolicy(Qt::StrongFocus);
+         w->installEventFilter(wheelGuard);
+@@ -807,7 +818,7 @@ void ConfigDialog::LoadToUI() {
+     
+     spinModelOffset->setValue(cfg->model_offset_ms);
+     spinDelay->setValue((int)(cfg->delay_seconds * 1000));
+-    spinCensorPadding->setValue(cfg->censor_padding_ms);
++    setCensorPaddingMs(cfg->censor_padding_ms);
+     
+     chkUsePinyin->setChecked(cfg->use_pinyin);
+     chkAsrDebugLogging->setChecked(cfg->asr_debug_logging);
+@@ -839,15 +850,34 @@ void ConfigDialog::LoadToUI() {
+     btnAdvanced->setChecked(advanced);
+ }
+ 
++int ConfigDialog::censorPaddingMs() const {
++    return comboCensorRange->currentData().toInt();
++}
++
++void ConfigDialog::setCensorPaddingMs(int ms) {
++    int i = comboCensorRange->findData(ms);
++    if (i < 0) {
++        // A value from an older version or an edited config keeps working, shown as its own item.
++        comboCensorRange->addItem(QString("自定义：词前后各多盖 %1 秒").arg(ms / 1000.0), ms);
++        i = comboCensorRange->count() - 1;
++    }
++    comboCensorRange->setCurrentIndex(i);
++}
++
+ void ConfigDialog::updateDelayUI() {
+-    int padding = spinCensorPadding->value();
++    int padding = censorPaddingMs();
+     if (chkDelayAuto->isChecked()) {
+         spinDelay->setMinimum(0);
+         spinDelay->setValue(padding + GlobalConfig::kAutoDelayMarginMs);
+         spinDelay->setEnabled(false);
++        lblDelayHint->setText(QString("按消音范围和识别所需时间自动设置。"));
+     } else {
+         spinDelay->setEnabled(true);
+         spinDelay->setMinimum(padding + GlobalConfig::kMinDelayMarginMs);
++        lblDelayHint->setText(QString("手动：最少 %1 秒（消音范围 %2 秒 + 识别出较长的词需要的 %3 秒）。")
++                                  .arg((padding + GlobalConfig::kMinDelayMarginMs) / 1000.0)
++                                  .arg(padding / 1000.0)
++                                  .arg(GlobalConfig::kMinDelayMarginMs / 1000.0));
+     }
+ }
+ 
+@@ -1119,10 +1149,10 @@ void ConfigDialog::onBrowseModel() {
+ 
+ bool ConfigDialog::onApply() {
+     if (chkGlobalEnable->isChecked() && !chkDelayAuto->isChecked() &&
+-        spinDelay->value() < spinCensorPadding->value() + GlobalConfig::kMinDelayMarginMs) {
++        spinDelay->value() < censorPaddingMs() + GlobalConfig::kMinDelayMarginMs) {
+         QMessageBox::warning(this, "声音延迟太短",
+-            QString("手动设置的声音延迟不能低于 前后多消 + %1 秒（识别需要的时间）。\n"
+-                    "建议勾选“声音延迟自动设置”，插件会按 前后多消 + %2 秒设置。\n"
++            QString("手动设置的声音延迟不能低于 消音范围 + %1 秒（识别出较长的词需要的时间）。\n"
++                    "建议勾选声音延迟的“自动”，插件会按 消音范围 + %2 秒设置。\n"
+                     "已经播出的声音无法追回，请调整后再应用。")
+                 .arg(GlobalConfig::kMinDelayMarginMs / 1000.0)
+                 .arg(GlobalConfig::kAutoDelayMarginMs / 1000.0));
+@@ -1163,7 +1193,7 @@ bool ConfigDialog::onApply() {
+         cfg->model_path = editModelPath->text().toStdString();
+         cfg->model_offset_ms = spinModelOffset->value();
+         cfg->delay_seconds = (double)spinDelay->value() / 1000.0;
+-        cfg->censor_padding_ms = spinCensorPadding->value();
++        cfg->censor_padding_ms = censorPaddingMs();
+         
+         cfg->use_pinyin = chkUsePinyin->isChecked();
+         cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 946e942..9e917f5 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -88,7 +88,9 @@ struct GlobalConfig {
+     // the time recognition needs, otherwise a word starts playing before it is muted.
+     bool delay_follows_padding = true;
+     static constexpr int kAutoDelayMarginMs = 1500; // used when delay follows padding
+-    static constexpr int kMinDelayMarginMs = 1000;  // lower bound for a manual delay
++    // Lower bound for a manual delay. X-ASR int8, real-time paced, all CPUs busy: a 4-character
++    // word is recognised up to 1.26 s after its first character starts (2026-11-08).
++    static constexpr int kMinDelayMarginMs = 1300;
+     void NormalizeDelay(); // call with mutex held (or before the config is shared)
+ 
+     // GPU Acceleration Settings
+@@ -142,7 +144,11 @@ private:
+     PluginModelManager *modelManager;
+ 
+     QSpinBox *spinDelay;
+-    QSpinBox *spinCensorPadding;
++    // 消音范围: extra muting before and after each hit (censor_padding_ms), as presets.
++    QComboBox *comboCensorRange;
++    int censorPaddingMs() const;
++    void setCensorPaddingMs(int ms);
++    QLabel *lblDelayHint;
+     QCheckBox *chkAutoFilterMic;
+     QComboBox *comboBroadcastMode; // 0 = OBS streams itself, 1 = companion app
+     bool showCompanionChecklist();
+-- 
+2.55.0.windows.5
+

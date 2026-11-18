@@ -1,0 +1,1448 @@
+From b4856c8373ca8652fec040aaf93302514639ae0c Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 00:39:25 -0700
+Subject: [PATCH] =?UTF-8?q?ui-copy:=20settings=20dialog=20reordered=20by?=
+ =?UTF-8?q?=20streaming=20workflow,=20summary=20line,=20unified=20?=
+ =?UTF-8?q?=E8=AF=AD=E9=9F=B3=E6=B6=88=E9=9F=B3=20wording,=20delay=20copy?=
+ =?UTF-8?q?=20from=20constants?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp    | 655 +++++++++++++++++++++------------------
+ src/plugin-config.hpp    |  11 +-
+ src/plugin-main.cpp      |  88 +++---
+ src/profanity-filter.cpp |  12 +-
+ src/video-delay.cpp      |   8 +-
+ 5 files changed, 423 insertions(+), 351 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 824bd43..0f16b69 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -122,14 +122,14 @@ std::vector<std::string> CheckCompanionAppAudio(bool &readable) {
+                 continue;
+             }
+             if (!strcmp(group, "outputs"))
+-                problems.push_back("伴侣正在采集系统声音（" + name + "），原声会绕过过滤进入直播，请在伴侣里关闭系统声音");
++                problems.push_back("伴侣正在采集系统声音（" + name + "），原声会绕过消音进入直播，请在伴侣里关闭系统声音");
+             else if (!strcmp(group, "inputs"))
+-                problems.push_back("伴侣正在采集麦克风“" + name + "”，原声会绕过过滤进入直播，伴侣里只保留 CABLE Output");
++                problems.push_back("伴侣正在采集麦克风“" + name + "”，原声会绕过消音进入直播，伴侣里只保留 CABLE Output");
+             else
+-                problems.push_back("伴侣正在采集程序声音“" + name + "”，原声会绕过过滤进入直播，请在伴侣里移除");
++                problems.push_back("伴侣正在采集程序声音“" + name + "”，原声会绕过消音进入直播，请在伴侣里移除");
+         }
+     }
+-    if (!cable) problems.push_back("伴侣没有采集 CABLE Output，直播会没有过滤后的声音，请在伴侣里把麦克风选为 CABLE Output");
++    if (!cable) problems.push_back("伴侣没有采集 CABLE Output，直播会没有消音后的声音，请在伴侣里把麦克风选为 CABLE Output");
+     return problems;
+ }
+ 
+@@ -178,7 +178,7 @@ std::string GetViewerLatencyText() {
+     else if (!voices.empty())
+         snprintf(text, sizeof(text), "语音比画面晚约%.1f秒（%s；游戏画面与声音不延迟）", delay, voices.c_str());
+     else
+-        snprintf(text, sizeof(text), "画面不延迟；过滤的语音将比画面晚约%.1f秒", delay);
++        snprintf(text, sizeof(text), "画面不延迟；消音的语音将比画面晚约%.1f秒", delay);
+     string out = text;
+     int obs_delay = obs_stream_delay_seconds();
+     if (obs_delay > 0) {
+@@ -372,9 +372,9 @@ void GlobalConfig::Load() {
+ // --- UI Implementation ---
+ 
+ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+-    setWindowTitle("语音脏话屏蔽 - 全局配置");
+-    resize(600, 550);
+-    
++    setWindowTitle("语音消音设置");
++    resize(640, 550);
++
+     // Init Model Manager
+     modelManager = new PluginModelManager(this);
+     QString jsonPathStr;
+@@ -386,172 +386,71 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         }
+     }
+     modelManager->LoadModels(jsonPathStr); // Always load, even if path is empty (triggers fallback)
+-    
++
+     connect(modelManager, &PluginModelManager::downloadProgress, this, &ConfigDialog::onDownloadProgress);
+     connect(modelManager, &PluginModelManager::downloadFinished, this, &ConfigDialog::onDownloadFinished);
+     connect(modelManager, &PluginModelManager::downloadError, this, &ConfigDialog::onDownloadError);
+-    
++
++    auto hint = [](const QString &text) {
++        QLabel *l = new QLabel(text);
++        l->setWordWrap(true);
++        l->setStyleSheet("color: #9a9cab;");
++        return l;
++    };
++    const QString autoMargin = QString::number(GlobalConfig::kAutoDelayMarginMs / 1000.0);
++    const QString minMargin = QString::number(GlobalConfig::kMinDelayMarginMs / 1000.0);
++
+     QVBoxLayout *mainLayout = new QVBoxLayout(this);
+-    
+-    // Global Enable
+-    chkGlobalEnable = new QCheckBox("启用全局脏话过滤功能 (Master Switch)");
+-    chkGlobalEnable->setToolTip("关闭此选项将完全禁用插件功能：\n1. 卸载语音识别模型 (释放内存)\n2. 停止所有音频检测\n3. 禁用视频延迟同步\n(相当于插件完全未运行)");
++
++    // Master switch and its consequence
++    chkGlobalEnable = new QCheckBox("启用语音消音");
+     QFont font = chkGlobalEnable->font();
+     font.setBold(true);
+     chkGlobalEnable->setFont(font);
+     mainLayout->addWidget(chkGlobalEnable);
+-    
++    QLabel *lblGlobalHint = hint("关闭后卸载识别模型，停止检测和画面延迟，所有声音照常输出。");
++    lblGlobalHint->setContentsMargins(22, 0, 0, 0);
++    mainLayout->addWidget(lblGlobalHint);
++
+     // --- Container for switchable content ---
+     settingsContainer = new QWidget();
+     QVBoxLayout *containerLayout = new QVBoxLayout(settingsContainer);
+     containerLayout->setContentsMargins(0, 0, 0, 0);
+-    
+-    // Model Group
+-    QGroupBox *grpModel = new QGroupBox("模型设置 (Model)");
+-    QFormLayout *layoutModel = new QFormLayout(grpModel);
+-    
+-    lblModelStatus = new QLabel("状态: 检查中...");
+-    QFont statusFont = lblModelStatus->font();
+-    statusFont.setBold(true);
+-    lblModelStatus->setFont(statusFont);
+-    layoutModel->addRow("当前状态:", lblModelStatus);
+-    
+-    comboModel = new QComboBox();
+-    const auto &loadedModels = modelManager->GetModels();
+-    BLOG(LOG_INFO, "Populating combo box with %zu models", loadedModels.size());
+-
+-    for (const auto &m : loadedModels) {
+-        comboModel->addItem(m.name, m.id);
+-        BLOG(LOG_INFO, "Added model to combo: %s (%s)", m.name.toStdString().c_str(), m.id.toStdString().c_str());
+-    }
+-    comboModel->addItem("使用自定义路径 (Custom Path)...", "custom");
+-    connect(comboModel, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ConfigDialog::onModelComboChanged);
+-    
+-    QHBoxLayout *boxPath = new QHBoxLayout();
+-    editModelPath = new QLineEdit();
+-    editModelPath->setPlaceholderText("选择或输入模型文件夹路径...");
+-    QPushButton *btnBrowse = new QPushButton("浏览...");
+-    connect(btnBrowse, &QPushButton::clicked, this, &ConfigDialog::onBrowseModel);
+-    boxPath->addWidget(editModelPath);
+-    boxPath->addWidget(btnBrowse);
+-    
+-    QHBoxLayout *boxDownload = new QHBoxLayout();
+-    btnDownloadModel = new QPushButton("⬇️ 一键下载此模型");
+-    connect(btnDownloadModel, &QPushButton::clicked, this, &ConfigDialog::onModelAction);
+-    progressDownload = new QProgressBar();
+-    progressDownload->setRange(0, 100);
+-    progressDownload->setValue(0);
+-    progressDownload->setVisible(false);
+-    lblDownloadStatus = new QLabel("");
+-    
+-    boxDownload->addWidget(btnDownloadModel);
+-    boxDownload->addWidget(progressDownload);
+-    boxDownload->addWidget(lblDownloadStatus);
+-    boxDownload->addStretch();
+-    
+-    layoutModel->addRow("选择模型:", comboModel);
+-    lblPathTitle = new QLabel("模型路径:");
+-    layoutModel->addRow(lblPathTitle, boxPath);
+-
+-    spinModelOffset = new QSpinBox();
+-    spinModelOffset->setRange(-2000, 2000);
+-    spinModelOffset->setSingleStep(50);
+-    spinModelOffset->setSuffix(" ms");
+-    spinModelOffset->setToolTip("模型延迟补偿 (Offset)\n不同模型可能有不同的处理延迟，导致哔声位置偏移。\n调整此值可校准哔声位置。\n正值: 哔声延后\n负值: 哔声提前");
+-    layoutModel->addRow("延迟补偿:", spinModelOffset);
+-    
+-    layoutModel->addRow("", boxDownload);
+-    
+-    containerLayout->addWidget(grpModel);
+-    
+-    // Audio Group
+-    QGroupBox *grpAudio = new QGroupBox("音频处理");
+-    QFormLayout *layoutAudio = new QFormLayout(grpAudio);
+-    
+-    spinDelay = new QSpinBox();
+-    spinDelay->setRange(0, 10000);
+-    spinDelay->setSingleStep(50);
+-    spinDelay->setSuffix(" ms");
+-    
+ 
+-    // Audio Effect Selection
+-    comboEffect = new QComboBox();
+-    comboEffect->addItem("标准哔声 (Beep)", 0);
+-    comboEffect->addItem("静音 (Silence)", 1);
+-    comboEffect->addItem("小黄人音效 (Minion)", 2);
+-    comboEffect->addItem("电报音效 (Telegraph)", 3);
+-    
+-    layoutAudio->addRow("全局延迟时间:", spinDelay);
+-    spinCensorPadding = new QSpinBox();
+-    spinCensorPadding->setRange(0, 5000);
+-    spinCensorPadding->setSingleStep(100);
+-    spinCensorPadding->setSuffix(" ms");
+-    spinCensorPadding->setToolTip("在命中词开始前和结束后各扩展此时长。\n也会屏蔽相邻正常声音；不能补救完全未命中的词。\n全局延迟应大于前扩展时间，并留出识别耗时。");
+-    layoutAudio->addRow("命中词前后各扩展:", spinCensorPadding);
+-    chkDelayAuto = new QCheckBox("延迟自动跟随屏蔽扩展（推荐）");
+-    chkDelayAuto->setToolTip("开启时全局延迟 = 前后扩展 + 2秒（识别耗时余量），只需调整扩展。\n关闭后可手动设置延迟，但不能低于 扩展 + 1.5秒，否则词头会在静音前播出。");
+-    layoutAudio->addRow("", chkDelayAuto);
+-    lblLatency = new QLabel();
+-    lblLatency->setWordWrap(true);
+-    lblLatency->setToolTip("插件延迟让识别有时间在声音播出前找到并静音命中词。\n不同步画面时，只有被过滤的语音（KOOK、麦克风）变晚，游戏画面和声音照常。\nOBS“设置→高级→串流延迟”只推迟已编码的推流输出，不参与消音；开启时观众还要再多等这么久。");
+-    layoutAudio->addRow("延迟说明:", lblLatency);
+-    connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
+-    connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
+-    chkAutoFilterMic = new QCheckBox("自动过滤主播麦克风");
+-    chkAutoFilterMic->setToolTip("开启后，自动给场景中的麦克风音源（音频输入采集）加上识别过滤滤镜。\n麦克风设备选“默认”时跟随Windows默认录音设备。\n关闭后移除自动添加的麦克风滤镜（开启音画同步时改为仅同步延迟）；手动添加的滤镜不受影响。");
+-    layoutAudio->addRow("", chkAutoFilterMic);
+-    layoutAudio->addRow("屏蔽音效:", comboEffect);
+-    
+-    comboSyncMode = new QComboBox();
+-    comboSyncMode->addItem("自动（推荐）", 0);
+-    comboSyncMode->addItem("总是同步", 1);
+-    comboSyncMode->addItem("不同步", 2);
+-    comboSyncMode->setToolTip("自动：只过滤KOOK/麦克风这类单独语音时画面不延迟（省显存，语音比画面晚几秒）；\n场景中有摄像头，或被过滤的是游戏/桌面/带画面的声音（游戏内语音）时，画面一起延迟以保持同步。\n总是同步：画面始终延迟，解说与画面严格对齐，占用显存。");
+-    layoutAudio->addRow("画面同步:", comboSyncMode);
+-    
+-    lblVideoMemory = new QLabel("当前音画同步显存占用: 0.0 MB");
+-    lblVideoMemory->setStyleSheet("color: #888; font-style: italic;");
+-    layoutAudio->addRow("", lblVideoMemory);
+-    
+-    containerLayout->addWidget(grpAudio);
+-
+-    QGroupBox *grpSources = new QGroupBox("声音来源");
+-    QVBoxLayout *layoutSources = new QVBoxLayout(grpSources);
+-    comboVoiceSource = new QComboBox();
+-    comboVoiceSource->addItem("没有队友语音（单排）", 0);
+-    comboVoiceSource->addItem("语音软件（KOOK、YY、Discord等）", 1);
+-    comboVoiceSource->addItem("游戏内语音", 2);
+-    comboVoiceSource->setToolTip("选择队友的声音从哪里来，插件按选择检查当前场景的声音设置：\n语音软件：单独采集语音软件并过滤，桌面音频要静音，游戏声音由游戏采集提供（画面不延迟）。\n游戏内语音：队友语音混在游戏声音里，过滤整个游戏声音，桌面音频要静音（画面与声音整体晚约2秒）。\n麦克风在所有情况下都会自动过滤。");
+-    {
+-        QFormLayout *form = new QFormLayout();
+-        form->addRow("队友语音来源:", comboVoiceSource);
+-        layoutSources->addLayout(form);
+-    }
+-    lblAudioSetup = new QLabel();
+-    lblAudioSetup->setWordWrap(true);
+-    lblAudioSetup->setTextInteractionFlags(Qt::TextSelectableByMouse);
+-    layoutSources->addWidget(lblAudioSetup);
+-    containerLayout->addWidget(grpSources);
++    lblSummary = new QLabel();
++    lblSummary->setWordWrap(true);
++    lblSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
++    containerLayout->addWidget(lblSummary);
+ 
+-    QGroupBox *grpCompanion = new QGroupBox("直播伴侣（抖音）");
++    // 1. How the stream goes out
++    QGroupBox *grpCompanion = new QGroupBox("开播方式");
+     QVBoxLayout *layoutCompanion = new QVBoxLayout(grpCompanion);
+     comboBroadcastMode = new QComboBox();
+-    comboBroadcastMode->addItem("OBS直接推流（B站、虎牙、斗鱼等有推流码的平台）", 0);
+-    comboBroadcastMode->addItem("直播伴侣（抖音）：画面经虚拟摄像头，声音经VB-CABLE", 1);
+-    comboBroadcastMode->setToolTip("选直播伴侣时插件会：启动虚拟摄像头；把OBS监听设备设为CABLE Input；把参与直播的音源设为“监听并输出”；\n持续检查Windows默认播放设备，如果是CABLE（其他程序的原声会绕过过滤进入直播）就在状态栏提醒。\n读取伴侣的声音设置，发现伴侣采集了系统声音、真实麦克风或程序声音时提醒。\n改回OBS直接推流时恢复插件改过的监听设置。需要先安装VB-CABLE（vb-cable.com）。");
++    comboBroadcastMode->addItem("OBS 直接推流（B站、虎牙、斗鱼等有推流码的平台）", 0);
++    comboBroadcastMode->addItem("抖音直播伴侣（画面走虚拟摄像头，声音走 VB-CABLE）", 1);
++    comboBroadcastMode->setToolTip("选直播伴侣时插件会：启动虚拟摄像头；把 OBS 监听设备设为 CABLE Input；把参与直播的音源设为“监听并输出”；\n"
++                                   "持续检查 Windows 默认播放设备，如果是 CABLE（其他程序的原声会绕过消音进入直播）就在状态栏提醒；\n"
++                                   "读取伴侣的声音设置，发现伴侣采集了系统声音、真实麦克风或程序声音时提醒。\n"
++                                   "改回 OBS 直接推流时恢复插件改过的监听设置。需要先安装 VB-CABLE。");
+     {
+         QFormLayout *form = new QFormLayout();
+-        form->addRow("开播方式:", comboBroadcastMode);
++        form->addRow("开播方式：", comboBroadcastMode);
+         layoutCompanion->addLayout(form);
+     }
+-    chkCableAutoDisable = new QCheckBox("不用直播伴侣模式时停用VB-CABLE（推荐，避免影响其他软件）");
+-    chkCableAutoDisable->setToolTip("开启直播伴侣模式时插件启用VB-CABLE，改回OBS直接推流或退出OBS时停用它的播放端（CABLE Input），\n效果同Windows声音设置里的“禁用”，这样Windows不会在拔耳机等情况下把CABLE设成默认设备。\n伴侣里选的麦克风 CABLE Output 不受影响。自己另有用途需要VB-CABLE时取消勾选。");
+-    layoutCompanion->addWidget(chkCableAutoDisable);
+     lblCompanion = new QLabel();
+     lblCompanion->setWordWrap(true);
++    lblCompanion->setTextInteractionFlags(Qt::TextSelectableByMouse);
+     layoutCompanion->addWidget(lblCompanion);
+-    QPushButton *btnFixDefaults = new QPushButton("修复Windows默认播放设备");
+-    btnFixDefaults->setToolTip("如果Windows默认播放设备或默认通信设备被设成了CABLE，改回真实的扬声器/耳机。");
++    companionDetails = new QWidget();
++    QVBoxLayout *layoutCompanionDetails = new QVBoxLayout(companionDetails);
++    layoutCompanionDetails->setContentsMargins(0, 0, 0, 0);
++    chkCableAutoDisable = new QCheckBox("不用直播伴侣时停用 VB-CABLE（推荐，避免影响其他软件）");
++    chkCableAutoDisable->setToolTip("开启直播伴侣模式时插件启用 VB-CABLE，改回 OBS 直接推流或退出 OBS 时停用它的播放端（CABLE Input），\n"
++                                    "效果同 Windows 声音设置里的“禁用”，这样 Windows 不会在拔耳机等情况下把 CABLE 设成默认设备。\n"
++                                    "伴侣里选的麦克风 CABLE Output 不受影响。自己另有用途需要 VB-CABLE 时取消勾选。");
++    layoutCompanionDetails->addWidget(chkCableAutoDisable);
++    QPushButton *btnFixDefaults = new QPushButton("修复 Windows 默认播放设备");
++    btnFixDefaults->setToolTip("如果 Windows 默认播放设备或默认通信设备被设成了 CABLE，改回真实的扬声器或耳机。");
+     connect(btnFixDefaults, &QPushButton::clicked, this, [this] {
+         std::string message;
+         bool ok = RestoreDefaultPlayback(message);
+@@ -560,56 +459,182 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         updateCompanionUI();
+     });
+-    btnInstallCable = new QPushButton("下载安装VB-CABLE…");
+-    btnInstallCable->setToolTip("打开VB-CABLE官网下载页（vb-cable.com）。直播伴侣模式需要它把过滤后的声音送进伴侣。");
++    btnInstallCable = new QPushButton("下载安装 VB-CABLE…");
++    btnInstallCable->setToolTip("打开 VB-CABLE 官网下载页。直播伴侣模式需要它把消音后的声音送进伴侣。");
+     connect(btnInstallCable, &QPushButton::clicked, this, [this] { openCableDownload(); });
+     QPushButton *btnChecklist = new QPushButton("伴侣端设置清单…");
++    btnChecklist->setToolTip("直播伴侣里需要手动完成的三项设置。");
+     connect(btnChecklist, &QPushButton::clicked, this, [this] {
+         showCompanionChecklist();
+         updateCompanionUI();
+     });
+     QHBoxLayout *companionButtons = new QHBoxLayout();
++    companionButtons->addWidget(btnChecklist);
+     companionButtons->addWidget(btnInstallCable);
+     companionButtons->addWidget(btnFixDefaults);
+-    companionButtons->addWidget(btnChecklist);
+     companionButtons->addStretch();
+-    layoutCompanion->addLayout(companionButtons);
++    layoutCompanionDetails->addLayout(companionButtons);
++    layoutCompanion->addWidget(companionDetails);
+     connect(comboBroadcastMode, &QComboBox::currentIndexChanged, this, [this] { updateCompanionUI(); });
+     containerLayout->addWidget(grpCompanion);
+-    
+-    // Words Group
+-    QGroupBox *grpWords = new QGroupBox("屏蔽词设置");
+-    QVBoxLayout *layoutWords = new QVBoxLayout(grpWords);
+-    
++
++    // 2. Which sounds get censored, and whether the current scene is set up for it
++    QGroupBox *grpSources = new QGroupBox("要消音的声音");
++    QFormLayout *layoutSources = new QFormLayout(grpSources);
++    comboVoiceSource = new QComboBox();
++    comboVoiceSource->addItem("没有队友语音（单排）", 0);
++    comboVoiceSource->addItem("语音软件（KOOK、YY、Discord 等）", 1);
++    comboVoiceSource->addItem("游戏内语音", 2);
++    comboVoiceSource->setToolTip("插件按这里的选择检查当前场景的声音设置：\n"
++                                 "语音软件：单独采集语音软件并消音，桌面音频要静音，游戏声音由游戏采集提供（画面不延迟）。\n"
++                                 "游戏内语音：队友语音混在游戏声音里，给整个游戏声音消音，桌面音频要静音（画面与声音整体延迟）。\n"
++                                 "麦克风在所有情况下都会检查。");
++    layoutSources->addRow("队友语音来自：", comboVoiceSource);
++    chkAutoFilterMic = new QCheckBox("自动给麦克风加消音滤镜");
++    chkAutoFilterMic->setToolTip("开启后，自动给场景中的麦克风音源（音频输入采集）加上消音滤镜。\n"
++                                 "麦克风设备选“默认”时跟随 Windows 默认录音设备。\n"
++                                 "关闭后移除自动添加的麦克风滤镜（开启画面同步时改为仅同步延迟）；手动添加的滤镜不受影响。");
++    layoutSources->addRow("", chkAutoFilterMic);
++    lblAudioSetup = new QLabel();
++    lblAudioSetup->setWordWrap(true);
++    lblAudioSetup->setTextInteractionFlags(Qt::TextSelectableByMouse);
++    layoutSources->addRow("当前场景检查：", lblAudioSetup);
++    containerLayout->addWidget(grpSources);
++
++    // 3. Words
++    QGroupBox *grpWords = new QGroupBox("屏蔽词");
++    QFormLayout *layoutWords = new QFormLayout(grpWords);
+     int builtin_count = 0;
+     {
+         GlobalConfig *cfg = GetGlobalConfig();
+         lock_guard<mutex> lock(cfg->mutex);
+         builtin_count = (int)SplitWordList(cfg->builtin_words_str).size();
+     }
+-    QLabel *lblBuiltin = new QLabel(QString("内置词库：已启用 %1 个词，随插件更新，不提供查看。会同时屏蔽同音的写法，并避开“操作”“草丛”这类正常说法。").arg(builtin_count));
+-    lblBuiltin->setWordWrap(true);
+-    layoutWords->addWidget(lblBuiltin);
++    layoutWords->addRow("内置词库：", hint(QString("%1 个词，随插件更新，不提供查看；已避开“操作”“草丛”这类正常说法。").arg(builtin_count)));
+     QHBoxLayout *wordButtons = new QHBoxLayout();
+-    QPushButton *btnWords = new QPushButton("自定义屏蔽词…");
++    QPushButton *btnWords = new QPushButton("编辑自定义屏蔽词…");
+     btnWords->setToolTip("添加内置词库里没有的词，例如某个外号。写普通文字即可。");
+     connect(btnWords, &QPushButton::clicked, this, [this] { editCustomWords(); });
++    lblCustomCount = new QLabel();
+     wordButtons->addWidget(btnWords);
++    wordButtons->addWidget(lblCustomCount);
+     wordButtons->addStretch();
+-    layoutWords->addLayout(wordButtons);
++    layoutWords->addRow("自定义：", wordButtons);
++    chkUsePinyin = new QCheckBox("同音字也消音（推荐）");
++    chkUsePinyin->setToolTip("开启后按拼音比较，内置词库和自定义屏蔽词都适用。");
++    layoutWords->addRow("", chkUsePinyin);
++    layoutWords->addRow("", hint("识别结果常有同音别字，例如“我曹”“几把”，开启后也能命中。"));
++    containerLayout->addWidget(grpWords);
+ 
+-    chkUsePinyin = new QCheckBox("同音的写法也屏蔽（推荐）");
+-    chkUsePinyin->setToolTip("识别出的字常有同音别字（如“我曹”“几把”）。开启后按拼音比较，内置词库和自定义屏蔽词都适用。");
+-    layoutWords->addWidget(chkUsePinyin);
++    // 4. How and when
++    QGroupBox *grpAudio = new QGroupBox("消音方式与延迟");
++    QFormLayout *layoutAudio = new QFormLayout(grpAudio);
++    comboEffect = new QComboBox();
++    comboEffect->addItem("哔声", 0);
++    comboEffect->addItem("静音", 1);
++    comboEffect->addItem("小黄人音效", 2);
++    comboEffect->addItem("电报音效", 3);
++    layoutAudio->addRow("替换成：", comboEffect);
++    spinCensorPadding = new QSpinBox();
++    spinCensorPadding->setRange(0, 5000);
++    spinCensorPadding->setSingleStep(100);
++    spinCensorPadding->setSuffix(" ms");
++    spinCensorPadding->setToolTip("在命中词开始前和结束后各多消音这么长。\n会连带消掉相邻的正常声音；完全没识别出的词无法补救。");
++    layoutAudio->addRow("命中词前后各多消：", spinCensorPadding);
++    chkDelayAuto = new QCheckBox(QString("声音延迟自动设置（推荐）：前后多消 + %1 秒识别时间").arg(autoMargin));
++    chkDelayAuto->setToolTip(QString("开启时声音延迟 = 前后多消 + %1 秒，只需调整前后多消。\n"
++                                     "关闭后可手动设置，但不能低于 前后多消 + %2 秒，否则词头会在消音前播出。")
++                                 .arg(autoMargin, minMargin));
++    layoutAudio->addRow("", chkDelayAuto);
++    spinDelay = new QSpinBox();
++    spinDelay->setRange(0, 10000);
++    spinDelay->setSingleStep(50);
++    spinDelay->setSuffix(" ms");
++    spinDelay->setToolTip("声音推迟播出的时长，让识别来得及在播出前找到并消掉命中词。\n"
++                          "OBS“设置 → 高级 → 串流延迟”只推迟已编码的推流，不参与消音；开启时观众还要再多等这么久。");
++    layoutAudio->addRow("声音延迟：", spinDelay);
++    connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
++    connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
++    comboSyncMode = new QComboBox();
++    comboSyncMode->addItem("自动（推荐）", 0);
++    comboSyncMode->addItem("总是同步", 1);
++    comboSyncMode->addItem("不同步", 2);
++    comboSyncMode->setToolTip("总是同步：画面始终延迟，解说与画面严格对齐，占用显存。\n不同步：画面始终不延迟。");
++    layoutAudio->addRow("画面同步：", comboSyncMode);
++    layoutAudio->addRow("", hint("自动：只给 KOOK、麦克风这类单独语音消音时画面不延迟（省显存，语音比画面晚）；"
++                                 "给游戏声音、桌面音频或带画面的声音消音，或场景里有摄像头时，画面一起延迟。"));
++    lblVideoMemory = new QLabel();
++    layoutAudio->addRow("", lblVideoMemory);
++    containerLayout->addWidget(grpAudio);
+ 
+-    chkAsrDebugLogging = new QCheckBox("记录识别调试日志 (默认关闭)");
+-    chkAsrDebugLogging->setToolTip("开启后将音源、输入音频时间及变化中的识别文字写入本机 OBS 日志。\n识别文字可能修订；日志包含未消音的对话，请仅在测试时开启，分享日志前检查隐私。");
+-    layoutWords->addWidget(chkAsrDebugLogging);
++    // 5. Advanced: rarely touched once installed
++    btnAdvanced = new QToolButton();
++    btnAdvanced->setText("高级：识别模型、GPU 加速、排查漏词");
++    btnAdvanced->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
++    btnAdvanced->setArrowType(Qt::RightArrow);
++    btnAdvanced->setCheckable(true);
++    btnAdvanced->setAutoRaise(true);
++    containerLayout->addWidget(btnAdvanced);
++    advancedContainer = new QWidget();
++    QVBoxLayout *layoutAdvanced = new QVBoxLayout(advancedContainer);
++    layoutAdvanced->setContentsMargins(0, 0, 0, 0);
++    connect(btnAdvanced, &QToolButton::toggled, this, [this](bool open) {
++        btnAdvanced->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
++        advancedContainer->setVisible(open);
++    });
++    advancedContainer->setVisible(false);
+ 
+-    containerLayout->addWidget(grpWords);
++    QGroupBox *grpModel = new QGroupBox("识别模型");
++    QFormLayout *layoutModel = new QFormLayout(grpModel);
++    lblModelStatus = new QLabel("检查中…");
++    lblModelStatus->setWordWrap(true);
++    layoutModel->addRow("状态：", lblModelStatus);
++
++    comboModel = new QComboBox();
++    const auto &loadedModels = modelManager->GetModels();
++    BLOG(LOG_INFO, "Populating combo box with %zu models", loadedModels.size());
++    for (const auto &m : loadedModels) {
++        comboModel->addItem(m.name, m.id);
++        BLOG(LOG_INFO, "Added model to combo: %s (%s)", m.name.toStdString().c_str(), m.id.toStdString().c_str());
++    }
++    comboModel->addItem("使用其他模型文件夹…", "custom");
++    connect(comboModel, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ConfigDialog::onModelComboChanged);
++    layoutModel->addRow("模型：", comboModel);
++
++    QHBoxLayout *boxPath = new QHBoxLayout();
++    editModelPath = new QLineEdit();
++    editModelPath->setPlaceholderText("选择或输入模型文件夹…");
++    QPushButton *btnBrowse = new QPushButton("浏览…");
++    connect(btnBrowse, &QPushButton::clicked, this, &ConfigDialog::onBrowseModel);
++    boxPath->addWidget(editModelPath);
++    boxPath->addWidget(btnBrowse);
++    lblPathTitle = new QLabel("安装位置：");
++    layoutModel->addRow(lblPathTitle, boxPath);
++
++    QHBoxLayout *boxDownload = new QHBoxLayout();
++    btnDownloadModel = new QPushButton("下载此模型");
++    connect(btnDownloadModel, &QPushButton::clicked, this, &ConfigDialog::onModelAction);
++    progressDownload = new QProgressBar();
++    progressDownload->setRange(0, 100);
++    progressDownload->setValue(0);
++    progressDownload->setVisible(false);
++    lblDownloadStatus = new QLabel("");
++    boxDownload->addWidget(btnDownloadModel);
++    boxDownload->addWidget(progressDownload);
++    boxDownload->addWidget(lblDownloadStatus);
++    boxDownload->addStretch();
++    layoutModel->addRow("", boxDownload);
++
++    spinModelOffset = new QSpinBox();
++    spinModelOffset->setRange(-2000, 2000);
++    spinModelOffset->setSingleStep(50);
++    spinModelOffset->setSuffix(" ms");
++    spinModelOffset->setToolTip("不同模型给出词语时间的偏差不同。消音整体偏早或偏晚时调整：正值往后推，负值往前提。");
++    layoutModel->addRow("消音位置校准：", spinModelOffset);
++    layoutAdvanced->addWidget(grpModel);
+ 
+     // GPU Acceleration Group
+-    QGroupBox *grpGpu = new QGroupBox("GPU 加速设置 (实验性)");
++    QGroupBox *grpGpu = new QGroupBox("GPU 加速（实验性）");
+     QFormLayout *layoutGpu = new QFormLayout(grpGpu);
+ 
+     // Init Runtime Manager
+@@ -634,65 +659,67 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     }
+ 
+     chkEnableGpu = new QCheckBox("启用 GPU 加速");
+-    chkEnableGpu->setToolTip("启用后将使用 GPU 进行语音识别推理，可显著提升性能。\n需要下载对应的 Runtime 文件。");
++    chkEnableGpu->setToolTip("用显卡做语音识别。需要下载对应的运行库。");
+     layoutGpu->addRow(chkEnableGpu);
+ 
+-    // GPU Settings Container (显示/隐藏根据 chkEnableGpu)
++    // GPU settings, shown only while the checkbox is on
+     gpuSettingsContainer = new QWidget();
+     QFormLayout *layoutGpuSettings = new QFormLayout(gpuSettingsContainer);
+     layoutGpuSettings->setContentsMargins(0, 0, 0, 0);
+ 
+     comboProvider = new QComboBox();
+-    comboProvider->addItem("CPU (默认)", "cpu");
+-    comboProvider->addItem("CUDA (NVIDIA GPU)", "cuda");
++    comboProvider->addItem("CPU（默认）", "cpu");
++    comboProvider->addItem("CUDA（NVIDIA 显卡）", "cuda");
+     connect(comboProvider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+         updateGpuStatus();
+     });
+-    layoutGpuSettings->addRow("执行提供者:", comboProvider);
++    layoutGpuSettings->addRow("运行方式：", comboProvider);
+ 
+     comboGpuDevice = new QComboBox();
+-    // 检测 GPU
+     QStringList gpuNames = RuntimeManager::GetGpuNames();
+     if (gpuNames.isEmpty()) {
+-        comboGpuDevice->addItem("未检测到 NVIDIA GPU", 0);
++        comboGpuDevice->addItem("未检测到 NVIDIA 显卡", 0);
+         comboGpuDevice->setEnabled(false);
+     } else {
+         for (int i = 0; i < gpuNames.size(); i++) {
+-            comboGpuDevice->addItem(QString("GPU %1: %2").arg(i).arg(gpuNames[i]), i);
++            comboGpuDevice->addItem(QString("GPU %1：%2").arg(i).arg(gpuNames[i]), i);
+         }
+     }
+-    layoutGpuSettings->addRow("CUDA 设备:", comboGpuDevice);
++    layoutGpuSettings->addRow("显卡：", comboGpuDevice);
+ 
+-    lblGpuStatus = new QLabel("状态: 检查中...");
+-    QFont gpuStatusFont = lblGpuStatus->font();
+-    gpuStatusFont.setBold(true);
+-    lblGpuStatus->setFont(gpuStatusFont);
+-    layoutGpuSettings->addRow("Runtime 状态:", lblGpuStatus);
++    lblGpuStatus = new QLabel("检查中…");
++    layoutGpuSettings->addRow("运行库：", lblGpuStatus);
+ 
+     QHBoxLayout *boxRuntime = new QHBoxLayout();
+-    btnRuntimeAction = new QPushButton("⬇️ 下载 CUDA Runtime");
++    btnRuntimeAction = new QPushButton("下载 CUDA 运行库");
+     connect(btnRuntimeAction, &QPushButton::clicked, this, &ConfigDialog::onRuntimeAction);
+     progressRuntime = new QProgressBar();
+     progressRuntime->setRange(0, 100);
+     progressRuntime->setValue(0);
+     progressRuntime->setVisible(false);
+     lblRuntimeStatus = new QLabel("");
+-
+     boxRuntime->addWidget(btnRuntimeAction);
+     boxRuntime->addWidget(progressRuntime);
+     boxRuntime->addWidget(lblRuntimeStatus);
+     boxRuntime->addStretch();
+-
+     layoutGpuSettings->addRow("", boxRuntime);
+ 
+     layoutGpu->addRow(gpuSettingsContainer);
+-
+-    // 连接 GPU 开关
+     connect(chkEnableGpu, &QCheckBox::toggled, this, &ConfigDialog::onGpuEnableChanged);
+-    gpuSettingsContainer->setVisible(false); // 默认隐藏
++    gpuSettingsContainer->setVisible(false);
++    layoutAdvanced->addWidget(grpGpu);
++
++    QGroupBox *grpDebug = new QGroupBox("排查漏词");
++    QVBoxLayout *layoutDebug = new QVBoxLayout(grpDebug);
++    chkAsrDebugLogging = new QCheckBox("把识别出的文字写进 OBS 日志");
++    chkAsrDebugLogging->setToolTip("记录音源、输入音频时间及变化中的识别文字。识别文字可能修订。");
++    layoutDebug->addWidget(chkAsrDebugLogging);
++    layoutDebug->addWidget(hint("日志里会有未消音的对话原文，测完请关闭，分享日志前检查。"));
++    layoutAdvanced->addWidget(grpDebug);
++
++    containerLayout->addWidget(advancedContainer);
++    containerLayout->addStretch();
+ 
+-    containerLayout->addWidget(grpGpu);
+-    
+     // Settings scroll; the OK/Apply/Cancel row stays visible below at any screen height.
+     QScrollArea *scroll = new QScrollArea();
+     scroll->setWidgetResizable(true);
+@@ -700,33 +727,32 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+     scroll->setWidget(settingsContainer);
+     mainLayout->addWidget(scroll, 1);
+-    
+-    // Connect Visibility Toggle
++
+     connect(chkGlobalEnable, &QCheckBox::toggled, settingsContainer, &QWidget::setVisible);
+-    
++
+     if (QScreen *screen = QGuiApplication::primaryScreen()) {
+         int height = screen->availableGeometry().height() * 85 / 100;
+         resize(660, height < 900 ? height : 900);
+     }
+-    
++
+     // Buttons
+     QHBoxLayout *btnLayout = new QHBoxLayout();
+     QPushButton *btnSave = new QPushButton("确定");
+     QPushButton *btnApply = new QPushButton("应用");
+     QPushButton *btnCancel = new QPushButton("取消");
+-    
++
+     connect(btnSave, &QPushButton::clicked, this, &ConfigDialog::onSave);
+     connect(btnApply, &QPushButton::clicked, this, &ConfigDialog::onApply);
+     connect(btnCancel, &QPushButton::clicked, this, &ConfigDialog::reject);
+-    
++
+     btnLayout->addStretch();
+     btnLayout->addWidget(btnSave);
+     btnLayout->addWidget(btnApply);
+     btnLayout->addWidget(btnCancel);
+     mainLayout->addLayout(btnLayout);
+-    
++
+     LoadToUI();
+-    
++
+     // Status Timer
+     statusTimer = new QTimer(this);
+     connect(statusTimer, &QTimer::timeout, this, &ConfigDialog::updateStatus);
+@@ -815,6 +841,12 @@ void ConfigDialog::LoadToUI() {
+ 
+     // Trigger update of download button state
+     onModelComboChanged(comboModel->currentIndex());
++
++    updateWordCounts((int)SplitWordList(cfg->custom_words_str).size());
++    // Open the advanced section when something in it is not at its default, so a
++    // running debug log (private conversation in the OBS log) or GPU mode stays visible.
++    bool advanced = cfg->enable_gpu || cfg->asr_debug_logging || comboModel->currentData().toString() == "custom";
++    btnAdvanced->setChecked(advanced);
+ }
+ 
+ void ConfigDialog::updateDelayUI() {
+@@ -834,10 +866,8 @@ void ConfigDialog::updateStatus() {
+     // refresh it every few seconds so it follows changes made outside OBS.
+     static int companion_refresh = 0;
+     if (++companion_refresh % 3 == 0) updateCompanionUI();
+-    {
+-        std::string latency = GetViewerLatencyText();
+-        lblLatency->setText(latency.empty() ? QString("过滤已关闭，无延迟") : QString::fromStdString(latency));
+-    }
++
++    int failed_checks = 0;
+     {
+         GlobalConfig *cfg = GetGlobalConfig();
+         int saved = 0;
+@@ -849,43 +879,67 @@ void ConfigDialog::updateStatus() {
+         if (comboVoiceSource->currentData().toInt() != saved)
+             text = "点“应用”后按新的选择检查。";
+         else
+-            for (auto &line : GetAudioSetupReport()) text += (text.isEmpty() ? "" : "\n") + QString::fromStdString(line);
++            for (auto &line : GetAudioSetupReport()) {
++                if (line.rfind("✗", 0) == 0) ++failed_checks;
++                text += (text.isEmpty() ? "" : "\n") + QString::fromStdString(line);
++            }
+         if (text.isEmpty()) text = "没有可检查的音源。";
+         if (lblAudioSetup->text() != text) lblAudioSetup->setText(text);
+     }
+-    // Model Status Update
++
++    // Engine state. "未生效" (filter not working) and "错误" are produced by
++    // ProfanityFilter::GetGlobalModelStatus; the status bar matches the same words.
+     auto status = ProfanityFilter::GetGlobalModelStatus();
++    const bool engine_bad = status.second.find("未生效") != std::string::npos;
++    const bool engine_error = status.second.find("错误") != std::string::npos;
++    const bool engine_ok = status.second.find("运行中") != std::string::npos;
+     lblModelStatus->setText(QString::fromStdString(status.second));
+-    
+-    if (status.first) {
+-        // Loading
+-        lblModelStatus->setStyleSheet("color: #E6A23C; font-weight: bold;"); // Warning Orange
+-    } else if (status.second.find("运行中") != std::string::npos) {
+-        lblModelStatus->setStyleSheet("color: #67C23A; font-weight: bold;"); // Success Green
+-    } else if (status.second.find("错误") != std::string::npos) {
+-        lblModelStatus->setStyleSheet("color: #F56C6C; font-weight: bold;"); // Danger Red
++    if (engine_error) lblModelStatus->setStyleSheet("color: #F56C6C;");
++    else if (status.first || engine_bad) lblModelStatus->setStyleSheet("color: #E6A23C;");
++    else if (engine_ok) lblModelStatus->setStyleSheet("color: #67C23A;");
++    else lblModelStatus->setStyleSheet("color: #9a9cab;");
++
++    // Summary: the most serious problem, then what viewers get.
++    QString headline;
++    QString color = "#67C23A";
++    int failed = failed_checks + companionProblems;
++    if (engine_error) {
++        headline = QString::fromStdString(status.second);
++        color = "#F56C6C";
++    } else if (status.first || engine_bad) {
++        headline = QString::fromStdString(status.second);
++        color = "#E6A23C";
++    } else if (failed > 0) {
++        headline = QString("%1 项检查未通过，原声可能进入直播，见下方“开播方式”和“要消音的声音”").arg(failed);
++        color = "#E6A23C";
+     } else {
+-        lblModelStatus->setStyleSheet("color: #909399; font-style: italic;"); // Info Gray
++        headline = QString::fromStdString(status.second);
++        if (!engine_ok) color = "#9a9cab";
+     }
++    std::string latency = GetViewerLatencyText();
++    QString summary = headline;
++    if (!latency.empty()) summary += "\n" + QString::fromStdString(latency);
++    QString style = QString("color: %1; font-weight: bold; padding: 6px 8px; border: 1px solid #44485a; border-radius: 4px;").arg(color);
++    if (lblSummary->text() != summary) lblSummary->setText(summary);
++    if (lblSummary->styleSheet() != style) lblSummary->setStyleSheet(style);
+ 
+     double mb = VideoDelayFilter::total_memory_mb.load();
+-    QString text = QString("当前音画同步显存占用: %1 MB").arg(mb, 0, 'f', 1);
+-    
+-    if (!chkGlobalEnable->isChecked()) {
+-        text += " (全局已禁用)";
+-    } else if (mb < 0.1) {
+-        text += " (待机中)";
+-    }
+-    
++    QString text = QString("画面延迟显存占用：%1 MB").arg(mb, 0, 'f', 1);
++    if (mb < 0.1) text += "（画面没有延迟）";
+     if (mb > 1000.0) {
+-        text += " (⚠️ 高占用)";
+-        lblVideoMemory->setStyleSheet("color: red; font-weight: bold;");
++        text += "，占用较高";
++        lblVideoMemory->setStyleSheet("color: #F56C6C;");
+     } else {
+-        lblVideoMemory->setStyleSheet("color: #888; font-style: italic;");
++        lblVideoMemory->setStyleSheet("color: #9a9cab;");
+     }
+     lblVideoMemory->setText(text);
+ }
+ 
++// Caller passes the count: LoadToUI already holds the config mutex.
++void ConfigDialog::updateWordCounts(int custom_count) {
++    lblCustomCount->setText(custom_count ? QString("%1 个词").arg(custom_count) : QString("还没有添加"));
++}
++
+ void ConfigDialog::onModelComboChanged(int index) {
+     QString id = comboModel->itemData(index).toString();
+     
+@@ -912,14 +966,14 @@ void ConfigDialog::onModelComboChanged(int index) {
+     }
+     
+     if (id == "custom") {
+-        lblPathTitle->setText("自定义路径:");
++        lblPathTitle->setText("模型文件夹：");
+         editModelPath->setEnabled(true);
+-        editModelPath->setPlaceholderText("请选择包含 tokens.txt 的模型文件夹...");
++        editModelPath->setPlaceholderText("选择包含 tokens.txt 的模型文件夹…");
+         btnDownloadModel->setVisible(false);
+         progressDownload->setVisible(false);
+         lblDownloadStatus->setVisible(false);
+     } else {
+-        lblPathTitle->setText("安装位置:");
++        lblPathTitle->setText("安装位置：");
+         editModelPath->setEnabled(false); // Make it read-only for presets
+         
+         QString path = modelManager->GetModelPath(id);
+@@ -929,7 +983,7 @@ void ConfigDialog::onModelComboChanged(int index) {
+         if (modelManager->IsBundled(id)) {
+             btnDownloadModel->setVisible(false);
+             progressDownload->setVisible(false);
+-            lblDownloadStatus->setText("✅ 已随插件安装 (Ready)");
++            lblDownloadStatus->setText("已随插件安装");
+             lblDownloadStatus->setVisible(true);
+             return;
+         }
+@@ -938,12 +992,12 @@ void ConfigDialog::onModelComboChanged(int index) {
+         progressDownload->setVisible(false);
+         
+         if (installed) {
+-            btnDownloadModel->setText("🗑️ 删除模型");
+-            lblDownloadStatus->setText("✅ 已安装 (Ready)");
++            btnDownloadModel->setText("删除此模型");
++            lblDownloadStatus->setText("已安装");
+             lblDownloadStatus->setVisible(true);
+         } else {
+-            btnDownloadModel->setText("⬇️ 一键下载此模型");
+-             lblDownloadStatus->setText("⚠️ 未安装 (需要下载)");
++            btnDownloadModel->setText("下载此模型");
++             lblDownloadStatus->setText("未安装，需要下载");
+              lblDownloadStatus->setVisible(true);
+         }
+     }
+@@ -957,7 +1011,7 @@ void ConfigDialog::onModelAction() {
+         // Delete Action
+         QMessageBox::StandardButton reply;
+         reply = QMessageBox::question(this, "确认删除", 
+-            "确定要删除此模型吗?\n此操作将移除模型文件以释放空间。",
++            "删除这个模型的文件？\n以后要用需要重新下载。",
+             QMessageBox::Yes | QMessageBox::No);
+             
+         if (reply == QMessageBox::Yes) {
+@@ -965,7 +1019,7 @@ void ConfigDialog::onModelAction() {
+                 // Update UI immediately
+                 onModelComboChanged(comboModel->currentIndex());
+             } else {
+-                QMessageBox::critical(this, "删除失败", "无法删除模型文件夹，可能文件正在被使用。");
++                QMessageBox::critical(this, "删除失败", "无法删除模型文件夹，文件可能正在使用。");
+             }
+         }
+     } else {
+@@ -973,7 +1027,7 @@ void ConfigDialog::onModelAction() {
+         btnDownloadModel->setEnabled(false);
+         progressDownload->setValue(0);
+         progressDownload->setVisible(true);
+-        lblDownloadStatus->setText("准备下载...");
++        lblDownloadStatus->setText("准备下载…");
+         lblDownloadStatus->setVisible(true);
+         
+         modelManager->DownloadModel(id);
+@@ -986,29 +1040,29 @@ void ConfigDialog::onDownloadProgress(qint64 received, qint64 total) {
+         progressDownload->setValue(percent);
+         double mbReceived = received / (1024.0 * 1024.0);
+         double mbTotal = total / (1024.0 * 1024.0);
+-        lblDownloadStatus->setText(QString("正在下载: %1 MB / %2 MB").arg(mbReceived, 0, 'f', 1).arg(mbTotal, 0, 'f', 1));
++        lblDownloadStatus->setText(QString("正在下载：%1 MB / %2 MB").arg(mbReceived, 0, 'f', 1).arg(mbTotal, 0, 'f', 1));
+     } else {
+         progressDownload->setValue(0);
+-        lblDownloadStatus->setText("正在下载...");
++        lblDownloadStatus->setText("正在下载…");
+     }
+ }
+ 
+ void ConfigDialog::onDownloadFinished(const QString &modelId) {
+     progressDownload->setVisible(false);
+-    lblDownloadStatus->setText("✅ 下载并解压完成!");
++    lblDownloadStatus->setText("下载并解压完成");
+     
+     // Update UI state
+     onModelComboChanged(comboModel->currentIndex());
+     
+-    QMessageBox::information(this, "下载完成", "模型已成功下载并安装。");
++    QMessageBox::information(this, "下载完成", "模型已下载并安装。");
+ }
+ 
+ void ConfigDialog::onDownloadError(const QString &msg) {
+     progressDownload->setVisible(false);
+-    lblDownloadStatus->setText("❌ 下载失败");
++    lblDownloadStatus->setText("下载失败");
+     btnDownloadModel->setEnabled(true);
+     
+-    QMessageBox::critical(this, "下载失败", "错误信息: " + msg);
++    QMessageBox::critical(this, "下载失败", "错误信息：" + msg);
+ }
+ 
+ void ConfigDialog::editCustomWords() {
+@@ -1017,7 +1071,7 @@ void ConfigDialog::editCustomWords() {
+     dialog.resize(480, 400);
+     QVBoxLayout *layout = new QVBoxLayout(&dialog);
+     QLabel *help = new QLabel("每行写一个要屏蔽的词，写普通文字即可（例如某个外号）。\n"
+-                              "内置词库已有的词不用再写。开启“同音的写法也屏蔽”时，同音的写法也会屏蔽。保存后立即生效。");
++                              "内置词库已有的词不用再写。开启“同音字也消音”时，同音的写法也会命中。保存后立即生效。");
+     help->setWordWrap(true);
+     layout->addWidget(help);
+     QTextEdit *editor = new QTextEdit();
+@@ -1058,6 +1112,7 @@ void ConfigDialog::editCustomWords() {
+             cfg->RebuildWords();
+             cfg->ParsePatterns();
+         }
++        updateWordCounts((int)lines.size());
+         dialog.accept();
+     });
+     dialog.exec();
+@@ -1075,29 +1130,30 @@ void ConfigDialog::onBrowseModel() {
+ bool ConfigDialog::onApply() {
+     if (chkGlobalEnable->isChecked() && !chkDelayAuto->isChecked() &&
+         spinDelay->value() < spinCensorPadding->value() + GlobalConfig::kMinDelayMarginMs) {
+-        QMessageBox::warning(this, "缓存时间不足",
+-            "手动延迟不能低于 命中词前扩展 + 1.5秒（识别耗时余量）。\n"
+-            "建议勾选“延迟自动跟随屏蔽扩展”，由插件按 扩展 + 2秒 设置。\n"
+-            "已经播出的声音无法追回，请调整后应用。");
++        QMessageBox::warning(this, "声音延迟太短",
++            QString("手动设置的声音延迟不能低于 前后多消 + %1 秒（识别需要的时间）。\n"
++                    "建议勾选“声音延迟自动设置”，插件会按 前后多消 + %2 秒设置。\n"
++                    "已经播出的声音无法追回，请调整后再应用。")
++                .arg(GlobalConfig::kMinDelayMarginMs / 1000.0)
++                .arg(GlobalConfig::kAutoDelayMarginMs / 1000.0));
+         return false;
+     }
+     // Validation
+     if (chkGlobalEnable->isChecked()) {
+         QString path = editModelPath->text();
+         if (path.isEmpty()) {
+-             QMessageBox::warning(this, "未配置模型", "启用插件需要选择一个模型路径。");
++             QMessageBox::warning(this, "没有选择模型", "启用语音消音需要选择一个识别模型（在“高级 → 识别模型”里）。");
+              // We allow saving empty path (it will error in log but not crash), 
+              // but warning is good. User can ignore.
+         } else {
+              QDir dir(path);
+              if (!dir.exists("tokens.txt")) {
+                  QMessageBox::StandardButton reply;
+-                 reply = QMessageBox::warning(this, "模型路径无效", 
+-                     "选定的模型路径似乎无效 (未找到 tokens.txt)。\n"
+-                     "这会导致插件无法工作。\n\n"
+-                     "请确保选择了包含 tokens.txt 的文件夹。\n"
+-                     "如果是自动下载的模型，可能解压失败或路径层级不正确。\n\n"
+-                     "是否仍然保存设置?",
++                 reply = QMessageBox::warning(this, "模型文件夹不对",
++                     "选的文件夹里没有 tokens.txt，识别模型无法加载，不会消音。\n\n"
++                     "请选择直接包含 tokens.txt 的文件夹。\n"
++                     "如果是插件下载的模型，可能解压失败或多了一层文件夹。\n\n"
++                     "仍然保存设置吗？",
+                      QMessageBox::Yes | QMessageBox::No);
+                  if (reply == QMessageBox::No) return false;
+              }
+@@ -1167,14 +1223,14 @@ bool ConfigDialog::onApply() {
+ // license), so the plugin links to the official download and explains the steps.
+ void ConfigDialog::openCableDownload() {
+     QMessageBox box(this);
+-    box.setWindowTitle("安装VB-CABLE");
++    box.setWindowTitle("安装 VB-CABLE");
+     box.setIcon(QMessageBox::Information);
+-    box.setText("直播伴侣模式需要虚拟声卡VB-CABLE，把过滤后的声音送进伴侣。");
++    box.setText("直播伴侣模式需要虚拟声卡 VB-CABLE，把消音后的声音送进伴侣。");
+     box.setInformativeText("1. 在打开的官网页面下载 VB-CABLE Driver（如果插件安装包旁边已有 VBCABLE_Driver_Pack*.zip，可直接用它）\n"
+                            "2. 解压后右键 VBCABLE_Setup_x64.exe →“以管理员身份运行”→ Install Driver\n"
+-                           "3. 重启电脑，再打开OBS\n\n"
+-                           "安装后插件会自动处理：只在直播伴侣模式下启用它，并防止它被设成Windows默认设备。\n"
+-                           "VB-CABLE是VB-Audio的捐赠软件（www.vb-cable.com），与本插件无关。");
++                           "3. 重启电脑，再打开 OBS\n\n"
++                           "安装后插件会自动处理：只在直播伴侣模式下启用它，并防止它被设成 Windows 默认设备。\n"
++                           "VB-CABLE 是 VB-Audio 的捐赠软件（www.vb-cable.com），与本插件无关。");
+     QPushButton *open = box.addButton("打开下载页", QMessageBox::AcceptRole);
+     box.addButton("取消", QMessageBox::RejectRole);
+     box.exec();
+@@ -1188,7 +1244,7 @@ bool ConfigDialog::showCompanionChecklist() {
+     box.setWindowTitle("直播伴侣端设置清单");
+     box.setIcon(QMessageBox::Information);
+     box.setText("请在抖音直播伴侣里完成以下设置（插件无法替你修改伴侣）：");
+-    box.setInformativeText("① 添加“摄像头”素材，设备选 OBS Virtual Camera\n② 麦克风选 CABLE Output (VB-Audio Virtual Cable)\n③ 关闭伴侣的“系统声音/扬声器”，不要再添加真实麦克风或程序声音\n\n否则KOOK、麦克风等原声会绕过过滤直接进入直播。\n插件能读到伴侣的声音设置时，也会自动检查第②③项。");
++    box.setInformativeText("① 添加“摄像头”素材，设备选 OBS Virtual Camera\n② 麦克风选 CABLE Output (VB-Audio Virtual Cable)\n③ 关闭伴侣的“系统声音/扬声器”，不要再添加真实麦克风或程序声音\n\n否则 KOOK、麦克风等原声会绕过消音直接进入直播。\n插件能读到伴侣的声音设置时，也会自动检查第②③项。");
+     QPushButton *done = box.addButton("我已完成", QMessageBox::AcceptRole);
+     box.addButton("稍后", QMessageBox::RejectRole);
+     box.exec();
+@@ -1210,25 +1266,34 @@ void ConfigDialog::updateCompanionUI() {
+     btnInstallCable->setVisible(comboBroadcastMode->currentData().toInt() == 1 && st.supported &&
+                                 GetCableRenderState() == CableRenderState::NotInstalled);
+     if (comboBroadcastMode->currentData().toInt() != 1) {
+-        lblCompanion->setText("OBS自己推流：不需要VB-CABLE，也不需要直播伴侣。");
++        lblCompanion->setText("OBS 自己推流，不需要 VB-CABLE，也不需要直播伴侣。");
++        companionDetails->setVisible(false);
++        companionProblems = 0;
+         return;
+     }
+-    if (!st.supported) text = "仅支持Windows。";
++    companionDetails->setVisible(true);
++    int problem_count = 0;
++    if (!st.supported) text = "✗ 直播伴侣模式只支持 Windows。";
+     else if (!st.cable_found && GetCableRenderState() == CableRenderState::Disabled)
+-        text = "VB-CABLE已安装，当前处于停用状态（不影响其他软件），开启本模式后插件会自动启用。";
+-    else if (!st.cable_found) text = "未检测到VB-CABLE：请点下方“下载安装VB-CABLE…”，安装后重启电脑。";
+-    else {
+-        text = "已检测到 " + st.cable_name + "。";
+-        if (st.console_is_cable || st.communications_is_cable)
+-            text += std::string("⚠ Windows默认") + (st.console_is_cable ? "播放" : "通信") +
+-                    "设备是CABLE，其他程序的原声会绕过过滤进入直播，请点下方按钮修复。";
++        text = "· VB-CABLE 已安装，目前停用（不影响其他软件），应用本模式后插件会自动启用。";
++    else if (!st.cable_found) {
++        text = "✗ 没有检测到 VB-CABLE：点下方“下载安装 VB-CABLE…”，安装后重启电脑。";
++        ++problem_count;
++    } else {
++        text = "✓ 已检测到 " + st.cable_name + "。";
++        if (st.console_is_cable || st.communications_is_cable) {
++            text += std::string("\n✗ Windows 默认") + (st.console_is_cable ? "播放" : "通信") +
++                    "设备是 CABLE，其他程序的原声会绕过消音进入直播 → 点下方“修复 Windows 默认播放设备”。";
++            ++problem_count;
++        }
+     }
+     bool readable = false;
+     auto problems = CheckCompanionAppAudio(readable);
+-    if (!readable) text += "\n未读取到直播伴侣的声音设置，请按清单自行确认。";
+-    else if (problems.empty()) text += "\n✓ 伴侣声音设置检查通过（只采集 CABLE Output）。";
+-    else for (auto &p : problems) text += "\n⚠ " + p;
+-    text += "\n直播伴侣里：①添加“摄像头”素材，设备选 OBS Virtual Camera；②麦克风选 CABLE Output (VB-Audio Virtual Cable)；③关闭伴侣的“系统声音/扬声器”采集，不要再添加其他麦克风。";
++    if (!readable) text += "\n· 读不到直播伴侣的声音设置，请按“伴侣端设置清单…”自行确认。";
++    else if (problems.empty()) text += "\n✓ 伴侣只采集 CABLE Output，声音设置正确。";
++    else for (auto &p : problems) text += "\n✗ " + p;
++    problem_count += (int)problems.size();
++    companionProblems = problem_count;
+     lblCompanion->setText(QString::fromStdString(text));
+ }
+ 
+@@ -1245,7 +1310,7 @@ void ConfigDialog::onGpuEnableChanged(bool enabled) {
+ 
+ void ConfigDialog::updateGpuStatus() {
+     if (!runtimeManager) {
+-        lblGpuStatus->setText("⚠️ Runtime Manager 未初始化");
++        lblGpuStatus->setText("运行库管理器没有初始化");
+         lblGpuStatus->setStyleSheet("color: #E6A23C;");
+         btnRuntimeAction->setEnabled(false);
+         return;
+@@ -1254,7 +1319,7 @@ void ConfigDialog::updateGpuStatus() {
+     QString provider = comboProvider->currentData().toString();
+ 
+     if (provider == "cpu") {
+-        lblGpuStatus->setText("✅ CPU 模式无需额外组件");
++        lblGpuStatus->setText("CPU 模式不需要额外组件");
+         lblGpuStatus->setStyleSheet("color: #67C23A;");
+         btnRuntimeAction->setVisible(false);
+         progressRuntime->setVisible(false);
+@@ -1267,9 +1332,9 @@ void ConfigDialog::updateGpuStatus() {
+     lblRuntimeStatus->setVisible(true);
+ 
+     if (runtimeManager->IsRuntimeInstalled("cuda")) {
+-        lblGpuStatus->setText("✅ CUDA Runtime 已就绪");
++        lblGpuStatus->setText("CUDA 运行库已就绪");
+         lblGpuStatus->setStyleSheet("color: #67C23A;");
+-        btnRuntimeAction->setText("🗑️ 删除 CUDA Runtime");
++        btnRuntimeAction->setText("删除 CUDA 运行库");
+         btnRuntimeAction->setEnabled(true);
+         lblRuntimeStatus->setText("已安装");
+     } else {
+@@ -1284,17 +1349,17 @@ void ConfigDialog::updateGpuStatus() {
+         }
+ 
+         if (hasUrl) {
+-            lblGpuStatus->setText("⚠️ 需要下载 CUDA Runtime");
++            lblGpuStatus->setText("需要下载 CUDA 运行库");
+             lblGpuStatus->setStyleSheet("color: #E6A23C;");
+-            btnRuntimeAction->setText("⬇️ 下载 CUDA Runtime");
++            btnRuntimeAction->setText("下载 CUDA 运行库");
+             btnRuntimeAction->setEnabled(true);
+             lblRuntimeStatus->setText("未安装");
+         } else {
+-            lblGpuStatus->setText("❌ 未配置 CUDA Runtime 下载地址");
++            lblGpuStatus->setText("没有配置 CUDA 运行库的下载地址");
+             lblGpuStatus->setStyleSheet("color: #F56C6C;");
+-            btnRuntimeAction->setText("⬇️ 下载 CUDA Runtime");
++            btnRuntimeAction->setText("下载 CUDA 运行库");
+             btnRuntimeAction->setEnabled(false);
+-            lblRuntimeStatus->setText("请在 runtime.json 中配置下载地址");
++            lblRuntimeStatus->setText("请在 runtime.json 里配置下载地址");
+         }
+     }
+ }
+@@ -1308,14 +1373,14 @@ void ConfigDialog::onRuntimeAction() {
+     if (runtimeManager->IsRuntimeInstalled("cuda")) {
+         // Delete
+         QMessageBox::StandardButton reply = QMessageBox::question(this, "确认删除",
+-            "确定要删除 CUDA Runtime 吗?\n删除后需要重新下载才能使用 GPU 加速。",
++            "删除 CUDA 运行库？\n删除后要重新下载才能使用 GPU 加速。",
+             QMessageBox::Yes | QMessageBox::No);
+ 
+         if (reply == QMessageBox::Yes) {
+             if (runtimeManager->DeleteRuntime("cuda")) {
+                 updateGpuStatus();
+             } else {
+-                QMessageBox::critical(this, "删除失败", "无法删除 CUDA Runtime，可能文件正在被使用。");
++                QMessageBox::critical(this, "删除失败", "无法删除 CUDA 运行库，文件可能正在使用。");
+             }
+         }
+     } else {
+@@ -1323,7 +1388,7 @@ void ConfigDialog::onRuntimeAction() {
+         btnRuntimeAction->setEnabled(false);
+         progressRuntime->setValue(0);
+         progressRuntime->setVisible(true);
+-        lblRuntimeStatus->setText("准备下载...");
++        lblRuntimeStatus->setText("准备下载…");
+ 
+         runtimeManager->DownloadRuntime("cuda");
+     }
+@@ -1335,26 +1400,26 @@ void ConfigDialog::onRuntimeDownloadProgress(qint64 received, qint64 total) {
+         progressRuntime->setValue(percent);
+         double mbReceived = received / (1024.0 * 1024.0);
+         double mbTotal = total / (1024.0 * 1024.0);
+-        lblRuntimeStatus->setText(QString("正在下载: %1 MB / %2 MB").arg(mbReceived, 0, 'f', 1).arg(mbTotal, 0, 'f', 1));
++        lblRuntimeStatus->setText(QString("正在下载：%1 MB / %2 MB").arg(mbReceived, 0, 'f', 1).arg(mbTotal, 0, 'f', 1));
+     } else {
+         progressRuntime->setValue(0);
+-        lblRuntimeStatus->setText("正在下载...");
++        lblRuntimeStatus->setText("正在下载…");
+     }
+ }
+ 
+ void ConfigDialog::onRuntimeDownloadFinished(const QString &runtimeId) {
+     (void)runtimeId;
+     progressRuntime->setVisible(false);
+-    lblRuntimeStatus->setText("✅ 下载并解压完成!");
++    lblRuntimeStatus->setText("下载并解压完成");
+     updateGpuStatus();
+-    QMessageBox::information(this, "下载完成", "CUDA Runtime 已成功下载并安装。");
++    QMessageBox::information(this, "下载完成", "CUDA 运行库已下载并安装。");
+ }
+ 
+ void ConfigDialog::onRuntimeDownloadError(const QString &msg) {
+     progressRuntime->setVisible(false);
+-    lblRuntimeStatus->setText("❌ 下载失败");
++    lblRuntimeStatus->setText("下载失败");
+     btnRuntimeAction->setEnabled(true);
+-    QMessageBox::critical(this, "下载失败", "错误信息: " + msg);
++    QMessageBox::critical(this, "下载失败", "错误信息：" + msg);
+ }
+ 
+ void InitGlobalConfig() {
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index d9cf71c..7a6d931 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -20,6 +20,7 @@
+ #include <QMessageBox>
+ #include <QTimer>
+ #include <QProgressBar>
++#include <QToolButton>
+ 
+ #include "model-manager.hpp"
+ #include "runtime-manager.hpp"
+@@ -161,8 +162,16 @@ private:
+     QLabel *lblAudioSetup;
+     void updateCompanionUI();
+     QCheckBox *chkDelayAuto;
+-    QLabel *lblLatency;
+     void updateDelayUI();
++    // One-line summary under the master switch: the most serious current problem first
++    // (engine not working, failed source/companion checks), then the viewer latency.
++    QLabel *lblSummary;
++    QWidget *companionDetails;   // VB-CABLE controls, shown only in companion mode
++    int companionProblems = 0;   // set by updateCompanionUI, counted in the summary
++    QLabel *lblCustomCount;
++    void updateWordCounts(int custom_count);
++    QToolButton *btnAdvanced;
++    QWidget *advancedContainer;  // model, GPU and debug logging; collapsed by default
+ 
+     QCheckBox *chkMuteMode; // Deprecated UI, replaced by comboEffect
+     QComboBox *comboEffect;
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 6323c9e..7a2b588 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -68,7 +68,7 @@ static void start_filter_warning() {
+             if (!message.empty()) message += "；";
+             message += video;
+         }
+-        if (status.second.find("过滤未生效") != std::string::npos) {
++        if (status.second.find("未生效") != std::string::npos) {
+             if (!message.empty()) message += "；";
+             message += status.second;
+         }
+@@ -93,7 +93,7 @@ static void start_filter_warning() {
+         }
+         if (companion && !latency.empty()) latency += "；直播伴侣模式（虚拟摄像头+CABLE）";
+         filter_warning->setText(QString::fromStdString(message.empty()
+-            ? (latency.empty() ? std::string("语音过滤已关闭") : latency) : message));
++            ? (latency.empty() ? std::string("语音消音已关闭") : latency) : message));
+         static std::string last_message;
+         std::string current = filter_warning->text().toStdString();
+         if (current != last_message) {
+@@ -109,7 +109,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-profanity-filter", "en-US")
+ 
+ // --- Audio Filter Callbacks ---
+ 
+-static const char *get_name(void *unused) { return "语音脏话屏蔽 (全局配置)"; }
++static const char *get_name(void *unused) { return "语音消音"; }
+ 
+ static void *create(obs_data_t *settings, obs_source_t *context) {
+     ProfanityFilter *filter = new ProfanityFilter(context);
+@@ -141,16 +141,16 @@ static void update(void *data, obs_data_t *settings) {
+ static obs_properties_t *get_properties(void *data) {
+     obs_properties_t *props = obs_properties_create();
+     
+-    obs_properties_add_group(props, "group_usage", "使用说明", OBS_GROUP_NORMAL, NULL);
+     obs_property_t *usage = obs_properties_add_text(props, "usage_info", "", OBS_TEXT_INFO);
+-    obs_property_set_long_description(usage, 
+-        "请在 OBS 顶部菜单 【工具】 -> 【语音脏话屏蔽设置】 中配置模型路径、屏蔽词和延迟时间。\n"
+-        "本滤镜仅提供开关功能，但会始终应用配置的延迟以保持音画同步。");
++    obs_property_set_long_description(usage,
++        "屏蔽词、消音方式和延迟在 OBS 菜单「工具 → 语音消音设置」里统一设置。\n"
++        "关闭下面的开关后，这个音源仍按设置延迟，以保持音画同步。");
+ 
+     auto *filter = static_cast<ProfanityFilter *>(data);
+     if (filter && filter->delay_only) {
+-        obs_property_set_long_description(usage, "此滤镜由音画同步自动维护，仅延迟声音，不加载模型或识别。需要过滤的KOOK音源请另加普通语音屏蔽滤镜；自动同步随后会移除重复的仅同步滤镜。");
+-    } else obs_properties_add_bool(props, "enabled", "启用脏话过滤 (关闭时仅保留延迟)");
++        obs_property_set_long_description(usage, "此滤镜由画面同步自动添加和移除：只延迟声音，不识别、不消音。\n"
++                                                 "要给这个音源消音，请另加一个「语音消音」滤镜，插件会随后移除这个仅同步滤镜。");
++    } else obs_properties_add_bool(props, "enabled", "对这个音源消音（关闭后只延迟，不识别）");
+     
+     return props;
+ }
+@@ -179,7 +179,7 @@ struct obs_source_info profanity_filter_info = {
+ 
+ // --- Video Delay Filter Callbacks ---
+ 
+-static const char *get_name_video(void *unused) { return "语音屏蔽-视频同步延迟"; }
++static const char *get_name_video(void *unused) { return "语音消音-画面延迟"; }
+ 
+ static void *create_video(obs_data_t *settings, obs_source_t *context) {
+     return new VideoDelayFilter(context);
+@@ -216,14 +216,12 @@ static bool refresh_video_status(obs_properties_t *props, obs_property_t *p, voi
+ static obs_properties_t *get_properties_video(void *data) {
+     obs_properties_t *props = obs_properties_create();
+     
+-    obs_properties_add_group(props, "group_usage", "使用说明", OBS_GROUP_NORMAL, NULL);
+     obs_property_t *usage = obs_properties_add_text(props, "usage_info", "", OBS_TEXT_INFO);
+-    obs_property_set_long_description(usage, 
+-        "此滤镜会自动读取【语音脏话屏蔽设置】中的延迟时间并应用到视频。\n"
+-        "适用于整个场景或游戏捕获等渲染源。\n"
+-        "⚠️ 注意：高延迟会导致较大的显存占用。");
++    obs_property_set_long_description(usage,
++        "按「工具 → 语音消音设置」里的声音延迟推迟画面，让画面和消音后的声音对齐。\n"
++        "画面同步选“自动”时由插件添加和移除。延迟越长，显存占用越大。");
+ 
+-    obs_properties_add_button(props, "refresh_btn", "🔄 刷新状态", refresh_video_status);
++    obs_properties_add_button(props, "refresh_btn", "刷新状态", refresh_video_status);
+     
+     obs_property_t *status = obs_properties_add_text(props, "status_info", "", OBS_TEXT_INFO);
+     if (data) {
+@@ -281,7 +279,7 @@ MODULE_EXPORT bool obs_module_load(void)
+     InitGlobalConfig();
+     
+     // Register Menu Item
+-    obs_frontend_add_tools_menu_item("语音脏话屏蔽设置", [](void *){
++    obs_frontend_add_tools_menu_item("语音消音设置", [](void *){
+         OpenGlobalConfigDialog();
+     }, nullptr);
+     
+@@ -494,13 +492,13 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             blog(LOG_INFO, "[Speech Sync] restore default playback (auto): %s", message.c_str());
+             cable_restore_failed = !ok;
+             if (ok) {
+-                cable_notice = "直播伴侣模式：" + message + "（原来是CABLE，原声会绕过过滤进入直播）";
++                cable_notice = "直播伴侣模式：" + message + "（原来是CABLE，原声会绕过消音进入直播）";
+                 cable_notice_ticks = 10;
+                 companion_state = QueryCompanionAudio();
+             }
+         }
+         if (cable_restore_failed)
+-            append_sync_warning(std::string("原声会绕过过滤进入直播：Windows默认") +
++            append_sync_warning(std::string("原声会绕过消音进入直播：Windows默认") +
+                                 (st.console_is_cable ? "播放" : "通信") +
+                                 "设备是CABLE，自动改回失败，请在Windows声音设置里改成扬声器或耳机");
+     } else {
+@@ -543,7 +541,7 @@ static bool audible(obs_source_t *s) {
+ 
+ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode) {
+     if (voice_app_tick++ % 3 == 0) voice_apps = ActiveVoiceApps();
+-    const std::string F = "“语音脏话屏蔽 (全局配置)”";
++    const std::string F = "“语音消音”";
+     std::vector<std::string> lines;
+     int problems = 0;
+     auto bad = [&](const std::string &text) {
+@@ -579,8 +577,8 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+ 
+     for (auto *m : mics) {
+         if (!audible(m)) lines.push_back("· 麦克风" + name(m) + "已静音");
+-        else if (has_recognizing_filter(m)) lines.push_back("✓ 麦克风" + name(m) + "已过滤");
+-        else lines.push_back("✗ 麦克风" + name(m) + "没有过滤 → 在插件设置开启“自动过滤主播麦克风”，或右键它 → 滤镜 → 添加" + F);
++        else if (has_recognizing_filter(m)) lines.push_back("✓ 麦克风" + name(m) + "已消音");
++        else lines.push_back("✗ 麦克风" + name(m) + "没有消音 → 在插件设置开启“自动给麦克风加消音滤镜”，或右键它 → 滤镜 → 添加" + F);
+     }
+     if (mics.empty()) lines.push_back("· 没有找到麦克风音源");
+ 
+@@ -592,9 +590,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         }
+         desktop_on = true;
+         if (mode == 0)
+-            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已过滤（画面与声音整体延迟）" : "保留：游戏声音、音乐从这里进直播，不过滤"));
++            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已消音（画面与声音整体延迟）" : "保留：游戏声音、音乐从这里进直播，不消音"));
+         else
+-            bad("桌面音频" + name(d) + "还开着：它会把队友语音不经过滤再收进直播一次 → 在混音器里点它的喇叭图标静音");
++            bad("桌面音频" + name(d) + "还开着：它会把队友语音不经消音再收进直播一次 → 在混音器里点它的喇叭图标静音");
+     }
+ 
+     // Voice programs making sound whose sound reaches the stream only via desktop audio.
+@@ -615,10 +613,10 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         bool filtered = has_recognizing_filter(a);
+         voice_captured |= voice || filtered;
+         if (!audible(a)) lines.push_back("· 应用程序音频" + name(a) + "已静音");
+-        else if (voice && filtered) lines.push_back("✓ 队友语音" + name(a) + "已过滤");
+-        else if (voice) bad("队友语音" + name(a) + "没有过滤 → 右键它 → 滤镜 → 添加" + F);
+-        else if (filtered) lines.push_back("✓ 应用程序音频" + name(a) + "已过滤");
+-        else lines.push_back("· 应用程序音频" + name(a) + "没有过滤：如果它是语音软件，请右键它 → 滤镜 → 添加" + F);
++        else if (voice && filtered) lines.push_back("✓ 队友语音" + name(a) + "已消音");
++        else if (voice) bad("队友语音" + name(a) + "没有消音 → 右键它 → 滤镜 → 添加" + F);
++        else if (filtered) lines.push_back("✓ 应用程序音频" + name(a) + "已消音");
++        else lines.push_back("· 应用程序音频" + name(a) + "没有消音：如果它是语音软件，请右键它 → 滤镜 → 添加" + F);
+     }
+ 
+     if (mode == 0) {
+@@ -631,8 +629,8 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         for (auto *g : games) {
+             obs_source_t *audio = game_audio(g);
+             if (audio && has_recognizing_filter(audio))
+-                lines.push_back("· 游戏声音" + name(audio) + "已采集但也加了过滤：队友语音在语音软件里时游戏声音不需要过滤，删掉它的滤镜可让画面不延迟");
+-            else if (audio) lines.push_back("✓ 游戏声音" + name(audio) + "已采集（不过滤）");
++                lines.push_back("· 游戏声音" + name(audio) + "已采集但也加了消音滤镜：队友语音在语音软件里时游戏声音不需要消音，删掉它的滤镜可让画面不延迟");
++            else if (audio) lines.push_back("✓ 游戏声音" + name(audio) + "已采集（不消音）");
+             else bad("游戏采集" + name(g) + "没有采集声音：桌面音频静音后直播里没有游戏声音 → 双击它，勾选“采集音频”");
+         }
+         if (games.empty()) lines.push_back("· 没有找到游戏采集或窗口采集");
+@@ -644,8 +642,8 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+             else if (audio) no_filter = no_filter ? no_filter : audio;
+             else if (!no_audio || !strcmp(obs_source_get_id(g), "game_capture")) no_audio = g;
+         }
+-        if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已过滤，画面自动同步（整体晚约2秒）");
+-        else if (no_filter) bad("游戏声音" + name(no_filter) + "没有过滤 → 右键它 → 滤镜 → 添加" + F);
++        if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已消音，画面自动同步（整体晚约2秒）");
++        else if (no_filter) bad("游戏声音" + name(no_filter) + "没有消音 → 右键它 → 滤镜 → 添加" + F);
+         else if (no_audio) bad("游戏采集" + name(no_audio) + "没有采集声音 → 双击它，勾选“采集音频”，再右键它 → 滤镜 → 添加" + F);
+         else bad("没有找到游戏采集 → 来源列表点“+” → “游戏采集”，勾选“采集音频”，再添加" + F);
+     }
+@@ -693,15 +691,15 @@ static bool decide_sync(const std::vector<obs_source_t *> &sources, std::string
+             bool own_audio = obs_data_get_bool(settings, "capture_audio");
+             obs_data_release(settings);
+             if (!own_audio) continue;
+-            why = "过滤的是游戏声音：" + name;
++            why = "消音的是游戏声音：" + name;
+         } else if (flags & OBS_SOURCE_VIDEO)
+-            why = "过滤的声音带画面：" + name;
++            why = "消音的声音带画面：" + name;
+         else if (id_is(id, {"wasapi_output_capture", "pulse_output_capture", "coreaudio_output_capture"}))
+-            why = "过滤的是桌面音频：" + name;
++            why = "消音的是桌面音频：" + name;
+         else if (id_is(id, {"wasapi_process_output_capture"})) {
+             std::string exe = window_exe(s);
+             for (auto &e : captured_exes)
+-                if (!exe.empty() && e == exe) why = "过滤的是游戏声音：" + name;
++                if (!exe.empty() && e == exe) why = "消音的是游戏声音：" + name;
+         }
+         if (!why.empty()) {
+             if (!need) reason = why;
+@@ -815,13 +813,13 @@ void UpdateVideoDelayFiltersState() {
+                     obs_data_t *settings = obs_data_create();
+                     obs_data_set_bool(settings, "auto_microphone", true);
+                     obs_data_set_bool(settings, "enabled", true);
+-                    auto *filter = obs_source_create_private("profanity_filter", "语音屏蔽-主播麦克风", settings);
++                    auto *filter = obs_source_create_private("profanity_filter", "语音消音-主播麦克风", settings);
+                     obs_data_release(settings);
+                     if (filter) {
+                         obs_source_filter_add(source, filter);
+                         audio.push_back(filter);
+                         blog(LOG_INFO, "[Speech Sync] added microphone filter to \"%s\"", obs_source_get_name(source));
+-                    } else append_sync_warning("无法给主播麦克风添加过滤滤镜");
++                    } else append_sync_warning("无法给主播麦克风添加消音滤镜");
+                 }
+                 if (auto_mic && obs_source_active(source)) mic_seen = true;
+                 if (auto_mic && obs_source_active(source) && !obs_source_muted(source)) {
+@@ -833,15 +831,15 @@ void UpdateVideoDelayFiltersState() {
+                         obs_data_release(settings);
+                     }
+                     if (!filtering)
+-                        append_sync_warning("主播麦克风未过滤：" + std::string(obs_source_get_name(source)) +
+-                                            "的语音屏蔽滤镜被停用");
++                        append_sync_warning("主播麦克风未消音：" + std::string(obs_source_get_name(source)) +
++                                            "的语音消音滤镜被停用");
+                 }
+             }
+             if (enable && audio.empty()) {
+                 obs_data_t *settings = obs_data_create();
+                 obs_data_set_bool(settings, "sync_delay_only", true);
+                 obs_data_set_bool(settings, "enabled", false);
+-                auto *filter = obs_source_create_private("profanity_filter", "语音屏蔽-仅同步声音", settings);
++                auto *filter = obs_source_create_private("profanity_filter", "语音消音-仅同步声音", settings);
+                 obs_data_release(settings);
+                 if (filter) {
+                     obs_source_filter_add(source, filter);
+@@ -874,7 +872,7 @@ void UpdateVideoDelayFiltersState() {
+             if (enable && obs_source_active(source) && !obs_source_muted(source)) {
+                 std::string name = obs_source_get_name(source);
+                 if (count != 1)
+-                    append_sync_warning("同步异常：" + name + "需要且只能启用一个语音屏蔽音频滤镜");
++                    append_sync_warning("同步异常：" + name + "需要且只能启用一个语音消音音频滤镜");
+                 if (obs_source_get_sync_offset(source) != 0)
+                     append_sync_warning("同步异常：" + name + "另设了手动音频偏移，请在高级音频属性归零");
+             }
+@@ -883,7 +881,7 @@ void UpdateVideoDelayFiltersState() {
+             for (auto *filter : audio) {
+                 if (obs_source_enabled(filter))
+                     append_sync_warning("同步异常：场景或组合源“" + std::string(obs_source_get_name(source)) +
+-                                    "”另有音频缓存滤镜，请把语音过滤放在独立输入源上");
++                                    "”另有音频缓存滤镜，请把消音滤镜放在独立输入源上");
+                 obs_source_release(filter);
+             }
+         }
+@@ -891,7 +889,7 @@ void UpdateVideoDelayFiltersState() {
+     }
+ 
+     if (auto_mic && !mic_seen)
+-        append_sync_warning("未找到主播麦克风音源：请在场景中添加“音频输入采集”（设备选默认），或在插件设置关闭自动过滤主播麦克风");
++        append_sync_warning("未找到主播麦克风音源：请在场景中添加“音频输入采集”（设备选默认），或在插件设置关闭自动给麦克风加消音滤镜");
+ 
+     obs_frontend_source_list transitions = {};
+     obs_frontend_get_transitions(&transitions);
+@@ -899,7 +897,7 @@ void UpdateVideoDelayFiltersState() {
+         auto *transition = transitions.sources.array[i];
+         auto filters = filters_of_type(transition, "profanity_video_delay");
+         if (enable && filters.empty()) {
+-            auto *filter = obs_source_create_private("profanity_video_delay", "语音屏蔽-最终画面同步", nullptr);
++            auto *filter = obs_source_create_private("profanity_video_delay", "语音消音-最终画面同步", nullptr);
+             if (filter) {
+                 obs_source_filter_add(transition, filter);
+                 if (obs_filter_get_parent(filter) != transition)
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 7d23381..30219cb 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -70,11 +70,11 @@ void ProfanityFilter::FeedAsrResampler(const uint8_t *const *data, uint32_t fram
+ 
+ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+     GlobalConfig *cfg = GetGlobalConfig();
+-    if (!cfg) return {false, "过滤未生效，原声继续输出（插件配置未加载）"};
++    if (!cfg) return {false, "消音未生效，原声继续输出（插件配置未加载）"};
+     string expected_path;
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+-        if (!cfg->global_enable) return {false, "过滤已关闭，原声继续输出"};
++        if (!cfg->global_enable) return {false, "语音消音已关闭，原声照常输出"};
+         expected_path = cfg->model_path;
+     }
+     lock_guard<mutex> lock(instances_mutex);
+@@ -88,15 +88,15 @@ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+         string name = obs_source_get_name(parent);
+         lock_guard<mutex> history_lock(filter->history_mutex);
+         if (filter->is_loading) {
+-            loading = "过滤未生效，原声继续输出：" + name + "（模型加载中）";
++            loading = "消音未生效，原声继续输出：" + name + "（模型加载中）";
+         } else if (!filter->initialization_error.empty()) {
+-            return {false, "过滤未生效，原声继续输出：" + name + "（错误：" + filter->initialization_error + "）"};
++            return {false, "消音未生效，原声继续输出：" + name + "（错误：" + filter->initialization_error + "）"};
+         } else if (expected_path.empty() || filter->loaded_model_path != expected_path) {
+-            loading = "过滤未生效，原声继续输出：" + name + "（等待识别引擎）";
++            loading = "消音未生效，原声继续输出：" + name + "（等待识别引擎）";
+         }
+     }
+     if (!loading.empty()) return {true, loading};
+-    if (!active) return {false, "无启用过滤的活跃来源"};
++    if (!active) return {false, "没有正在使用的消音音源"};
+     return {false, "模型运行中"};
+ }
+ 
+diff --git a/src/video-delay.cpp b/src/video-delay.cpp
+index 578d0a0..30ba4b1 100644
+--- a/src/video-delay.cpp
++++ b/src/video-delay.cpp
+@@ -242,15 +242,15 @@ std::string VideoDelayFilter::GetStatusString() {
+     uint32_t count = current_frame_count.load();
+     
+     std::stringstream ss;
+-    ss << "同步缓冲: " << ms << " ms (" << count << " 帧)\n";
+-    ss << "显存占用: " << std::fixed << std::setprecision(1) << mb << " MB";
++    ss << "画面延迟：" << ms << " ms（缓存 " << count << " 帧）\n";
++    ss << "显存占用：" << std::fixed << std::setprecision(1) << mb << " MB";
+     
+     if (count == 0 && ms > 0) {
+-        ss << "\n(当前场景未激活，已释放显存)";
++        ss << "\n当前场景没有用到这个画面，显存已释放。";
+     }
+     
+     if (mb > 1000.0) {
+-        ss << "\n⚠️ 警告: 显存占用较高!";
++        ss << "\n显存占用较高：可缩短声音延迟，或把画面同步改为“自动”。";
+     }
+     
+     return ss.str();
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,229 @@
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index bce2dff..005b362 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -5,6 +5,8 @@
+ #include "utils.hpp"
+ #include <obs-module.h>
+ #include <obs.h>
++#include <obs-frontend-api.h>
++#include <util/config-file.h>
+ #include <filesystem>
+ #include <fstream>
+ #include <sstream>
+@@ -55,6 +57,42 @@ void GlobalConfig::ParsePatterns() {
+     }
+ }
+ 
++void GlobalConfig::NormalizeDelay() {
++    double padding = censor_padding_ms / 1000.0;
++    if (delay_follows_padding)
++        delay_seconds = padding + kAutoDelayMarginMs / 1000.0;
++    else if (delay_seconds < padding + kMinDelayMarginMs / 1000.0)
++        delay_seconds = padding + kMinDelayMarginMs / 1000.0;
++}
++
++// OBS "stream delay" (Settings > Advanced) delays only the encoded stream output. It
++// gives the recognizer no lookahead, so it does not help censoring; it adds to the
++// viewers' latency. Returns 0 when disabled.
++static int obs_stream_delay_seconds() {
++    config_t *profile = obs_frontend_get_profile_config();
++    if (!profile || !config_get_bool(profile, "Output", "DelayEnable")) return 0;
++    return (int)config_get_uint(profile, "Output", "DelaySec");
++}
++
++std::string GetViewerLatencyText() {
++    GlobalConfig *cfg = GetGlobalConfig();
++    if (!cfg) return "";
++    double delay;
++    {
++        lock_guard<std::mutex> lock(cfg->mutex);
++        if (!cfg->global_enable) return "";
++        delay = cfg->delay_seconds;
++    }
++    int obs_delay = obs_stream_delay_seconds();
++    char text[256];
++    if (obs_delay > 0)
++        snprintf(text, sizeof(text), "推流观众约晚%.1f秒（插件%.1f秒+OBS串流延迟%d秒，后者不参与消音）",
++                 delay + obs_delay, delay, obs_delay);
++    else
++        snprintf(text, sizeof(text), "观众约晚%.1f秒", delay);
++    return text;
++}
++
+ void GlobalConfig::Save() {
+     obs_data_t *data = obs_data_create();
+     string path_to_save;
+@@ -76,6 +114,7 @@ void GlobalConfig::Save() {
+         obs_data_set_bool(data, "enable_agc", enable_agc);
+         obs_data_set_bool(data, "video_delay_enabled", video_delay_enabled);
+         obs_data_set_bool(data, "auto_filter_microphones", auto_filter_microphones);
++        obs_data_set_bool(data, "delay_follows_padding", delay_follows_padding);
+ 
+         // GPU Settings
+         obs_data_set_bool(data, "enable_gpu", enable_gpu);
+@@ -154,6 +193,7 @@ void GlobalConfig::Load() {
+     if (json_path.empty() || !filesystem::exists(json_path)) {
+         video_delay_enabled = true;
+         is_first_run = true;
++        NormalizeDelay();
+         ParsePatterns();
+         return;
+     }
+@@ -207,6 +247,9 @@ void GlobalConfig::Load() {
+         if (obs_data_has_user_value(data, "auto_filter_microphones")) {
+             auto_filter_microphones = obs_data_get_bool(data, "auto_filter_microphones");
+         }
++        if (obs_data_has_user_value(data, "delay_follows_padding")) {
++            delay_follows_padding = obs_data_get_bool(data, "delay_follows_padding");
++        }
+ 
+         // GPU Settings
+         if (obs_data_has_user_value(data, "enable_gpu")) {
+@@ -223,6 +266,7 @@ void GlobalConfig::Load() {
+         obs_data_release(data);
+     }
+     
++    NormalizeDelay();
+     ParsePatterns();
+     loaded = true;
+ }
+@@ -348,6 +392,15 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     spinCensorPadding->setSuffix(" ms");
+     spinCensorPadding->setToolTip("在命中词开始前和结束后各扩展此时长。\n也会屏蔽相邻正常声音；不能补救完全未命中的词。\n全局延迟应大于前扩展时间，并留出识别耗时。");
+     layoutAudio->addRow("命中词前后各扩展:", spinCensorPadding);
++    chkDelayAuto = new QCheckBox("延迟自动跟随屏蔽扩展（推荐）");
++    chkDelayAuto->setToolTip("开启时全局延迟 = 前后扩展 + 2秒（识别耗时余量），只需调整扩展。\n关闭后可手动设置延迟，但不能低于 扩展 + 1.5秒，否则词头会在静音前播出。");
++    layoutAudio->addRow("", chkDelayAuto);
++    lblLatency = new QLabel();
++    lblLatency->setWordWrap(true);
++    lblLatency->setToolTip("插件延迟让识别有时间在声音播出前找到并静音命中词，画面同步延迟同样时长；推流和录制都有。\nOBS“设置→高级→串流延迟”只推迟已编码的推流输出，不参与消音，也不影响录制；开启时观众还要再多等这么久。");
++    layoutAudio->addRow("观众延迟:", lblLatency);
++    connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
++    connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
+     layoutAudio->addRow("", chkEnableAGC);
+     chkAutoFilterMic = new QCheckBox("自动过滤主播麦克风");
+     chkAutoFilterMic->setToolTip("开启后，自动给场景中的麦克风音源（音频输入采集）加上识别过滤滤镜。\n麦克风设备选“默认”时跟随Windows默认录音设备。\n关闭后移除自动添加的麦克风滤镜（开启音画同步时改为仅同步延迟）；手动添加的滤镜不受影响。");
+@@ -565,6 +618,8 @@ void ConfigDialog::LoadToUI() {
+ 
+     chkEnableVideoDelay->setChecked(cfg->video_delay_enabled);
+     chkAutoFilterMic->setChecked(cfg->auto_filter_microphones);
++    chkDelayAuto->setChecked(cfg->delay_follows_padding);
++    updateDelayUI();
+ 
+     // GPU Settings
+     chkEnableGpu->setChecked(cfg->enable_gpu);
+@@ -585,7 +640,28 @@ void ConfigDialog::LoadToUI() {
+     onModelComboChanged(comboModel->currentIndex());
+ }
+ 
++void ConfigDialog::updateDelayUI() {
++    int padding = spinCensorPadding->value();
++    if (chkDelayAuto->isChecked()) {
++        spinDelay->setMinimum(0);
++        spinDelay->setValue(padding + GlobalConfig::kAutoDelayMarginMs);
++        spinDelay->setEnabled(false);
++    } else {
++        spinDelay->setEnabled(true);
++        spinDelay->setMinimum(padding + GlobalConfig::kMinDelayMarginMs);
++    }
++}
++
+ void ConfigDialog::updateStatus() {
++    {
++        int obs_delay = obs_stream_delay_seconds();
++        double delay = spinDelay->value() / 1000.0;
++        QString text = obs_delay > 0
++            ? QString("推流观众约晚 %1 秒 = 插件 %2 秒 + OBS串流延迟 %3 秒（OBS串流延迟不参与消音，可在OBS设置→高级关闭）")
++                  .arg(delay + obs_delay, 0, 'f', 1).arg(delay, 0, 'f', 1).arg(obs_delay)
++            : QString("观众约晚 %1 秒（插件延迟，推流与录制都有）").arg(delay, 0, 'f', 1);
++        lblLatency->setText(text);
++    }
+     {
+         auto level = ProfanityFilter::GetLevelReport(false);
+         lblRecognitionLevel->setText(QString::fromStdString(level.empty() ? "无活跃来源" : level));
+@@ -639,6 +715,7 @@ void ConfigDialog::onModelComboChanged(int index) {
+                 int recommended = m.delay;
+                 if (spinDelay->value() < recommended) {
+                     spinDelay->setValue(recommended);
++                    updateDelayUI(); // auto mode keeps padding + margin
+                     // Optional: Maybe show a tooltip or flash?
+                     // For now just auto-updating is safest for user experience.
+                 }
+@@ -818,10 +895,11 @@ void ConfigDialog::onBrowseModel() {
+ }
+ 
+ bool ConfigDialog::onApply() {
+-    if (chkGlobalEnable->isChecked() && spinDelay->value() <= spinCensorPadding->value()) {
++    if (chkGlobalEnable->isChecked() && !chkDelayAuto->isChecked() &&
++        spinDelay->value() < spinCensorPadding->value() + GlobalConfig::kMinDelayMarginMs) {
+         QMessageBox::warning(this, "缓存时间不足",
+-            "全局延迟必须大于命中词前扩展时间，且应额外留出识别耗时。\n"
+-            "例如前后各扩展1000ms，可先使用3000ms全局延迟测试。\n"
++            "手动延迟不能低于 命中词前扩展 + 1.5秒（识别耗时余量）。\n"
++            "建议勾选“延迟自动跟随屏蔽扩展”，由插件按 扩展 + 2秒 设置。\n"
+             "已经播出的声音无法追回，请调整后应用。");
+         return false;
+     }
+@@ -871,6 +949,8 @@ bool ConfigDialog::onApply() {
+ 
+         cfg->video_delay_enabled = chkEnableVideoDelay->isChecked();
+         cfg->auto_filter_microphones = chkAutoFilterMic->isChecked();
++        cfg->delay_follows_padding = chkDelayAuto->isChecked();
++        cfg->NormalizeDelay();
+ 
+         // GPU Settings
+         cfg->enable_gpu = chkEnableGpu->isChecked();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index bad9e96..d7a4e79 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -30,6 +30,9 @@
+ #include <regex>
+ 
+ // Global Configuration Structure
++// Viewer latency summary for the status bar ("" when the plugin is disabled).
++std::string GetViewerLatencyText();
++
+ struct GlobalConfig {
+     bool loaded = false;
+     bool is_first_run = false;
+@@ -50,6 +53,12 @@ struct GlobalConfig {
+     bool asr_debug_logging = false;
+     bool video_delay_enabled = true;
+     bool auto_filter_microphones = true; // attach a recognizing filter to microphone inputs
++    // Delay = padding + recognition margin. The delay must exceed the front padding plus
++    // the time recognition needs, otherwise a word starts playing before it is muted.
++    bool delay_follows_padding = true;
++    static constexpr int kAutoDelayMarginMs = 2000; // used when delay follows padding
++    static constexpr int kMinDelayMarginMs = 1500;  // lower bound for a manual delay
++    void NormalizeDelay(); // call with mutex held (or before the config is shared)
+ 
+     // GPU Acceleration Settings
+     bool enable_gpu = false;           // GPU 加速总开关
+@@ -114,6 +123,9 @@ private:
+     QSpinBox *spinCensorPadding;
+     QCheckBox *chkEnableAGC;
+     QCheckBox *chkAutoFilterMic;
++    QCheckBox *chkDelayAuto;
++    QLabel *lblLatency;
++    void updateDelayUI();
+ 
+     QCheckBox *chkMuteMode; // Deprecated UI, replaced by comboEffect
+     QComboBox *comboEffect;
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 0520037..c9a7a67 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -81,8 +81,10 @@ static void start_filter_warning() {
+         filter_warning->setStyleSheet(message.empty()
+             ? "color: #88cc88; padding: 3px;"
+             : "color: #ffcc66; font-weight: bold; padding: 3px;");
++        std::string latency = GetViewerLatencyText();
+         filter_warning->setText(QString::fromStdString(message.empty()
+-            ? (syncing ? "音画同步：自动维护中（画面与各独立音源使用同一延迟）" : "语音过滤与自动同步已关闭") : message));
++            ? (syncing ? "音画同步：自动维护中（画面与各独立音源使用同一延迟）" + (latency.empty() ? "" : "；" + latency)
++                       : "语音过滤与自动同步已关闭") : message));
+         static std::string last_message;
+         std::string current = filter_warning->text().toStdString();
+         if (current != last_message) {

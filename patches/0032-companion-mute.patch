@@ -1,0 +1,176 @@
+From 729dbb55c847a0e2715ac5dc91c5b24f1f674388 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Fri, 13 Nov 2026 05:39:53 -0700
+Subject: [PATCH] companion-mute: in companion mode a source is monitored (sent
+ into VB-CABLE, i.e. broadcast) only while it is active, unmuted and enabled;
+ a muted source's monitoring is switched off at once (mute signal) and
+ restored on unmute, the user's own monitoring type is kept in private
+ settings and put back on unmute or when companion mode is turned off; OBS 33
+ keeps monitoring muted sources and has no monitor-only type, earlier versions
+ write silence, the rule is the same for all versions
+
+---
+ src/plugin-main.cpp | 117 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 99 insertions(+), 18 deletions(-)
+
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 3072923..a318f23 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -12,6 +12,7 @@
+ #include <QStatusBar>
+ #include <QLabel>
+ #include <QTimer>
++#include <QCoreApplication>
+ #include <QPointer>
+ #include <cstring>
+ #include <util/platform.h>
+@@ -480,6 +481,92 @@ static void DisableCableOnExit() {
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled on exit%s", SetCableRenderEnabled(false) ? "" : " (failed)");
+ }
+ 
++// In companion mode the cable carries what OBS monitors, so a source is monitored exactly
++// when it would be heard in an OBS output: active in the program, not muted, enabled.
++// Muting has to switch monitoring off: since OBS 33.0 a muted source keeps playing to the
++// monitoring device (libobs "Output monitor audio while muted"); earlier versions write
++// silence. The rule is the same for every version.
++// Private settings: "companion_monitor" = switched on by us from "not monitored";
++// "companion_held" = the user's own monitoring type + 1, switched off while muted and
++// put back when the source is unmuted or companion mode is turned off.
++static void companion_apply_monitoring(obs_source_t *s) {
++    auto type = obs_source_get_monitoring_type(s);
++    obs_data_t *priv = obs_source_get_private_settings(s);
++    bool ours = obs_data_get_bool(priv, "companion_monitor");
++    int held = (int)obs_data_get_int(priv, "companion_held");
++    bool muted = obs_source_muted(s) || !obs_source_enabled(s);
++    bool active = obs_source_active(s);
++    const char *name = obs_source_get_name(s);
++    if (ours && type != OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT) {
++        // The user changed what we had switched on; from now on it is theirs.
++        ours = false;
++        obs_data_set_bool(priv, "companion_monitor", false);
++    }
++    if (held && !muted) {
++        if (type == OBS_MONITORING_TYPE_NONE) {
++            type = (obs_monitoring_type)(held - 1);
++            obs_source_set_monitoring_type(s, type);
++            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" unmuted, own monitoring restored", name);
++        }
++        obs_data_erase(priv, "companion_held");
++    }
++    if (muted) {
++        if (type != OBS_MONITORING_TYPE_NONE) {
++            if (ours) obs_data_set_bool(priv, "companion_monitor", false);
++            else obs_data_set_int(priv, "companion_held", (int)type + 1);
++            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" muted, monitoring off", name);
++        }
++    } else if (active && type == OBS_MONITORING_TYPE_NONE) {
++        obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
++        obs_data_set_bool(priv, "companion_monitor", true);
++        blog(LOG_INFO, "[Speech Sync] companion: \"%s\" monitor and output", name);
++    } else if (!active && ours) {
++        if (type == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
++            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++        obs_data_set_bool(priv, "companion_monitor", false);
++        blog(LOG_INFO, "[Speech Sync] companion: \"%s\" inactive, monitoring off", name);
++    }
++    obs_data_release(priv);
++}
++
++// Mute/unmute applies at once instead of on the next one-second check; the signal can come
++// from any thread, so the change is made on the UI thread like the periodic check.
++static std::vector<obs_weak_source_t *> mute_hooked;
++static void on_source_mute(void *, calldata_t *cd) {
++    auto *s = static_cast<obs_source_t *>(calldata_ptr(cd, "source"));
++    if (!s) return;
++    obs_weak_source_t *weak = obs_source_get_weak_source(s);
++    QMetaObject::invokeMethod(qApp, [weak] {
++        obs_source_t *src = obs_weak_source_get_source(weak);
++        obs_weak_source_release(weak);
++        if (!src) return;
++        if (companion_was_on && is_audio_input(src)) companion_apply_monitoring(src);
++        obs_source_release(src);
++    }, Qt::QueuedConnection);
++}
++static void hook_mute_signal(obs_source_t *s) {
++    for (auto it = mute_hooked.begin(); it != mute_hooked.end();) {
++        if (obs_weak_source_references_source(*it, s)) return;
++        if (obs_weak_source_expired(*it)) {
++            obs_weak_source_release(*it);
++            it = mute_hooked.erase(it);
++        } else ++it;
++    }
++    signal_handler_connect(obs_source_get_signal_handler(s), "mute", on_source_mute, nullptr);
++    mute_hooked.push_back(obs_source_get_weak_source(s));
++}
++static void unhook_mute_signals() {
++    for (auto *weak : mute_hooked) {
++        if (obs_source_t *s = obs_weak_source_get_source(weak)) {
++            signal_handler_disconnect(obs_source_get_signal_handler(s), "mute", on_source_mute, nullptr);
++            obs_source_release(s);
++        }
++        obs_weak_source_release(weak);
++    }
++    mute_hooked.clear();
++}
++
+ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool on) {
+     static bool first_tick = true;
+     bool first = first_tick;
+@@ -504,6 +591,12 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+                         obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
+                     obs_data_set_bool(priv, "companion_monitor", false);
+                 }
++                // The user's own monitoring, switched off while the source was muted.
++                if (int held = (int)obs_data_get_int(priv, "companion_held")) {
++                    if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_NONE)
++                        obs_source_set_monitoring_type(s, (obs_monitoring_type)(held - 1));
++                    obs_data_erase(priv, "companion_held");
++                }
+                 obs_data_release(priv);
+             }
+             const char *name = nullptr, *id = nullptr;
+@@ -571,26 +664,13 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         }
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE enabled: reopened monitoring of %d sources", count);
+     }
+-    // Mirror the OBS output mix: only sources active in the program are monitored, so a
+-    // source in another scene cannot reach the cable; it is restored when it leaves.
++    // Mirror the OBS output mix (see companion_apply_monitoring).
+     for (auto *s : sources) {
+         if (!is_audio_input(s)) continue;
+-        auto type = obs_source_get_monitoring_type(s);
+-        obs_data_t *priv = obs_source_get_private_settings(s);
+-        bool ours = obs_data_get_bool(priv, "companion_monitor");
+-        bool active = obs_source_active(s);
+-        if (active && type == OBS_MONITORING_TYPE_NONE) {
+-            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
+-            obs_data_set_bool(priv, "companion_monitor", true);
+-            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" monitor and output", obs_source_get_name(s));
+-        } else if (!active && ours) {
+-            if (type == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
+-                obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
+-            obs_data_set_bool(priv, "companion_monitor", false);
+-            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" inactive, monitoring off", obs_source_get_name(s));
+-        }
+-        obs_data_release(priv);
+-        if (type == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) && !obs_source_muted(s)) {
++        hook_mute_signal(s);
++        companion_apply_monitoring(s);
++        if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) &&
++            !obs_source_muted(s)) {
+             add_warning(WARN_LEAK, std::string("“") + obs_source_get_name(s) +
+                                 "”设为仅监听，伴侣模式下它也会进入直播");
+         }
+@@ -1219,6 +1299,7 @@ MODULE_EXPORT void obs_module_unload(void)
+ {
+     delete filter_warning_timer;
+     delete filter_warning;
++    unhook_mute_signals();
+     DisableCableOnExit();
+     FreeHeardSources();
+     FreeConfigDialog();
+-- 
+2.55.0.windows.5
+

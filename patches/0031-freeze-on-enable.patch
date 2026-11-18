@@ -1,0 +1,73 @@
+From 76fcf9f0206db7a1cfcb60b10a5b4fc22027e149 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Mon, 9 Nov 2026 06:31:01 -0700
+Subject: [PATCH] freeze-on-enable: while the picture delay cache fills (plugin
+ switched on, delay changed, source shown again) the first frame captured
+ since then is held instead of black; the frame in which the switch-on arrives
+ before the cache exists is passed through instead of black
+
+---
+ src/video-delay.cpp | 29 +++++++++++++++++++++--------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/src/video-delay.cpp b/src/video-delay.cpp
+index 30ba4b1..63a1670 100644
+--- a/src/video-delay.cpp
++++ b/src/video-delay.cpp
+@@ -259,13 +259,24 @@ std::string VideoDelayFilter::GetStatusString() {
+ void VideoDelayFilter::DrawFrame() {
+     if (frames.empty()) return;
+     
+-    FrameData &frame = frames.front(); // peek front
+-    if (!frame.captured_at) {
++    // While the cache fills (switched on, delay changed, source shown again) hold the
++    // first frame captured since then, i.e. the picture at that moment, instead of black.
++    // The sound is silent meanwhile, so the early frame has nothing to be out of sync with.
++    FrameData *shown = &frames.front();
++    if (!shown->captured_at) {
+         warming = true;
+-        return;
++        shown = nullptr;
++        for (auto &f : frames)
++            if (f.captured_at) {
++                shown = &f;
++                break;
++            }
++        if (!shown) return;
++    } else {
++        observed_delay_ns = os_gettime_ns() - shown->captured_at;
++        warming = false;
+     }
+-    observed_delay_ns = os_gettime_ns() - frame.captured_at;
+-    warming = false;
++    FrameData &frame = *shown;
+ 
+     const enum gs_color_space current_space = gs_get_color_space();
+     float multiplier;
+@@ -295,10 +306,12 @@ void VideoDelayFilter::Render(gs_effect_t *effect) {
+     obs_source_t *parent = obs_filter_get_parent(context);
+ 
+     if (!target_valid || !target || !parent || frames.empty()) {
+-        // Never expose an undelayed frame while the delay cache is starting.
++        // Never pass the live picture through while the delay cache is starting. delay_ns
++        // is set in Tick: right after switching on, before the first Tick has built the
++        // cache, pass this one frame through (the same picture then held) instead of black.
+         GlobalConfig *cfg = GetGlobalConfig();
+         bool delaying = false;
+-        if (cfg) {
++        if (cfg && delay_ns > 0) {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+             delaying = cfg->global_enable && cfg->video_delay_enabled && cfg->delay_seconds > 0;
+         }
+@@ -391,7 +404,7 @@ std::string VideoDelayFilter::GetSyncWarning() {
+         if (!parent || !obs_source_active(parent) || !obs_source_enabled(filter->context)) continue;
+         found = true;
+         if (filter->render_failed) return "画面同步异常：视频缓存渲染失败";
+-        if (filter->warming) return "画面同步缓冲中，暂不输出未延迟画面";
++        if (filter->warming) return "画面同步缓冲中，画面暂时定格";
+         if (os_gettime_ns() - filter->last_render_ts.load() > 2000000000ULL)
+             return "画面同步异常：最终画面超过2秒未更新（也可能关闭了预览且尚未输出）";
+         uint64_t actual = filter->observed_delay_ns;
+-- 
+2.55.0.windows.5
+

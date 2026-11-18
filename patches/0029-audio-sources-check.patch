@@ -1,0 +1,1077 @@
+From e8935283fb179fed2e394044c990428efbfa2959 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Mon, 9 Nov 2026 03:42:43 -0700
+Subject: [PATCH] =?UTF-8?q?audio-sources-check:=20status=20bar=20shows=20t?=
+ =?UTF-8?q?he=20most=20severe=20item=20with=20a=20count=20(full=20list=20i?=
+ =?UTF-8?q?n=20the=20tooltip,=20click=20opens=20the=20settings);=20checkli?=
+ =?UTF-8?q?st=20grouped=20as=20=E2=9C=97=20/=20=EF=BC=9F=20/=20merged=20?=
+ =?UTF-8?q?=E2=9C=93=20/=20=C2=B7=20with=20inline=20actions=20(=E5=8A=A0?=
+ =?UTF-8?q?=E6=B6=88=E9=9F=B3,=20=E9=9D=99=E9=9F=B3,=20=E4=B8=8D=E7=94=A8?=
+ =?UTF-8?q?=E6=B6=88=E9=9F=B3,=20=E6=81=A2=E5=A4=8D=E6=A3=80=E6=9F=A5);=20?=
+ =?UTF-8?q?sources=20that=20are=20heard=20but=20unknown=20(camera/capture-?=
+ =?UTF-8?q?card=20audio,=20ASIO,=20NDI)=20and=20media/browser=20sources=20?=
+ =?UTF-8?q?are=20listed;=20VB-CABLE=20matched=20by=20its=20description=20o?=
+ =?UTF-8?q?nly;=20an=20input=20recording=20CABLE=20Output=20keeps=20the=20?=
+ =?UTF-8?q?cable=20enabled=20(scanned=20before=20the=20cable=20is=20mainta?=
+ =?UTF-8?q?ined),=20and=20in=20companion=20mode=20it=20is=20flagged=20as?=
+ =?UTF-8?q?=20an=20echo=20loop;=20a=20default=20recording=20device=20that?=
+ =?UTF-8?q?=20resolves=20to=20CABLE=20Output=20is=20flagged;=20companion?=
+ =?UTF-8?q?=20mode=20saves=20the=20previous=20monitoring=20device=20in=20t?=
+ =?UTF-8?q?he=20profile=20and=20restores=20it=20when=20turned=20off,=20als?=
+ =?UTF-8?q?o=20after=20a=20restart;=20the=20auto=20microphone=20filter=20i?=
+ =?UTF-8?q?s=20moved=20first=20in=20the=20chain=20(before=20a=20VST=20voic?=
+ =?UTF-8?q?e=20changer);=20no=20device=20changes=20while=20OBS=20exits?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/companion-audio.cpp |  44 +++-
+ src/companion-audio.hpp |   6 +
+ src/plugin-config.cpp   | 124 +++++++++--
+ src/plugin-config.hpp   |   2 +
+ src/plugin-main.cpp     | 463 +++++++++++++++++++++++++++++++---------
+ 5 files changed, 520 insertions(+), 119 deletions(-)
+
+diff --git a/src/companion-audio.cpp b/src/companion-audio.cpp
+index b19e462..96f4ddc 100644
+--- a/src/companion-audio.cpp
++++ b/src/companion-audio.cpp
+@@ -62,8 +62,11 @@ std::string endpoint_name(IMMDevice *device) {
+     return name;
+ }
+ 
++// Standard VB-CABLE only. A friendly name is "<endpoint name> (<device description>)"; the
++// endpoint part can be renamed in Windows, the description cannot. The paid A+B cables
++// ("VB-Audio Cable A/B") and Hi-Fi cable have other descriptions and are left alone.
+ bool is_cable_name(const std::string &name) {
+-    return name.find("CABLE") != std::string::npos && name.find("VB-Audio") != std::string::npos;
++    return name.find("VB-Audio Virtual Cable") != std::string::npos;
+ }
+ 
+ bool is_virtual_name(const std::string &name) {
+@@ -318,6 +321,45 @@ bool SetCableRenderEnabled(bool enabled) {
+ 
+ #endif
+ 
++std::string CaptureDeviceName(const std::string &device_id) {
++#ifdef _WIN32
++    ComScope com;
++    IMMDeviceEnumerator *e = nullptr;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&e)))) return "";
++    IMMDevice *d = nullptr;
++    HRESULT hr;
++    if (device_id.empty() || device_id == "default") {
++        // OBS opens "default" for an audio input as the default communications device
++        // (win-wasapi.cpp, OBS 28–33).
++        hr = e->GetDefaultAudioEndpoint(eCapture, eCommunications, &d);
++    } else {
++        int n = MultiByteToWideChar(CP_UTF8, 0, device_id.c_str(), -1, nullptr, 0);
++        std::wstring w(n > 0 ? n - 1 : 0, L'\0');
++        if (n > 1) MultiByteToWideChar(CP_UTF8, 0, device_id.c_str(), -1, w.data(), n);
++        hr = e->GetDevice(w.c_str(), &d);
++    }
++    std::string name;
++    if (SUCCEEDED(hr) && d) {
++        name = endpoint_name(d);
++        d->Release();
++    }
++    e->Release();
++    return name;
++#else
++    (void)device_id;
++    return "";
++#endif
++}
++
++bool IsCableEndpointName(const std::string &name) {
++#ifdef _WIN32
++    return is_cable_name(name);
++#else
++    (void)name;
++    return false;
++#endif
++}
++
+ bool IsVoiceAppExe(const std::string &exe) {
+ #ifdef _WIN32
+     for (auto &k : known_voice_apps)
+diff --git a/src/companion-audio.hpp b/src/companion-audio.hpp
+index 955afb0..e7833b4 100644
+--- a/src/companion-audio.hpp
++++ b/src/companion-audio.hpp
+@@ -34,6 +34,12 @@ struct VoiceApp {
+     std::string label; // display name, e.g. "KOOK"
+ };
+ std::vector<VoiceApp> ActiveVoiceApps();
++// Friendly name of the recording device an OBS audio input opens ("default" = Windows
++// default communications recording device, as OBS uses). Empty when not found.
++std::string CaptureDeviceName(const std::string &device_id);
++// True for a standard VB-CABLE endpoint ("... (VB-Audio Virtual Cable)").
++bool IsCableEndpointName(const std::string &name);
++
+ // True for the executable of a known voice chat program (lower-case name).
+ bool IsVoiceAppExe(const std::string &exe);
+ 
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index d5286a4..01f9faa 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -29,6 +29,7 @@
+ #include <QCoreApplication>
+ #include <QWheelEvent>
+ #include <QPixmap>
++#include <QMap>
+ 
+ using namespace std;
+ 
+@@ -431,25 +432,64 @@ void GlobalConfig::Load() {
+ 
+ // --- UI Implementation ---
+ 
+-// Check lines start with ✓ (fine), ✗ (needs a change) or · (information). Shown as rich
+-// text with a colored mark so problems stand out; the rest of the line is escaped.
++// Check lines start with ✓ (fine), ✗ (needs a change), ？ (the user decides) or ·
++// (information). Text after " → " is the manual fix and goes on an indented grey second
++// line; actions after "\x1f" become links handled by ConfigDialog::onCheckAction.
++// Problems come first, all ✓ lines are merged into one, information last.
+ static QString ColorCheckLines(const QStringList &lines) {
+-    QString html;
++    const QString red = "#F56C6C", orange = "#E6A23C", green = "#67C23A", grey = "#9a9cab", link = "#58a6ff";
++    QStringList bad, ask, ok, info;
+     for (const QString &line : lines) {
+-        QString color, mark, rest = line;
+-        if (line.startsWith(QString::fromUtf8("✓"))) color = "#67C23A";
+-        else if (line.startsWith(QString::fromUtf8("✗"))) color = "#F56C6C";
+-        else if (line.startsWith(QString::fromUtf8("·"))) color = "#9a9cab";
+-        if (!color.isEmpty()) {
+-            mark = line.left(1);
+-            rest = line.mid(1);
++        if (line.startsWith(QString::fromUtf8("✗"))) bad << line;
++        else if (line.startsWith(QString::fromUtf8("？"))) ask << line;
++        else if (line.startsWith(QString::fromUtf8("✓"))) ok << line;
++        else info << line;
++    }
++    auto item = [&](const QString &line, const QString &color, bool color_title) {
++        QStringList parts = line.split(QChar(0x1f));
++        QString text = parts.takeFirst();
++        QString mark = text.left(1);
++        text = text.mid(1).trimmed();
++        QString fix;
++        int arrow = text.indexOf(QString::fromUtf8(" → "));
++        if (arrow >= 0) {
++            fix = text.mid(arrow + 3);
++            text = text.left(arrow);
++        }
++        static const QMap<QString, QString> labels = {
++            {"add", QString::fromUtf8("加消音")}, {"mute", QString::fromUtf8("静音")},
++            {"ignore", QString::fromUtf8("不用消音")}, {"unignore", QString::fromUtf8("恢复检查")}};
++        QString links;
++        for (const QString &a : parts) {
++            QString kind = a.section(':', 0, 0);
++            if (!labels.contains(kind)) continue;
++            QString target = a.section(':', 1);
++            links += QString("&nbsp;&nbsp;<a href=\"%1:%2\" style=\"color:%3;\">%4</a>")
++                         .arg(kind, QString::fromLatin1(QUrl::toPercentEncoding(target)), link, labels[kind]);
++        }
++        QString html = QString("<div style=\"margin-top:3px;\"><span style=\"color:%1; font-weight:bold;\">%2</span> ")
++                           .arg(color, mark.toHtmlEscaped());
++        html += color_title ? QString("<span style=\"color:%1;\">%2</span>").arg(color, text.toHtmlEscaped())
++                            : QString("<span style=\"color:%1;\">%2</span>").arg(mark == QString::fromUtf8("·") ? grey : "", text.toHtmlEscaped());
++        html += links + "</div>";
++        if (!fix.isEmpty())
++            html += QString("<div style=\"margin-left:16px; color:%1;\">%2</div>").arg(grey, fix.toHtmlEscaped());
++        return html;
++    };
++    QString html;
++    for (auto &l : bad) html += item(l, red, true);
++    for (auto &l : ask) html += item(l, orange, false);
++    if (!ok.isEmpty()) {
++        QStringList texts;
++        for (auto &l : ok) {
++            QString t = l.split(QChar(0x1f)).first().mid(1).trimmed();
++            if (t.endsWith(QString::fromUtf8("。"))) t.chop(1);
++            texts << t.toHtmlEscaped();
+         }
+-        if (!html.isEmpty()) html += "<br>";
+-        if (!mark.isEmpty()) html += QString("<span style=\"color:%1; font-weight:bold;\">%2</span>").arg(color, mark);
+-        QString body = rest.toHtmlEscaped();
+-        if (color == "#F56C6C") body = QString("<span style=\"color:%1;\">%2</span>").arg(color, body);
+-        html += body;
++        html += QString("<div style=\"margin-top:3px;\"><span style=\"color:%1; font-weight:bold;\">✓</span> %2</div>")
++                    .arg(green, texts.join(QString::fromUtf8("；")));
+     }
++    for (auto &l : info) html += item(l, grey, false);
+     return html;
+ }
+ 
+@@ -583,6 +623,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     lblAudioSetup->setWordWrap(true);
+     lblAudioSetup->setTextFormat(Qt::RichText);
+     lblAudioSetup->setTextInteractionFlags(Qt::TextSelectableByMouse);
++    lblAudioSetup->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::LinksAccessibleByMouse);
++    connect(lblAudioSetup, &QLabel::linkActivated, this, [this](const QString &link) { onCheckAction(link); });
+     layoutSources->addRow("当前场景检查：", lblAudioSetup);
+     containerLayout->addWidget(grpSources);
+ 
+@@ -916,7 +958,7 @@ void ConfigDialog::updateStatus() {
+     static int companion_refresh = 0;
+     if (++companion_refresh % 3 == 0) updateCompanionUI();
+ 
+-    int failed_checks = 0;
++    int failed_checks = 0, unknown_sources = 0;
+     {
+         GlobalConfig *cfg = GetGlobalConfig();
+         int saved = 0;
+@@ -930,6 +972,7 @@ void ConfigDialog::updateStatus() {
+         else
+             for (auto &line : GetAudioSetupReport()) {
+                 if (line.rfind("✗", 0) == 0) ++failed_checks;
++                if (line.rfind("？", 0) == 0) ++unknown_sources;
+                 lines << QString::fromStdString(line);
+             }
+         if (lines.isEmpty()) lines << "· 没有可检查的音源。";
+@@ -960,7 +1003,11 @@ void ConfigDialog::updateStatus() {
+         headline = QString::fromStdString(status.second);
+         color = "#E6A23C";
+     } else if (failed > 0) {
+-        headline = QString("%1 项检查未通过，原声可能进入直播，见下方“开播方式”和“要消音的声音”").arg(failed);
++        headline = QString("%1 项检查未通过，原声可能进入直播，见下方红色项").arg(failed);
++        if (unknown_sources) headline += QString("；%1 个声音来源需要确认").arg(unknown_sources);
++        color = "#F56C6C";
++    } else if (unknown_sources > 0) {
++        headline = QString("%1 个声音来源需要确认是否消音，见下方“要消音的声音”").arg(unknown_sources);
+         color = "#E6A23C";
+     } else {
+         headline = QString::fromStdString(status.second);
+@@ -1305,6 +1352,39 @@ bool ConfigDialog::showCompanionChecklist() {
+     return confirmed;
+ }
+ 
++void ConfigDialog::onCheckAction(const QString &link) {
++    QString kind = link.section(':', 0, 0);
++    std::string name = QUrl::fromPercentEncoding(link.section(':', 1).toUtf8()).toStdString();
++    obs_source_t *source = obs_get_source_by_name(name.c_str());
++    if (!source) {
++        QMessageBox::warning(this, "语音消音", QString("找不到音源“%1”，可能已被删除或改名。").arg(QString::fromStdString(name)));
++        return;
++    }
++    if (kind == "add") {
++        obs_data_t *settings = obs_data_create();
++        obs_data_set_bool(settings, "enabled", true);
++        obs_source_t *filter = obs_source_create_private("profanity_filter", "语音消音", settings);
++        obs_data_release(settings);
++        if (filter) {
++            obs_source_filter_add(source, filter);
++            obs_source_filter_set_order(source, filter, OBS_ORDER_MOVE_TOP);
++            obs_source_release(filter);
++        }
++        blog(LOG_INFO, "[Speech Sync] checklist: added filter to \"%s\"%s", name.c_str(), filter ? "" : " (failed)");
++    } else if (kind == "mute") {
++        obs_source_set_muted(source, true);
++        blog(LOG_INFO, "[Speech Sync] checklist: muted \"%s\"", name.c_str());
++    } else if (kind == "ignore" || kind == "unignore") {
++        obs_data_t *priv = obs_source_get_private_settings(source);
++        obs_data_set_bool(priv, "speech_no_filter", kind == "ignore");
++        obs_data_release(priv);
++        blog(LOG_INFO, "[Speech Sync] checklist: \"%s\" %s", name.c_str(), kind == "ignore" ? "marked as not needing a filter" : "checked again");
++    }
++    obs_source_release(source);
++    UpdateVideoDelayFiltersState(); // refreshes the checklist
++    updateStatus();
++}
++
+ void ConfigDialog::updateCompanionUI() {
+     auto st = QueryCompanionAudio();
+     std::string text;
+@@ -1322,7 +1402,7 @@ void ConfigDialog::updateCompanionUI() {
+     else if (!st.cable_found && GetCableRenderState() == CableRenderState::Disabled)
+         text = "· VB-CABLE 已安装，目前停用（不影响其他软件），应用本模式后插件会自动启用。";
+     else if (!st.cable_found) {
+-        text = "✗ 没有检测到 VB-CABLE：点下方“下载安装 VB-CABLE…”，安装后重启电脑。";
++        text = "✗ 没有检测到 VB-CABLE → 点下方“下载安装 VB-CABLE…”，安装后重启电脑。";
+         ++problem_count;
+     } else {
+         text = "✓ 已检测到 " + st.cable_name + "。";
+@@ -1331,6 +1411,14 @@ void ConfigDialog::updateCompanionUI() {
+                     "设备是 CABLE，其他程序的原声会绕过消音进入直播 → 点下方“修复 Windows 默认播放设备”。";
+             ++problem_count;
+         }
++        // Companion mode takes over OBS's single monitoring device (restored when off).
++        if (config_t *profile = obs_frontend_get_profile_config()) {
++            const char *prev = config_get_string(profile, "SpeechFilter", "PrevMonitoringDeviceName");
++            const char *prev_id = config_get_string(profile, "SpeechFilter", "PrevMonitoringDeviceId");
++            if (prev && *prev && prev_id && strcmp(prev_id, "default") != 0)
++                text += std::string("\n· OBS 监听设备已改为 CABLE（原来是“") + prev +
++                        "”，改回 OBS 直接推流时恢复）；在 OBS 里监听的声音会改送进伴侣。";
++        }
+     }
+     bool readable = false;
+     auto problems = CheckCompanionAppAudio(readable);
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 47e9625..0b3b9b0 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -160,6 +160,8 @@ private:
+     void showSponsorDialog();
+     QLabel *lblAudioSetup;
+     void updateCompanionUI();
++    // A link in the checklist: add a filter, mute, or (un)mark a source as not needing one.
++    void onCheckAction(const QString &link);
+     QCheckBox *chkDelayAuto;
+     void updateDelayUI();
+     // One-line summary under the master switch: the most serious current problem first
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 7a2b588..45822a2 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -16,89 +16,146 @@
+ #include <cstring>
+ #include <util/platform.h>
+ 
+-static QPointer<QLabel> filter_warning;
+-static QPointer<QTimer> filter_warning_timer;
+-static std::string sync_warning;
++#include <QMouseEvent>
++#include <QResizeEvent>
++#include <QFontMetrics>
++#include <atomic>
++#include <cmath>
++#include <map>
++
++// Status bar items. The bar shows one line: the most serious item and how many more
++// there are; the tooltip lists them all and a click opens the settings dialog. The log
++// keeps the full list. Information that needs no action stays in the settings checklist.
++enum WarnLevel { WARN_LEAK = 0, WARN_BROKEN = 1, WARN_NOTICE = 2 };
++struct StatusItem {
++    int level;
++    std::string text;
++};
++static std::vector<StatusItem> sync_warnings;
+ static uint64_t scene_settle_until = 0;
+ static std::mutex sync_warning_mutex;
+ 
+-static void append_sync_warning(const std::string &message) {
++static void add_warning(int level, const std::string &message) {
+     std::lock_guard<std::mutex> lock(sync_warning_mutex);
+-    if (!sync_warning.empty()) sync_warning += "；";
+-    sync_warning += message;
++    sync_warnings.push_back({level, message});
+ }
+ 
+-static std::string get_sync_warning() {
+-    std::lock_guard<std::mutex> lock(sync_warning_mutex);
+-    return sync_warning;
++// Several messages from one producer arrive joined with "；".
++static void add_joined(std::vector<StatusItem> &items, int level, const std::string &joined) {
++    size_t start = 0;
++    const std::string sep = "；";
++    while (start < joined.size()) {
++        size_t end = joined.find(sep, start);
++        std::string part = joined.substr(start, end == std::string::npos ? std::string::npos : end - start);
++        if (!part.empty()) items.push_back({level, part});
++        if (end == std::string::npos) break;
++        start = end + sep.size();
++    }
+ }
+ 
++class StatusLabel : public QLabel {
++public:
++    explicit StatusLabel(QWidget *parent) : QLabel(parent) {
++        setCursor(Qt::PointingHandCursor);
++        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
++        setMinimumWidth(60);
++    }
++    void setParts(const QString &main, const QString &suffix) {
++        main_text = main;
++        suffix_text = suffix;
++        refresh();
++    }
++    QString fullText() const { return main_text + suffix_text; }
++
++protected:
++    void mouseReleaseEvent(QMouseEvent *e) override {
++        if (e->button() == Qt::LeftButton) OpenGlobalConfigDialog();
++        QLabel::mouseReleaseEvent(e);
++    }
++    void resizeEvent(QResizeEvent *e) override {
++        QLabel::resizeEvent(e);
++        refresh();
++    }
++
++private:
++    void refresh() {
++        QFontMetrics fm(font());
++        int room = width() - 10 - fm.horizontalAdvance(suffix_text);
++        setText(fm.elidedText(main_text, Qt::ElideRight, room > 20 ? room : 20) + suffix_text);
++    }
++    QString main_text, suffix_text;
++};
++
++static QPointer<StatusLabel> filter_warning;
++static QPointer<QTimer> filter_warning_timer;
++
+ static void start_filter_warning() {
+     if (filter_warning) return;
+     auto *window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+     if (!window) return;
+     UpdateVideoDelayFiltersState();
+-    filter_warning = new QLabel(window);
++    filter_warning = new StatusLabel(window);
+     filter_warning->setObjectName("speechFilterStatus");
+-    filter_warning->setWordWrap(true);
+-    filter_warning->setToolTip("自动维护最终画面及独立音源的同量延迟。提醒仅显示在OBS，不进入直播画面。不能检测采集设备或平台引入的偏差、语音漏识别。异常时继续出声。");
+     window->statusBar()->addPermanentWidget(filter_warning, 1);
+     filter_warning_timer = new QTimer(filter_warning);
+     QObject::connect(filter_warning_timer, &QTimer::timeout, filter_warning, [] {
+         UpdateVideoDelayFiltersState();
+         auto status = ProfanityFilter::GetGlobalModelStatus();
+-        std::string message = get_sync_warning();
++        std::vector<StatusItem> items;
++        {
++            std::lock_guard<std::mutex> lock(sync_warning_mutex);
++            items = sync_warnings;
++        }
+         GlobalConfig *cfg = GetGlobalConfig();
+-        bool syncing = false;
++        bool syncing = false, companion = false;
+         if (cfg) {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+             syncing = cfg->global_enable && cfg->video_delay_enabled;
+-        }
+-        auto audio = syncing ? ProfanityFilter::GetAudioSyncWarning() : "";
+-        if (syncing && os_gettime_ns() < scene_settle_until) {
+-            if (!message.empty()) message += "；";
+-            message += "场景切换后同步缓冲过渡中";
+-        }
+-        if (!audio.empty()) {
+-            if (!message.empty()) message += "；";
+-            message += audio;
+-        }
+-        auto video = VideoDelayFilter::GetSyncWarning();
+-        if (!video.empty()) {
+-            if (!message.empty()) message += "；";
+-            message += video;
+-        }
+-        if (status.second.find("未生效") != std::string::npos) {
+-            if (!message.empty()) message += "；";
+-            message += status.second;
+-        }
+-        auto recognition = ProfanityFilter::GetRecognitionWarning();
+-        if (!recognition.empty()) {
+-            if (!message.empty()) message += "；";
+-            message += recognition;
+-        }
+-        auto level = ProfanityFilter::GetMicDataWarning();
+-        if (!level.empty()) {
+-            if (!message.empty()) message += "；";
+-            message += level;
+-        }
+-        filter_warning->setStyleSheet(message.empty()
+-            ? "color: #88cc88; padding: 3px;"
+-            : "color: #ffcc66; font-weight: bold; padding: 3px;");
+-        std::string latency = GetViewerLatencyText();
+-        bool companion = false;
+-        if (cfg) {
+-            std::lock_guard<std::mutex> lock(cfg->mutex);
+             companion = cfg->companion_mode;
+         }
++        if (status.second.find("未生效") != std::string::npos) items.push_back({WARN_LEAK, status.second});
++        add_joined(items, WARN_LEAK, ProfanityFilter::GetRecognitionWarning());
++        add_joined(items, WARN_BROKEN, ProfanityFilter::GetMicDataWarning());
++        add_joined(items, WARN_BROKEN, VideoDelayFilter::GetSyncWarning());
++        if (syncing) add_joined(items, WARN_NOTICE, ProfanityFilter::GetAudioSyncWarning());
++        if (syncing && os_gettime_ns() < scene_settle_until) items.push_back({WARN_NOTICE, "场景切换后同步缓冲过渡中"});
++        std::stable_sort(items.begin(), items.end(),
++                         [](const StatusItem &a, const StatusItem &b) { return a.level < b.level; });
++
++        std::string latency = GetViewerLatencyText();
+         if (companion && !latency.empty()) latency += "；直播伴侣模式（虚拟摄像头+CABLE）";
+-        filter_warning->setText(QString::fromStdString(message.empty()
+-            ? (latency.empty() ? std::string("语音消音已关闭") : latency) : message));
++        QString main, suffix, color;
++        if (items.empty()) {
++            main = QString::fromStdString(latency.empty() ? std::string("语音消音已关闭") : latency);
++            color = "#88cc88";
++        } else {
++            main = QString::fromStdString(items[0].text);
++            if (items.size() > 1) suffix = QString("（另有 %1 项）").arg(items.size() - 1);
++            color = items[0].level == WARN_LEAK ? "#ff7b72" : items[0].level == WARN_BROKEN ? "#ffcc66" : "#c0c4cc";
++        }
++        QString style = QString("color: %1; padding: 3px;%2").arg(color, items.empty() || items[0].level == WARN_NOTICE ? "" : " font-weight: bold;");
++        if (filter_warning->styleSheet() != style) filter_warning->setStyleSheet(style);
++        filter_warning->setParts(main, suffix);
++
++        QString tip = "点击打开语音消音设置";
++        if (!items.empty()) {
++            tip += "\n";
++            for (auto &it : items)
++                tip += QString("\n%1 %2").arg(it.level == WARN_LEAK ? "✗" : it.level == WARN_BROKEN ? "!" : "·",
++                                              QString::fromStdString(it.text));
++        }
++        if (!latency.empty()) tip += "\n\n" + QString::fromStdString(latency);
++        tip += "\n\n提醒只显示在 OBS，不进入直播画面；不能发现采集设备或平台带来的偏差、语音漏识别。异常时声音继续输出。";
++        if (filter_warning->toolTip() != tip) filter_warning->setToolTip(tip);
++
++        // Log the full list, not the shortened line.
++        std::string full;
++        for (auto &it : items) full += (full.empty() ? "" : "；") + it.text;
++        if (full.empty()) full = main.toStdString();
+         static std::string last_message;
+-        std::string current = filter_warning->text().toStdString();
+-        if (current != last_message) {
+-            blog(LOG_INFO, "[Speech Sync] %s", current.c_str());
+-            last_message = current;
++        if (full != last_message) {
++            blog(LOG_INFO, "[Speech Sync] %s", full.c_str());
++            last_message = full;
+         }
+     });
+     filter_warning_timer->start(1000);
+@@ -249,7 +306,17 @@ struct obs_source_info profanity_video_delay_info = {
+ 
+ // --- Module Load/Unload ---
+ 
++// Set when OBS starts closing: the scenes are cleared next, and a check run on the empty
++// collection would conclude that nothing records CABLE Output (and disable the cable on
++// exit under a voice changer that still uses it) or that the microphone is missing.
++static bool obs_exiting = false;
++
+ static void frontend_event(enum obs_frontend_event event, void *) {
++    if (event == OBS_FRONTEND_EVENT_EXIT) {
++        obs_exiting = true;
++        if (filter_warning_timer) filter_warning_timer->stop();
++        return;
++    }
+     if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+         start_filter_warning();
+         GlobalConfig *cfg = GetGlobalConfig();
+@@ -363,6 +430,20 @@ static bool cable_reinit_pending = false;
+ static bool cable_restore_failed = false;
+ static std::string cable_notice; // shown in the status bar for a few seconds
+ static int cable_notice_ticks = 0;
++// An audio input explicitly set to "CABLE Output" outside companion mode: another program
++// (typically a voice changer) feeds OBS through VB-CABLE, so its playback side must stay on.
++static bool cable_used_by_source = false;
++
++// Monitoring device before companion mode replaced it with the cable, kept in the
++// profile so turning the mode off (also after a restart) puts it back.
++static const char *kPrevSection = "SpeechFilter";
++static void save_prev_monitoring(const char *name, const char *id) {
++    config_t *profile = obs_frontend_get_profile_config();
++    if (!profile) return;
++    config_set_string(profile, kPrevSection, "PrevMonitoringDeviceName", name ? name : "");
++    config_set_string(profile, kPrevSection, "PrevMonitoringDeviceId", id ? id : "");
++    config_save_safe(profile, "tmp", nullptr);
++}
+ 
+ // Companion mode on: the cable playback side must be enabled. Off (and the option on):
+ // disabled, so Windows cannot fall back to it as a default device and other programs do
+@@ -377,7 +458,10 @@ static void maintain_cable(bool companion, bool auto_disable) {
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE playback enabled for companion mode%s", ok ? "" : " (failed)");
+         cable_reinit_pending = ok;
+         companion_tick = 0; // re-query devices on the next tick
+-    } else if (!companion && auto_disable && state != CableRenderState::Disabled) {
++    } else if (!companion && cable_used_by_source && state != CableRenderState::Enabled) {
++        bool ok = SetCableRenderEnabled(true);
++        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback enabled: an audio input records CABLE Output%s", ok ? "" : " (failed)");
++    } else if (!companion && auto_disable && !cable_used_by_source && state != CableRenderState::Disabled) {
+         bool ok = SetCableRenderEnabled(false);
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled (companion mode off)%s", ok ? "" : " (failed)");
+     }
+@@ -391,14 +475,27 @@ static void DisableCableOnExit() {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         disable = cfg->cable_auto_disable;
+     }
+-    if (disable && GetCableRenderState() != CableRenderState::Disabled &&
++    if (disable && !cable_used_by_source && GetCableRenderState() != CableRenderState::Disabled &&
+         GetCableRenderState() != CableRenderState::NotInstalled)
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled on exit%s", SetCableRenderEnabled(false) ? "" : " (failed)");
+ }
+ 
+ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool on) {
++    static bool first_tick = true;
++    bool first = first_tick;
++    first_tick = false;
+     if (!on) {
+-        if (companion_was_on) {
++        std::string prev_name, prev_id;
++        if (config_t *profile = obs_frontend_get_profile_config()) {
++            const char *n = config_get_string(profile, kPrevSection, "PrevMonitoringDeviceName");
++            const char *i = config_get_string(profile, kPrevSection, "PrevMonitoringDeviceId");
++            prev_name = n ? n : "";
++            prev_id = i ? i : "";
++        }
++        // Switched off now, or OBS restarted after the mode was turned off while OBS was
++        // closed (only when companion mode saved a device, so a cable the user chose
++        // for monitoring is left alone).
++        if (companion_was_on || (first && !prev_id.empty())) {
+             for (auto *s : sources) {
+                 if (!is_audio_input(s)) continue;
+                 obs_data_t *priv = obs_source_get_private_settings(s);
+@@ -411,7 +508,13 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             }
+             const char *name = nullptr, *id = nullptr;
+             obs_get_audio_monitoring_device(&name, &id);
+-            if (name && strstr(name, "CABLE")) set_monitoring_device("Default", "default");
++            if (name && IsCableEndpointName(name)) {
++                if (prev_id.empty()) set_monitoring_device("Default", "default");
++                else set_monitoring_device(prev_name.c_str(), prev_id.c_str());
++                blog(LOG_INFO, "[Speech Sync] monitoring device restored to %s",
++                     prev_id.empty() ? "Default" : prev_name.c_str());
++            }
++            if (!prev_id.empty()) save_prev_monitoring("", "");
+             blog(LOG_INFO, "[Speech Sync] companion mode off");
+         }
+         companion_was_on = false;
+@@ -431,20 +534,30 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+     companion_was_on = true;
+     const auto &st = companion_state;
+     if (!st.supported) {
+-        append_sync_warning("直播伴侣模式仅支持Windows");
++        add_warning(WARN_BROKEN, "直播伴侣模式仅支持Windows");
+         return;
+     }
+     if (!st.cable_found && GetCableRenderState() != CableRenderState::NotInstalled) {
+-        append_sync_warning("直播伴侣模式：正在启用VB-CABLE…");
++        add_warning(WARN_NOTICE, "直播伴侣模式：正在启用VB-CABLE…");
+         return;
+     }
+     if (!st.cable_found) {
+-        append_sync_warning("直播伴侣模式：未安装VB-CABLE虚拟声卡，伴侣收不到声音，请在插件设置点“下载安装VB-CABLE”");
++        add_warning(WARN_BROKEN, "直播伴侣模式：未安装VB-CABLE虚拟声卡，伴侣收不到声音，请在插件设置点“下载安装VB-CABLE”");
+         return;
+     }
+     const char *name = nullptr, *id = nullptr;
+     obs_get_audio_monitoring_device(&name, &id);
+-    if (!id || st.cable_id != id) set_monitoring_device(st.cable_name.c_str(), st.cable_id.c_str());
++    if (!id || st.cable_id != id) {
++        // Remember what it was (OBS has one monitoring device; the cable takes it over).
++        if (!(name && IsCableEndpointName(name))) {
++            save_prev_monitoring(name, id);
++            if (id && strcmp(id, "default") != 0 && name) {
++                cable_notice = std::string("直播伴侣模式：OBS监听设备已从“") + name + "”改为CABLE，改回OBS直接推流时恢复";
++                cable_notice_ticks = 10;
++            }
++        }
++        set_monitoring_device(st.cable_name.c_str(), st.cable_id.c_str());
++    }
+     if (cable_reinit_pending) {
+         cable_reinit_pending = false;
+         int count = 0;
+@@ -478,7 +591,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         }
+         obs_data_release(priv);
+         if (type == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) && !obs_source_muted(s)) {
+-            append_sync_warning(std::string("“") + obs_source_get_name(s) +
++            add_warning(WARN_LEAK, std::string("“") + obs_source_get_name(s) +
+                                 "”设为仅监听，伴侣模式下它也会进入直播");
+         }
+     }
+@@ -498,7 +611,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             }
+         }
+         if (cable_restore_failed)
+-            append_sync_warning(std::string("原声会绕过消音进入直播：Windows默认") +
++            add_warning(WARN_LEAK, std::string("原声会绕过消音进入直播：Windows默认") +
+                                 (st.console_is_cable ? "播放" : "通信") +
+                                 "设备是CABLE，自动改回失败，请在Windows声音设置里改成扬声器或耳机");
+     } else {
+@@ -506,24 +619,24 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+     }
+     if (cable_notice_ticks > 0) {
+         --cable_notice_ticks;
+-        append_sync_warning(cable_notice);
++        add_warning(WARN_NOTICE, cable_notice);
+     }
+-    for (auto &p : companion_app_problems) append_sync_warning(p);
++    for (auto &p : companion_app_problems) add_warning(p.find("没有采集 CABLE Output") != std::string::npos ? WARN_BROKEN : WARN_LEAK, p);
+     bool confirmed = false;
+     if (GlobalConfig *cfg = GetGlobalConfig()) {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         confirmed = cfg->companion_confirmed;
+     }
+     if (!confirmed && !companion_app_readable)
+-        append_sync_warning("直播伴侣模式：请在插件设置点“伴侣端设置清单”，确认已关闭伴侣的系统声音");
++        add_warning(WARN_BROKEN, "直播伴侣模式：请在插件设置点“伴侣端设置清单”，确认已关闭伴侣的系统声音");
+     if (!obs_frontend_virtualcam_active()) {
+-        append_sync_warning("直播伴侣模式：虚拟摄像头未启动，伴侣收不到画面");
++        add_warning(WARN_BROKEN, "直播伴侣模式：虚拟摄像头未启动，伴侣收不到画面");
+     } else if (obs_output_t *vcam = obs_frontend_get_virtualcam_output()) {
+         // "Program" output renders the main mix, which carries the picture-sync delay on
+         // the transition; a single scene/source output bypasses it and freezes the view
+         // on that scene when the program changes.
+         if (obs_output_video(vcam) != obs_get_video())
+-            append_sync_warning("直播伴侣模式：虚拟摄像头输出的不是“节目”画面（不跟随场景切换、不经过画面同步），请点虚拟摄像机旁的齿轮把输出类型改为“节目”");
++            add_warning(WARN_BROKEN, "直播伴侣模式：虚拟摄像头输出的不是“节目”画面（不跟随场景切换、不经过画面同步），请点虚拟摄像机旁的齿轮把输出类型改为“节目”");
+         obs_output_release(vcam);
+     }
+ }
+@@ -532,6 +645,10 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+ // filtered automatically in every case; the difference is desktop audio (it holds every
+ // program's raw sound, so it must be off once teammates are heard) and where the filter
+ // goes: on the voice program's own capture, or on the game sound for in-game voice.
++// Lines start with ✓ (fine), ✗ (raw speech can reach the stream), ？ (has sound the
++// plugin cannot classify; the user decides) or · (information). Text after " → " is the
++// manual fix. Actions the settings page offers as links follow "\x1f" ("add:<source>",
++// "mute:<source>", "ignore:<source>", "unignore:<source>").
+ static int voice_app_tick = 0;
+ static std::vector<VoiceApp> voice_apps;
+ 
+@@ -539,25 +656,131 @@ static bool audible(obs_source_t *s) {
+     return !obs_source_muted(s) && obs_source_get_volume(s) > 0.0f;
+ }
+ 
+-static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode) {
++static std::string act(const char *kind, obs_source_t *s) {
++    return std::string("\x1f") + kind + ":" + obs_source_get_name(s);
++}
++
++// Sources of a type the checklist does not know (camera or capture card sound, ASIO,
++// NDI, other plugins) are only listed once they have actually produced sound: OBS 28
++// marks every video capture device as having audio, also a webcam without a microphone.
++struct HeardSource {
++    obs_weak_source_t *weak = nullptr;
++    std::atomic<bool> heard{false};
++};
++static std::map<obs_source_t *, HeardSource *> heard_sources; // UI thread only
++static std::vector<HeardSource *> heard_retired;              // freed at unload
++
++static void heard_callback(void *param, obs_source_t *, const struct audio_data *audio, bool muted) {
++    auto *h = static_cast<HeardSource *>(param);
++    if (muted || h->heard.load(std::memory_order_relaxed) || !audio->data[0]) return;
++    const float *x = reinterpret_cast<const float *>(audio->data[0]);
++    for (uint32_t i = 0; i < audio->frames; ++i)
++        if (std::fabs(x[i]) > 0.003f) { // about -50 dBFS
++            h->heard.store(true, std::memory_order_relaxed);
++            return;
++        }
++}
++
++static bool has_been_heard(obs_source_t *s) {
++    auto it = heard_sources.find(s);
++    if (it != heard_sources.end()) {
++        obs_source_t *alive = obs_weak_source_get_source(it->second->weak);
++        bool same = alive == s;
++        obs_source_release(alive);
++        if (same) return it->second->heard.load(std::memory_order_relaxed);
++        heard_retired.push_back(it->second); // pointer reused by a new source
++        heard_sources.erase(it);
++    }
++    auto *h = new HeardSource();
++    h->weak = obs_source_get_weak_source(s);
++    heard_sources[s] = h;
++    obs_source_add_audio_capture_callback(s, heard_callback, h);
++    return false;
++}
++
++static void FreeHeardSources() {
++    for (auto &kv : heard_sources) {
++        if (obs_source_t *s = obs_weak_source_get_source(kv.second->weak)) {
++            obs_source_remove_audio_capture_callback(s, heard_callback, kv.second);
++            obs_source_release(s);
++        }
++        heard_retired.push_back(kv.second);
++    }
++    heard_sources.clear();
++    for (auto *h : heard_retired) {
++        obs_weak_source_release(h->weak);
++        delete h;
++    }
++    heard_retired.clear();
++}
++
++static bool ignored_by_user(obs_source_t *s) {
++    obs_data_t *priv = obs_source_get_private_settings(s);
++    bool ignored = obs_data_get_bool(priv, "speech_no_filter");
++    obs_data_release(priv);
++    return ignored;
++}
++
++// Recording device of each audio input (by source name), read every few seconds.
++struct MicDevice {
++    bool explicit_cable = false;   // device chosen is CABLE Output
++    bool default_is_cable = false; // "默认", and the Windows default is CABLE Output
++};
++static std::map<std::string, MicDevice> mic_devices;
++static int mic_device_tick = 0;
++
++// Recording devices: an input explicitly on CABLE Output is another program feeding
++// OBS through the cable (keep the cable on); "默认" resolving to it is Windows having
++// switched the default recording device, and records no voice. Runs before
++// maintain_cable so the first tick does not disable a cable that is in use.
++static void scan_mic_devices(const std::vector<obs_source_t *> &sources) {
++    if (mic_device_tick++ % 3 == 0) {
++        mic_devices.clear();
++        bool used = false;
++        for (auto *s : sources) {
++            if (obs_source_get_type(s) != OBS_SOURCE_TYPE_INPUT || !id_is(obs_source_get_id(s), {"wasapi_input_capture"}))
++                continue;
++            obs_data_t *settings = obs_source_get_settings(s);
++            std::string device = obs_data_get_string(settings, "device_id");
++            obs_data_release(settings);
++            MicDevice d;
++            bool is_default = device.empty() || device == "default";
++            bool cable = IsCableEndpointName(CaptureDeviceName(device));
++            d.explicit_cable = cable && !is_default;
++            d.default_is_cable = cable && is_default;
++            used |= d.explicit_cable;
++            mic_devices[obs_source_get_name(s)] = d;
++        }
++        if (used != cable_used_by_source)
++            blog(LOG_INFO, "[Speech Sync] audio input on CABLE Output: %s", used ? "yes" : "no");
++        cable_used_by_source = used;
++    }
++}
++
++static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode, bool companion) {
+     if (voice_app_tick++ % 3 == 0) voice_apps = ActiveVoiceApps();
+     const std::string F = "“语音消音”";
+     std::vector<std::string> lines;
+-    int problems = 0;
++    int problems = 0, unknown = 0;
+     auto bad = [&](const std::string &text) {
+         lines.push_back("✗ " + text);
+         ++problems;
+     };
+-    std::vector<obs_source_t *> mics, desktops, apps, games;
++    auto name = [](obs_source_t *s) { return std::string("“") + obs_source_get_name(s) + "”"; };
++
++    std::vector<obs_source_t *> mics, desktops, apps, games, media, others;
+     for (auto *s : sources) {
+         if (!obs_source_active(s) || obs_source_get_type(s) != OBS_SOURCE_TYPE_INPUT) continue;
+         const char *id = obs_source_get_id(s);
++        uint32_t flags = obs_source_get_output_flags(s);
+         if (id_is(id, {"wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture"})) mics.push_back(s);
+         else if (id_is(id, {"wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture"})) desktops.push_back(s);
+         else if (id_is(id, {"wasapi_process_output_capture"})) apps.push_back(s);
+         else if (id_is(id, {"game_capture", "window_capture"})) games.push_back(s);
++        else if (!(flags & OBS_SOURCE_AUDIO) || (flags & OBS_SOURCE_COMPOSITE) || !obs_source_audio_active(s)) continue;
++        else if (id_is(id, {"ffmpeg_source", "vlc_source", "browser_source"})) media.push_back(s);
++        else others.push_back(s);
+     }
+-    auto name = [](obs_source_t *s) { return std::string("“") + obs_source_get_name(s) + "”"; };
+     // Game sound: the capture's own audio ("采集音频") or an application capture of its exe.
+     auto game_audio = [&](obs_source_t *g) -> obs_source_t * {
+         obs_data_t *settings = obs_source_get_settings(g);
+@@ -576,11 +799,21 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+     };
+ 
+     for (auto *m : mics) {
+-        if (!audible(m)) lines.push_back("· 麦克风" + name(m) + "已静音");
++        auto dev = mic_devices.find(obs_source_get_name(m));
++        bool on = audible(m);
++        if (on && dev != mic_devices.end() && dev->second.default_is_cable)
++            bad("麦克风" + name(m) + "设备选的是“默认”，而 Windows 默认录音设备现在是 CABLE Output，录不到你的声音" +
++                (companion ? "，还会把直播声音再录回来形成回声" : "") +
++                " → Windows 声音设置 → 输入，把默认设备改回真实麦克风");
++        else if (on && companion && dev != mic_devices.end() && dev->second.explicit_cable)
++            bad("麦克风" + name(m) + "录的是 CABLE Output，伴侣模式下会把直播声音再录回来形成回声 → 双击它，把设备改为真实麦克风；用变声器时让变声器输出到别的虚拟声卡");
++        else if (!on) lines.push_back("· 麦克风" + name(m) + "已静音");
+         else if (has_recognizing_filter(m)) lines.push_back("✓ 麦克风" + name(m) + "已消音");
+-        else lines.push_back("✗ 麦克风" + name(m) + "没有消音 → 在插件设置开启“自动给麦克风加消音滤镜”，或右键它 → 滤镜 → 添加" + F);
++        else bad("麦克风" + name(m) + "没有消音 → 点“加消音”，或开启上面的“自动给麦克风加消音滤镜”" + act("add", m));
+     }
+     if (mics.empty()) lines.push_back("· 没有找到麦克风音源");
++    if (!companion && cable_used_by_source)
++        lines.push_back("· 有麦克风音源录的是 CABLE Output（变声器等软件经 VB-CABLE 送进 OBS），插件不会停用 VB-CABLE");
+ 
+     bool desktop_on = false;
+     for (auto *d : desktops) {
+@@ -590,9 +823,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         }
+         desktop_on = true;
+         if (mode == 0)
+-            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已消音（画面与声音整体延迟）" : "保留：游戏声音、音乐从这里进直播，不消音"));
++            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已消音（画面与声音整体延迟）" : "不消音：游戏声音、音乐从这里进直播"));
+         else
+-            bad("桌面音频" + name(d) + "还开着：它会把队友语音不经消音再收进直播一次 → 在混音器里点它的喇叭图标静音");
++            bad("桌面音频" + name(d) + "还开着，会把队友语音不经消音再收进直播一次 → 点“静音”，或在混音器里点它的喇叭图标" + act("mute", d));
+     }
+ 
+     // Voice programs making sound whose sound reaches the stream only via desktop audio.
+@@ -614,14 +847,14 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         voice_captured |= voice || filtered;
+         if (!audible(a)) lines.push_back("· 应用程序音频" + name(a) + "已静音");
+         else if (voice && filtered) lines.push_back("✓ 队友语音" + name(a) + "已消音");
+-        else if (voice) bad("队友语音" + name(a) + "没有消音 → 右键它 → 滤镜 → 添加" + F);
++        else if (voice) bad("队友语音" + name(a) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", a));
+         else if (filtered) lines.push_back("✓ 应用程序音频" + name(a) + "已消音");
+-        else lines.push_back("· 应用程序音频" + name(a) + "没有消音：如果它是语音软件，请右键它 → 滤镜 → 添加" + F);
++        else lines.push_back("· 应用程序音频" + name(a) + "不消音；如果它是语音软件，点“加消音”" + act("add", a));
+     }
+ 
+     if (mode == 0) {
+         if (!uncaptured.empty() && desktop_on)
+-            bad("检测到" + uncaptured + "在使用耳机/扬声器，它的声音会经桌面音频原样进入直播 → 如果是队友语音，请在上面把“队友语音来源”选为语音软件");
++            bad("检测到" + uncaptured + "在使用耳机/扬声器，它的声音会经桌面音频原样进入直播 → 如果是队友语音，在上面把“队友语音来自”选为语音软件");
+     } else if (mode == 1) {
+         if (!voice_captured)
+             bad(std::string(uncaptured.empty() ? "没有找到语音软件的采集" : "检测到" + uncaptured + "在运行，但没有单独采集它") +
+@@ -629,9 +862,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         for (auto *g : games) {
+             obs_source_t *audio = game_audio(g);
+             if (audio && has_recognizing_filter(audio))
+-                lines.push_back("· 游戏声音" + name(audio) + "已采集但也加了消音滤镜：队友语音在语音软件里时游戏声音不需要消音，删掉它的滤镜可让画面不延迟");
++                lines.push_back("· 游戏声音" + name(audio) + "也加了消音滤镜：队友语音在语音软件里时游戏声音不需要消音，删掉它的滤镜可让画面不延迟");
+             else if (audio) lines.push_back("✓ 游戏声音" + name(audio) + "已采集（不消音）");
+-            else bad("游戏采集" + name(g) + "没有采集声音：桌面音频静音后直播里没有游戏声音 → 双击它，勾选“采集音频”");
++            else bad("游戏采集" + name(g) + "没有采集声音，桌面音频静音后直播里没有游戏声音 → 双击它，勾选“采集音频”");
+         }
+         if (games.empty()) lines.push_back("· 没有找到游戏采集或窗口采集");
+     } else {
+@@ -642,19 +875,44 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+             else if (audio) no_filter = no_filter ? no_filter : audio;
+             else if (!no_audio || !strcmp(obs_source_get_id(g), "game_capture")) no_audio = g;
+         }
+-        if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已消音，画面自动同步（整体晚约2秒）");
+-        else if (no_filter) bad("游戏声音" + name(no_filter) + "没有消音 → 右键它 → 滤镜 → 添加" + F);
++        if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已消音，画面自动同步");
++        else if (no_filter) bad("游戏声音" + name(no_filter) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", no_filter));
+         else if (no_audio) bad("游戏采集" + name(no_audio) + "没有采集声音 → 双击它，勾选“采集音频”，再右键它 → 滤镜 → 添加" + F);
+         else bad("没有找到游戏采集 → 来源列表点“+” → “游戏采集”，勾选“采集音频”，再添加" + F);
+     }
+ 
++    // Media and browser sources (alert sounds, music, danmaku text-to-speech): information
++    // only, they are not people talking unless they read out viewers' messages.
++    for (auto *s : media) {
++        if (!audible(s) || !has_been_heard(s)) continue;
++        if (has_recognizing_filter(s)) lines.push_back("✓ " + name(s) + "已消音");
++        else lines.push_back("· 媒体/网页" + name(s) + "的声音不消音；如果它朗读弹幕，点“加消音”" + act("add", s));
++    }
++    // Anything else that has made sound: camera or capture card microphones, ASIO
++    // inputs, NDI and other plugins. The plugin cannot tell speech from game sound here.
++    for (auto *s : others) {
++        if (!audible(s) || !has_been_heard(s)) continue;
++        bool video_device = id_is(obs_source_get_id(s), {"dshow_input", "av_capture_input", "av_capture_input_v2", "v4l2_input"});
++        std::string kind = video_device ? "视频采集设备" : "音源";
++        if (has_recognizing_filter(s)) lines.push_back("✓ " + kind + name(s) + "已消音");
++        else if (ignored_by_user(s)) lines.push_back("· " + kind + name(s) + "已设为不用消音" + act("unignore", s));
++        else {
++            lines.push_back("？ " + kind + name(s) + "有声音，没有消音 → 有人在里面说话（如摄像头麦克风、声卡）点“加消音”；只是游戏或音乐声音点“不用消音”" +
++                            act("add", s) + act("ignore", s));
++            ++unknown;
++        }
++    }
++
+     static std::vector<std::string> last_lines;
+     if (lines != last_lines)
+-        for (auto &l : lines) blog(LOG_INFO, "[Speech Sync] audio setup (mode %d): %s", mode, l.c_str());
++        for (auto l : lines) {
++            for (size_t k; (k = l.find('\x1f')) != std::string::npos;) l.replace(k, 1, " | ");
++            blog(LOG_INFO, "[Speech Sync] audio setup (mode %d): %s", mode, l.c_str());
++        }
+     last_lines = lines;
+     SetAudioSetupReport(lines);
+-    if (problems)
+-        append_sync_warning("声音来源设置有" + std::to_string(problems) + "项需要调整，请打开插件设置查看“声音来源”");
++    if (problems) add_warning(WARN_LEAK, "声音来源有 " + std::to_string(problems) + " 项需要调整，原声可能进入直播");
++    if (unknown) add_warning(WARN_BROKEN, std::to_string(unknown) + " 个声音来源需要确认是否消音");
+ }
+ 
+ // Automatic picture sync. Delaying only separately captured voices (KOOK app audio,
+@@ -714,7 +972,7 @@ static bool decide_sync(const std::vector<obs_source_t *> &sources, std::string
+ 
+ void UpdateVideoDelayFiltersState() {
+     GlobalConfig *cfg = GetGlobalConfig();
+-    if (!cfg) return;
++    if (!cfg || obs_exiting) return;
+     bool enable;
+     bool global_enable;
+     bool auto_mic;
+@@ -734,7 +992,7 @@ void UpdateVideoDelayFiltersState() {
+     bool mic_seen = false;
+     {
+         std::lock_guard<std::mutex> lock(sync_warning_mutex);
+-        sync_warning.clear();
++        sync_warnings.clear();
+     }
+ 
+     // Delay after scene composition: nested scenes share a single video cache.
+@@ -762,9 +1020,10 @@ void UpdateVideoDelayFiltersState() {
+             cfg->video_delay_enabled = enable;
+         }
+         SetSyncSummary(reason, voices);
++        scan_mic_devices(sources);
+         maintain_cable(companion, cable_auto_disable);
+         maintain_companion(sources, companion);
+-        check_audio_setup(sources, voice_source);
++        check_audio_setup(sources, voice_source, companion);
+         if (changed)
+             blog(LOG_INFO, "[Speech Sync] picture sync %s (%s)", enable ? "on" : "off",
+                  enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
+@@ -817,9 +1076,12 @@ void UpdateVideoDelayFiltersState() {
+                     obs_data_release(settings);
+                     if (filter) {
+                         obs_source_filter_add(source, filter);
++                        // First in the chain: recognize the voice before a voice changer
++                        // or other effect filter on the same source alters it.
++                        obs_source_filter_set_order(source, filter, OBS_ORDER_MOVE_TOP);
+                         audio.push_back(filter);
+                         blog(LOG_INFO, "[Speech Sync] added microphone filter to \"%s\"", obs_source_get_name(source));
+-                    } else append_sync_warning("无法给主播麦克风添加消音滤镜");
++                    } else add_warning(WARN_LEAK, "无法给主播麦克风添加消音滤镜");
+                 }
+                 if (auto_mic && obs_source_active(source)) mic_seen = true;
+                 if (auto_mic && obs_source_active(source) && !obs_source_muted(source)) {
+@@ -831,7 +1093,7 @@ void UpdateVideoDelayFiltersState() {
+                         obs_data_release(settings);
+                     }
+                     if (!filtering)
+-                        append_sync_warning("主播麦克风未消音：" + std::string(obs_source_get_name(source)) +
++                        add_warning(WARN_LEAK, "主播麦克风未消音：" + std::string(obs_source_get_name(source)) +
+                                             "的语音消音滤镜被停用");
+                 }
+             }
+@@ -872,15 +1134,15 @@ void UpdateVideoDelayFiltersState() {
+             if (enable && obs_source_active(source) && !obs_source_muted(source)) {
+                 std::string name = obs_source_get_name(source);
+                 if (count != 1)
+-                    append_sync_warning("同步异常：" + name + "需要且只能启用一个语音消音音频滤镜");
++                    add_warning(WARN_BROKEN, "同步异常：" + name + "需要且只能启用一个语音消音音频滤镜");
+                 if (obs_source_get_sync_offset(source) != 0)
+-                    append_sync_warning("同步异常：" + name + "另设了手动音频偏移，请在高级音频属性归零");
++                    add_warning(WARN_BROKEN, "同步异常：" + name + "另设了手动音频偏移，请在高级音频属性归零");
+             }
+         } else if (enable && (flags & OBS_SOURCE_COMPOSITE) && obs_source_active(source)) {
+             auto audio = filters_of_type(source, "profanity_filter");
+             for (auto *filter : audio) {
+                 if (obs_source_enabled(filter))
+-                    append_sync_warning("同步异常：场景或组合源“" + std::string(obs_source_get_name(source)) +
++                    add_warning(WARN_BROKEN, "同步异常：场景或组合源“" + std::string(obs_source_get_name(source)) +
+                                     "”另有音频缓存滤镜，请把消音滤镜放在独立输入源上");
+                 obs_source_release(filter);
+             }
+@@ -889,7 +1151,7 @@ void UpdateVideoDelayFiltersState() {
+     }
+ 
+     if (auto_mic && !mic_seen)
+-        append_sync_warning("未找到主播麦克风音源：请在场景中添加“音频输入采集”（设备选默认），或在插件设置关闭自动给麦克风加消音滤镜");
++        add_warning(WARN_BROKEN, "未找到主播麦克风音源：请在场景中添加“音频输入采集”（设备选默认），或在插件设置关闭自动给麦克风加消音滤镜");
+ 
+     obs_frontend_source_list transitions = {};
+     obs_frontend_get_transitions(&transitions);
+@@ -901,9 +1163,9 @@ void UpdateVideoDelayFiltersState() {
+             if (filter) {
+                 obs_source_filter_add(transition, filter);
+                 if (obs_filter_get_parent(filter) != transition)
+-                    append_sync_warning("最终画面同步滤镜挂载失败");
++                    add_warning(WARN_BROKEN, "最终画面同步滤镜挂载失败");
+                 filters.push_back(filter);
+-            } else append_sync_warning("无法创建最终画面同步滤镜");
++            } else add_warning(WARN_BROKEN, "无法创建最终画面同步滤镜");
+         }
+         for (size_t n = 0; n < filters.size(); ++n) {
+             bool wanted = enable && n == 0;
+@@ -919,6 +1181,7 @@ MODULE_EXPORT void obs_module_unload(void)
+     delete filter_warning_timer;
+     delete filter_warning;
+     DisableCableOnExit();
++    FreeHeardSources();
+     FreeConfigDialog();
+     FreeGlobalConfig();
+ }
+-- 
+2.55.0.windows.5
+

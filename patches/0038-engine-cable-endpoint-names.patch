@@ -1,0 +1,92 @@
+From 9baaa95daa8edb1ad9def09f635baa6725435ed4 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 05:32:56 -0700
+Subject: [PATCH] companion-audio: VB-CABLE 16-channel endpoint recognised as
+ "16ch" or "16 Ch" (IsCable16chEndpointName); the other playback endpoint is
+ the stereo CABLE Input whatever Windows calls it; the plugin's companion
+ check also accepts a recording device named "... (VB-Audio Virtual Cable)" as
+ CABLE Output
+
+---
+ src/companion-audio.cpp | 22 ++++++++++++++++++++--
+ src/companion-audio.hpp |  3 +++
+ src/plugin-config.cpp   |  2 +-
+ 3 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/src/companion-audio.cpp b/src/companion-audio.cpp
+index 96f4ddc..163c29b 100644
+--- a/src/companion-audio.cpp
++++ b/src/companion-audio.cpp
+@@ -69,6 +69,16 @@ bool is_cable_name(const std::string &name) {
+     return name.find("VB-Audio Virtual Cable") != std::string::npos;
+ }
+ 
++// "CABLE In 16ch" / "CABLE In 16 Ch": spaces and case differ between driver packs and Windows
++// versions. The other playback endpoint of the cable is the stereo CABLE Input, which Windows may
++// also show under a localised name ("扬声器 (VB-Audio Virtual Cable)" after a fresh install).
++bool is_cable_16ch_name(const std::string &name) {
++    std::string s;
++    for (char c : name)
++        if (c != ' ') s += (char)tolower((unsigned char)c);
++    return is_cable_name(name) && s.find("16ch") != std::string::npos;
++}
++
+ bool is_virtual_name(const std::string &name) {
+     return is_cable_name(name) || name.find("Virtual") != std::string::npos ||
+            name.find("VoiceMeeter") != std::string::npos;
+@@ -123,8 +133,7 @@ CompanionAudioState QueryCompanionAudio() {
+     // Prefer the stereo "CABLE Input" over the 16-channel endpoint of the same cable.
+     for (auto &ep : render_endpoints(e)) {
+         if (!is_cable_name(ep.name)) continue;
+-        bool better = !st.cable_found || (ep.name.find("16ch") == std::string::npos &&
+-                                          st.cable_name.find("16ch") != std::string::npos);
++        bool better = !st.cable_found || (!is_cable_16ch_name(ep.name) && is_cable_16ch_name(st.cable_name));
+         if (better) {
+             st.cable_found = true;
+             st.cable_id = utf8(ep.id.c_str());
+@@ -360,6 +369,15 @@ bool IsCableEndpointName(const std::string &name) {
+ #endif
+ }
+ 
++bool IsCable16chEndpointName(const std::string &name) {
++#ifdef _WIN32
++    return is_cable_16ch_name(name);
++#else
++    (void)name;
++    return false;
++#endif
++}
++
+ bool IsVoiceAppExe(const std::string &exe) {
+ #ifdef _WIN32
+     for (auto &k : known_voice_apps)
+diff --git a/src/companion-audio.hpp b/src/companion-audio.hpp
+index e7833b4..7966f05 100644
+--- a/src/companion-audio.hpp
++++ b/src/companion-audio.hpp
+@@ -39,6 +39,9 @@ std::vector<VoiceApp> ActiveVoiceApps();
+ std::string CaptureDeviceName(const std::string &device_id);
+ // True for a standard VB-CABLE endpoint ("... (VB-Audio Virtual Cable)").
+ bool IsCableEndpointName(const std::string &name);
++// True for the cable's 16-channel playback endpoint ("CABLE In 16ch", "CABLE In 16 Ch"). The other
++// playback endpoint is the stereo CABLE Input, whatever name Windows shows for it.
++bool IsCable16chEndpointName(const std::string &name);
+ 
+ // True for the executable of a known voice chat program (lower-case name).
+ bool IsVoiceAppExe(const std::string &exe);
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index e60f3df..270287d 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -141,7 +141,7 @@ std::vector<std::string> CheckCompanionAppAudio(bool &readable) {
+             std::string name = state.value("name").toString().toStdString();
+             if (state.value("deviceId").toString() == "DefaultID") name = "默认设备";
+             if (volume(state) <= 0.0) continue;
+-            if (!strcmp(group, "inputs") && name.find("CABLE Output") != std::string::npos) {
++            if (!strcmp(group, "inputs") && (name.find("CABLE Output") != std::string::npos || IsCableEndpointName(name))) {
+                 cable = true;
+                 continue;
+             }
+-- 
+2.55.0.windows.5
+

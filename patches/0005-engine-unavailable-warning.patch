@@ -1,0 +1,181 @@
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 02c9354..502cd3a 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -4,6 +4,34 @@
+ #include "profanity-filter.hpp"
+ #include "plugin-config.hpp"
+ #include "video-delay.hpp"
++#include <QMainWindow>
++#include <QStatusBar>
++#include <QLabel>
++#include <QTimer>
++#include <QPointer>
++
++static QPointer<QLabel> filter_warning;
++static QPointer<QTimer> filter_warning_timer;
++
++static void start_filter_warning() {
++    if (filter_warning) return;
++    auto *window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
++    if (!window) return;
++    filter_warning = new QLabel(window);
++    filter_warning->setWordWrap(true);
++    filter_warning->setStyleSheet("color: #ffcc66; font-weight: bold; padding: 3px;");
++    filter_warning->setToolTip("仅提醒主播，不进入直播画面。引擎未就绪时继续输出声音，不自动静音。此提示不检测识别线程卡死或语音漏识别。");
++    window->statusBar()->addPermanentWidget(filter_warning, 1);
++    filter_warning->hide();
++    filter_warning_timer = new QTimer(filter_warning);
++    QObject::connect(filter_warning_timer, &QTimer::timeout, filter_warning, [] {
++        auto status = ProfanityFilter::GetGlobalModelStatus();
++        bool warning = status.second.find("过滤未生效") != std::string::npos;
++        filter_warning->setText(QString::fromStdString(status.second));
++        filter_warning->setVisible(warning);
++    });
++    filter_warning_timer->start(1000);
++}
+ 
+ OBS_DECLARE_MODULE()
+ OBS_MODULE_USE_DEFAULT_LOCALE("obs-profanity-filter", "en-US")
+@@ -150,6 +178,7 @@ struct obs_source_info profanity_video_delay_info = {
+ 
+ static void frontend_event(enum obs_frontend_event event, void *) {
+     if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
++        start_filter_warning();
+         GlobalConfig *cfg = GetGlobalConfig();
+         if (cfg && cfg->loaded && cfg->is_first_run) {
+             UpdateVideoDelayFiltersState();
+@@ -214,6 +243,8 @@ void UpdateVideoDelayFiltersState() {
+ 
+ MODULE_EXPORT void obs_module_unload(void)
+ {
++    delete filter_warning_timer;
++    delete filter_warning;
+     FreeConfigDialog();
+     FreeGlobalConfig();
+ }
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 64688de..cb14025 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -50,39 +50,34 @@ ProfanityFilter::~ProfanityFilter() {
+ }
+ 
+ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+-    std::lock_guard<std::mutex> lock(instances_mutex);
+-    
+-    // Check loading first
+-    for (auto* filter : instances) {
+-        if (filter->is_loading) {
+-             std::string path;
+-             {
+-                 std::lock_guard<std::mutex> h_lock(filter->history_mutex);
+-                 path = filter->loading_target_path;
+-             }
+-             // Truncate if too long for UI
+-             if (path.length() > 40) path = "..." + path.substr(path.length() - 37);
+-             return {true, "🟡 正在加载 " + path};
+-        }
++    GlobalConfig *cfg = GetGlobalConfig();
++    string expected_path;
++    {
++        lock_guard<mutex> lock(cfg->mutex);
++        if (!cfg->global_enable) return {false, "过滤已关闭，原声继续输出"};
++        expected_path = cfg->model_path;
+     }
+-    
+-    // Check loaded or error
+-    for (auto* filter : instances) {
+-        if (filter->asr_model && filter->asr_model->recognizer) {
+-             return {false, "🟢 模型运行中"};
+-        }
+-        
+-        // Check error (initialization_error is not strictly mutex protected but only written during load)
+-        // Since is_loading is false here, it should be safe enough, but to be 100% safe we could use history_mutex for it too if we moved it there.
+-        // For now, let's assume it's stable when not loading.
+-        if (!filter->initialization_error.empty()) {
+-             return {false, "🔴 错误: " + filter->initialization_error};
++    lock_guard<mutex> lock(instances_mutex);
++    bool active = false;
++    string loading;
++    for (auto *filter : instances) {
++        obs_source_t *parent = obs_filter_get_parent(filter->context);
++        if (!filter->enabled || !obs_source_enabled(filter->context) ||
++            !parent || !obs_source_active(parent)) continue;
++        active = true;
++        string name = obs_source_get_name(parent);
++        lock_guard<mutex> history_lock(filter->history_mutex);
++        if (filter->is_loading) {
++            loading = "过滤未生效，原声继续输出：" + name + "（模型加载中）";
++        } else if (!filter->initialization_error.empty()) {
++            return {false, "过滤未生效，原声继续输出：" + name + "（错误：" + filter->initialization_error + "）"};
++        } else if (expected_path.empty() || filter->loaded_model_path != expected_path) {
++            loading = "过滤未生效，原声继续输出：" + name + "（等待识别引擎）";
+         }
+     }
+-    
+-    if (instances.empty()) return {false, "⚪ 无活跃来源 (请添加滤镜)"};
+-    
+-    return {false, "⚪ 未初始化"};
++    if (!loading.empty()) return {true, loading};
++    if (!active) return {false, "无启用过滤的活跃来源"};
++    return {false, "模型运行中"};
+ }
+ 
+ void ProfanityFilter::LoadModel(const string& path) {
+@@ -101,11 +96,10 @@ void ProfanityFilter::LoadModel(const string& path) {
+         BLOG(LOG_INFO, "正在释放旧模型引用...");
+     }
+     asr_model.reset();
+-    initialization_error = "";
++    { lock_guard<mutex> lock(history_mutex); initialization_error = ""; }
+ 
+     if (path.empty()) {
+-        loaded_model_path = "";
+-        loaded_provider = "";
++        { lock_guard<mutex> lock(history_mutex); loaded_model_path = ""; loaded_provider = ""; }
+ 
+         // Check if it's due to global disable
+         GlobalConfig *cfg = GetGlobalConfig();
+@@ -116,7 +110,7 @@ void ProfanityFilter::LoadModel(const string& path) {
+         }
+ 
+         if (global_enable) {
+-            initialization_error = "未选择模型路径";
++            { lock_guard<mutex> lock(history_mutex); initialization_error = "未选择模型路径"; }
+             BLOG(LOG_ERROR, "错误: %s", initialization_error.c_str());
+         } else {
+             // Just unloaded, no error
+@@ -142,6 +136,10 @@ void ProfanityFilter::LoadModel(const string& path) {
+ 
+     if (asr_model && asr_model->recognizer) {
+         stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++        if (!stream) {
++            lock_guard<mutex> lock(history_mutex);
++            initialization_error = "识别流创建失败";
++        }
+         {
+             lock_guard<mutex> lock(history_mutex);
+             loaded_model_path = path;
+@@ -149,7 +147,7 @@ void ProfanityFilter::LoadModel(const string& path) {
+         }
+         BLOG(LOG_INFO, "引擎初始化成功 (provider: %s)", provider.c_str());
+     } else {
+-        initialization_error = err.empty() ? "引擎初始化失败" : err;
++        { lock_guard<mutex> lock(history_mutex); initialization_error = err.empty() ? "引擎初始化失败" : err; }
+         BLOG(LOG_ERROR, "错误: %s", initialization_error.c_str());
+ 
+         // IMPORTANT: Even if failed, update loaded_model_path to prevent infinite retry loop in ASRLoop
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index 8e3162e..27c0bed 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -18,7 +18,7 @@ public:
+     obs_source_t *context;
+     
+     // Local Properties
+-    bool enabled = true; 
++    std::atomic<bool> enabled{true};
+     
+     // Global Cache
+     std::string target_model_path;

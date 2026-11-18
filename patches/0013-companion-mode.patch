@@ -1,0 +1,766 @@
+From eb4e40f9f5b9ce5a92ee8e4b6b6d758fbac5fba1 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 09:20:26 -0700
+Subject: [PATCH] companion-mode
+
+Broadcast mode choice: OBS streams itself, or the Douyin companion route
+(OBS virtual camera for the picture, OBS audio monitoring into VB-CABLE
+for the censored sound). The companion mode starts the virtual camera,
+points monitoring at CABLE Input, monitors the sources active in the
+program (restored when they leave or the mode is turned off), warns when
+a Windows default playback role is the cable (with a fix via
+IPolicyConfig), when the virtual camera does not output the program, and
+when the companion app's own audio mix (webcast_mate audioStore.json)
+captures anything besides CABLE Output. Turning the mode on shows a
+checklist for the companion side. The settings dialog now scrolls so the
+buttons stay reachable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt          |   1 +
+ src/companion-audio.cpp | 203 ++++++++++++++++++++++++++++++++++++++++
+ src/companion-audio.hpp |  26 +++++
+ src/plugin-config.cpp   | 174 ++++++++++++++++++++++++++++++++--
+ src/plugin-config.hpp   |  13 +++
+ src/plugin-main.cpp     | 132 ++++++++++++++++++++++++++
+ 6 files changed, 542 insertions(+), 7 deletions(-)
+ create mode 100644 src/companion-audio.cpp
+ create mode 100644 src/companion-audio.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 80b32e8..e36d2fa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -145,6 +145,7 @@ target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_20)
+ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+     src/plugin-main.cpp
+     src/plugin-config.cpp
++    src/companion-audio.cpp
+     src/model-manager.cpp
+     src/asr-model.cpp
+     src/utils.cpp
+diff --git a/src/companion-audio.cpp b/src/companion-audio.cpp
+new file mode 100644
+index 0000000..626a154
+--- /dev/null
++++ b/src/companion-audio.cpp
+@@ -0,0 +1,203 @@
++#include "companion-audio.hpp"
++
++#ifdef _WIN32
++#include <windows.h>
++#include <mmdeviceapi.h>
++#include <vector>
++#include <mutex>
++
++namespace {
++
++// PKEY_Device_FriendlyName, defined here to avoid INITGUID/propkey linking.
++const PROPERTYKEY kFriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
++
++// Undocumented but long-stable Windows interface used by audio switchers to change the
++// default endpoint (no public API exists). Only SetDefaultEndpoint is called.
++struct __declspec(uuid("f8679f50-850a-41cf-9c72-430f290290c8")) IPolicyConfig : public IUnknown {
++    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR, void **) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR, INT, void **) = 0;
++    virtual HRESULT STDMETHODCALLTYPE ResetDeviceFormat(PCWSTR) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, void *, void *) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR, INT, PINT64, PINT64) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR, PINT64) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR, void *) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR, void *) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR, const PROPERTYKEY &, PROPVARIANT *) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR, const PROPERTYKEY &, PROPVARIANT *) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR, ERole) = 0;
++    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR, INT) = 0;
++};
++const CLSID CLSID_PolicyConfigClient = {0x870af99c, 0x171d, 0x4f9e, {0xaf, 0x0d, 0xe6, 0x3d, 0xf4, 0x0c, 0x2b, 0xc9}};
++
++std::string utf8(const wchar_t *w) {
++    if (!w) return "";
++    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
++    std::string s(n > 0 ? n - 1 : 0, '\0');
++    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
++    return s;
++}
++
++struct Endpoint {
++    std::wstring id;
++    std::string name;
++};
++
++struct ComScope {
++    bool uninit;
++    ComScope() { uninit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)); }
++    ~ComScope() { if (uninit) CoUninitialize(); }
++};
++
++std::string endpoint_name(IMMDevice *device) {
++    IPropertyStore *store = nullptr;
++    std::string name;
++    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store))) {
++        PROPVARIANT v;
++        PropVariantInit(&v);
++        if (SUCCEEDED(store->GetValue(kFriendlyName, &v)) && v.vt == VT_LPWSTR) name = utf8(v.pwszVal);
++        PropVariantClear(&v);
++        store->Release();
++    }
++    return name;
++}
++
++bool is_cable_name(const std::string &name) {
++    return name.find("CABLE") != std::string::npos && name.find("VB-Audio") != std::string::npos;
++}
++
++bool is_virtual_name(const std::string &name) {
++    return is_cable_name(name) || name.find("Virtual") != std::string::npos ||
++           name.find("VoiceMeeter") != std::string::npos;
++}
++
++std::vector<Endpoint> render_endpoints(IMMDeviceEnumerator *e) {
++    std::vector<Endpoint> out;
++    IMMDeviceCollection *list = nullptr;
++    if (FAILED(e->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &list))) return out;
++    UINT count = 0;
++    list->GetCount(&count);
++    for (UINT i = 0; i < count; ++i) {
++        IMMDevice *d = nullptr;
++        if (FAILED(list->Item(i, &d))) continue;
++        LPWSTR id = nullptr;
++        if (SUCCEEDED(d->GetId(&id))) {
++            out.push_back({id, endpoint_name(d)});
++            CoTaskMemFree(id);
++        }
++        d->Release();
++    }
++    list->Release();
++    return out;
++}
++
++Endpoint default_render(IMMDeviceEnumerator *e, ERole role) {
++    Endpoint ep;
++    IMMDevice *d = nullptr;
++    if (FAILED(e->GetDefaultAudioEndpoint(eRender, role, &d))) return ep;
++    LPWSTR id = nullptr;
++    if (SUCCEEDED(d->GetId(&id))) {
++        ep.id = id;
++        CoTaskMemFree(id);
++    }
++    ep.name = endpoint_name(d);
++    d->Release();
++    return ep;
++}
++
++// Last default playback device seen that was not the cable: the restore target.
++std::mutex remembered_mutex;
++std::wstring remembered_id;
++
++} // namespace
++
++CompanionAudioState QueryCompanionAudio() {
++    CompanionAudioState st;
++    st.supported = true;
++    ComScope com;
++    IMMDeviceEnumerator *e = nullptr;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&e)))) return st;
++    // Prefer the stereo "CABLE Input" over the 16-channel endpoint of the same cable.
++    for (auto &ep : render_endpoints(e)) {
++        if (!is_cable_name(ep.name)) continue;
++        bool better = !st.cable_found || (ep.name.find("16ch") == std::string::npos &&
++                                          st.cable_name.find("16ch") != std::string::npos);
++        if (better) {
++            st.cable_found = true;
++            st.cable_id = utf8(ep.id.c_str());
++            st.cable_name = ep.name;
++        }
++    }
++    Endpoint console = default_render(e, eConsole);
++    Endpoint comm = default_render(e, eCommunications);
++    st.console_name = console.name;
++    st.console_is_cable = is_cable_name(console.name);
++    st.communications_is_cable = is_cable_name(comm.name);
++    if (!console.id.empty() && !st.console_is_cable) {
++        std::lock_guard<std::mutex> lock(remembered_mutex);
++        remembered_id = console.id;
++    }
++    e->Release();
++    return st;
++}
++
++bool RestoreDefaultPlayback(std::string &message) {
++    ComScope com;
++    IMMDeviceEnumerator *e = nullptr;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&e)))) {
++        message = "无法读取Windows音频设备";
++        return false;
++    }
++    auto endpoints = render_endpoints(e);
++    Endpoint console = default_render(e, eConsole);
++    Endpoint comm = default_render(e, eCommunications);
++    e->Release();
++    bool fix_console = is_cable_name(console.name), fix_comm = is_cable_name(comm.name);
++    if (!fix_console && !fix_comm) {
++        message = "默认播放设备不是CABLE，无需修复";
++        return true;
++    }
++    // Target: remembered previous default, else current console default, else first real device.
++    const Endpoint *target = nullptr;
++    std::wstring wanted;
++    {
++        std::lock_guard<std::mutex> lock(remembered_mutex);
++        wanted = remembered_id;
++    }
++    if (!fix_console) wanted = console.id;
++    for (auto &ep : endpoints)
++        if (ep.id == wanted && !is_cable_name(ep.name)) target = &ep;
++    for (auto &ep : endpoints)
++        if (!target && !is_virtual_name(ep.name)) target = &ep;
++    if (!target) {
++        message = "没有找到可用的真实扬声器或耳机";
++        return false;
++    }
++    IPolicyConfig *policy = nullptr;
++    if (FAILED(CoCreateInstance(CLSID_PolicyConfigClient, nullptr, CLSCTX_ALL, __uuidof(IPolicyConfig),
++                                reinterpret_cast<void **>(&policy)))) {
++        message = "无法修改Windows默认设备，请在“声音设置”里手动改回";
++        return false;
++    }
++    bool ok = true;
++    if (fix_console) {
++        ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eConsole));
++        ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eMultimedia));
++    }
++    if (fix_comm) ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eCommunications));
++    policy->Release();
++    message = ok ? std::string("已把Windows默认") + (fix_console && fix_comm ? "播放和通信" : fix_console ? "播放" : "通信") +
++                       "设备改为：" + target->name
++                 : "修改Windows默认设备失败，请在“声音设置”里手动改回";
++    return ok;
++}
++
++#else
++
++CompanionAudioState QueryCompanionAudio() { return {}; }
++
++bool RestoreDefaultPlayback(std::string &message) {
++    message = "仅支持Windows";
++    return false;
++}
++
++#endif
+diff --git a/src/companion-audio.hpp b/src/companion-audio.hpp
+new file mode 100644
+index 0000000..76dbd77
+--- /dev/null
++++ b/src/companion-audio.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Companion mode support: OBS feeds the Douyin streaming companion (直播伴侣) through the
++// OBS virtual camera (picture) and a VB-CABLE virtual audio cable (censored sound, via
++// OBS audio monitoring). Anything else that plays into "CABLE Input" also reaches the
++// broadcast unfiltered, so Windows must not use the cable as a default playback device.
++
++#include <string>
++
++struct CompanionAudioState {
++    bool supported = false;       // Windows only
++    bool cable_found = false;
++    std::string cable_id;         // render endpoint id of "CABLE Input"
++    std::string cable_name;
++    bool console_is_cable = false;        // default playback device (console/multimedia)
++    bool communications_is_cable = false; // default communications playback device
++    std::string console_name;             // current default playback device name
++};
++
++// Reads the playback endpoints and default devices (cheap; call from the UI thread).
++CompanionAudioState QueryCompanionAudio();
++
++// Moves every default playback role that points at the cable back to a real device:
++// the remembered previous default, else the console default, else the first active
++// non-virtual playback device. Returns false and a reason when nothing could be set.
++bool RestoreDefaultPlayback(std::string &message);
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 8e4965b..08a8946 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -3,6 +3,7 @@
+ #include "profanity-filter.hpp"
+ #include "logging-macros.hpp"
+ #include "utils.hpp"
++#include "companion-audio.hpp"
+ #include <obs-module.h>
+ #include <obs.h>
+ #include <obs-frontend-api.h>
+@@ -12,6 +13,13 @@
+ #include <sstream>
+ #include <iomanip>
+ #include <QPointer>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QJsonArray>
++#include <util/platform.h>
++#include <QScrollArea>
++#include <QScreen>
++#include <QGuiApplication>
+ #include <QSaveFile>
+ #include <QFile>
+ 
+@@ -74,6 +82,45 @@ static int obs_stream_delay_seconds() {
+     return (int)config_get_uint(profile, "Output", "DelaySec");
+ }
+ 
++std::vector<std::string> CheckCompanionAppAudio(bool &readable) {
++    std::vector<std::string> problems;
++    readable = false;
++    char path[512];
++    if (os_get_config_path(path, sizeof(path), "webcast_mate/WBStore/audioStore.json") <= 0) return problems;
++    QFile file(QString::fromUtf8(path));
++    if (!file.open(QIODevice::ReadOnly)) return problems;
++    QJsonObject store = QJsonDocument::fromJson(file.readAll()).object().value("audioStore").toObject();
++    QJsonObject states = store.value("audioState").toObject();
++    QJsonObject mixing = store.value("mixingAudio").toObject();
++    if (states.isEmpty() || !mixing.value("inputs").isArray()) return problems;
++    readable = true;
++    auto volume = [](const QJsonObject &state) {
++        QJsonValue v = state.value("filter").toObject().value("setting").toObject().value("volume");
++        return v.isDouble() ? v.toDouble() : 1.0;
++    };
++    bool cable = false;
++    for (const char *group : {"inputs", "outputs", "process"}) {
++        for (const QJsonValue &id : mixing.value(group).toArray()) {
++            QJsonObject state = states.value(id.toString()).toObject();
++            std::string name = state.value("name").toString().toStdString();
++            if (state.value("deviceId").toString() == "DefaultID") name = "默认设备";
++            if (volume(state) <= 0.0) continue;
++            if (!strcmp(group, "inputs") && name.find("CABLE Output") != std::string::npos) {
++                cable = true;
++                continue;
++            }
++            if (!strcmp(group, "outputs"))
++                problems.push_back("伴侣正在采集系统声音（" + name + "），原声会绕过过滤进入直播，请在伴侣里关闭系统声音");
++            else if (!strcmp(group, "inputs"))
++                problems.push_back("伴侣正在采集麦克风“" + name + "”，原声会绕过过滤进入直播，伴侣里只保留 CABLE Output");
++            else
++                problems.push_back("伴侣正在采集程序声音“" + name + "”，原声会绕过过滤进入直播，请在伴侣里移除");
++        }
++    }
++    if (!cable) problems.push_back("伴侣没有采集 CABLE Output，直播会没有过滤后的声音，请在伴侣里把麦克风选为 CABLE Output");
++    return problems;
++}
++
+ static std::mutex sync_summary_mutex;
+ static std::string sync_reason, sync_voices;
+ 
+@@ -137,6 +184,8 @@ void GlobalConfig::Save() {
+         obs_data_set_bool(data, "enable_agc", enable_agc);
+         obs_data_set_int(data, "sync_mode", sync_mode);
+         obs_data_set_bool(data, "auto_filter_microphones", auto_filter_microphones);
++        obs_data_set_bool(data, "companion_mode", companion_mode);
++        obs_data_set_bool(data, "companion_confirmed", companion_confirmed);
+         obs_data_set_bool(data, "delay_follows_padding", delay_follows_padding);
+ 
+         // GPU Settings
+@@ -273,6 +322,8 @@ void GlobalConfig::Load() {
+         if (obs_data_has_user_value(data, "auto_filter_microphones")) {
+             auto_filter_microphones = obs_data_get_bool(data, "auto_filter_microphones");
+         }
++        companion_mode = obs_data_get_bool(data, "companion_mode");
++        companion_confirmed = obs_data_get_bool(data, "companion_confirmed");
+         if (obs_data_has_user_value(data, "delay_follows_padding")) {
+             delay_follows_padding = obs_data_get_bool(data, "delay_follows_padding");
+         }
+@@ -449,6 +500,43 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutAudio->addRow("", lblVideoMemory);
+     
+     containerLayout->addWidget(grpAudio);
++
++    QGroupBox *grpCompanion = new QGroupBox("直播伴侣（抖音）");
++    QVBoxLayout *layoutCompanion = new QVBoxLayout(grpCompanion);
++    comboBroadcastMode = new QComboBox();
++    comboBroadcastMode->addItem("OBS直接推流（B站、虎牙、斗鱼等有推流码的平台）", 0);
++    comboBroadcastMode->addItem("直播伴侣（抖音）：画面经虚拟摄像头，声音经VB-CABLE", 1);
++    comboBroadcastMode->setToolTip("选直播伴侣时插件会：启动虚拟摄像头；把OBS监听设备设为CABLE Input；把参与直播的音源设为“监听并输出”；\n持续检查Windows默认播放设备，如果是CABLE（其他程序的原声会绕过过滤进入直播）就在状态栏提醒。\n读取伴侣的声音设置，发现伴侣采集了系统声音、真实麦克风或程序声音时提醒。\n改回OBS直接推流时恢复插件改过的监听设置。需要先安装VB-CABLE（vb-cable.com）。");
++    {
++        QFormLayout *form = new QFormLayout();
++        form->addRow("开播方式:", comboBroadcastMode);
++        layoutCompanion->addLayout(form);
++    }
++    lblCompanion = new QLabel();
++    lblCompanion->setWordWrap(true);
++    layoutCompanion->addWidget(lblCompanion);
++    QPushButton *btnFixDefaults = new QPushButton("修复Windows默认播放设备");
++    btnFixDefaults->setToolTip("如果Windows默认播放设备或默认通信设备被设成了CABLE，改回真实的扬声器/耳机。");
++    connect(btnFixDefaults, &QPushButton::clicked, this, [this] {
++        std::string message;
++        bool ok = RestoreDefaultPlayback(message);
++        blog(LOG_INFO, "[Speech Sync] restore default playback: %s", message.c_str());
++        if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
++        else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
++        updateCompanionUI();
++    });
++    QPushButton *btnChecklist = new QPushButton("伴侣端设置清单…");
++    connect(btnChecklist, &QPushButton::clicked, this, [this] {
++        showCompanionChecklist();
++        updateCompanionUI();
++    });
++    QHBoxLayout *companionButtons = new QHBoxLayout();
++    companionButtons->addWidget(btnFixDefaults);
++    companionButtons->addWidget(btnChecklist);
++    companionButtons->addStretch();
++    layoutCompanion->addLayout(companionButtons);
++    connect(comboBroadcastMode, &QComboBox::currentIndexChanged, this, [this] { updateCompanionUI(); });
++    containerLayout->addWidget(grpCompanion);
+     
+     // Words Group
+     QGroupBox *grpWords = new QGroupBox("屏蔽词设置");
+@@ -556,16 +644,21 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+ 
+     containerLayout->addWidget(grpGpu);
+     
+-    // Add container to main layout
+-    mainLayout->addWidget(settingsContainer);
++    // Settings scroll; the OK/Apply/Cancel row stays visible below at any screen height.
++    QScrollArea *scroll = new QScrollArea();
++    scroll->setWidgetResizable(true);
++    scroll->setFrameShape(QFrame::NoFrame);
++    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
++    scroll->setWidget(settingsContainer);
++    mainLayout->addWidget(scroll, 1);
+     
+     // Connect Visibility Toggle
+     connect(chkGlobalEnable, &QCheckBox::toggled, settingsContainer, &QWidget::setVisible);
+-    connect(chkGlobalEnable, &QCheckBox::toggled, this, [this](bool checked){
+-         this->resize(this->width(), this->minimumSizeHint().height());
+-    });
+     
+-    mainLayout->addStretch();
++    if (QScreen *screen = QGuiApplication::primaryScreen()) {
++        int height = screen->availableGeometry().height() * 85 / 100;
++        resize(660, height < 900 ? height : 900);
++    }
+     
+     // Buttons
+     QHBoxLayout *btnLayout = new QHBoxLayout();
+@@ -650,6 +743,8 @@ void ConfigDialog::LoadToUI() {
+         comboSyncMode->setCurrentIndex(idx < 0 ? 0 : idx);
+     }
+     chkAutoFilterMic->setChecked(cfg->auto_filter_microphones);
++    comboBroadcastMode->setCurrentIndex(cfg->companion_mode ? 1 : 0);
++    updateCompanionUI();
+     chkDelayAuto->setChecked(cfg->delay_follows_padding);
+     updateDelayUI();
+ 
+@@ -957,10 +1052,12 @@ bool ConfigDialog::onApply() {
+     
+     int old_sync_mode;
+     bool old_auto_mic;
++    bool old_companion;
+     {
+         lock_guard<std::mutex> lock(cfg->mutex);
+         old_sync_mode = cfg->sync_mode;
+         old_auto_mic = cfg->auto_filter_microphones;
++        old_companion = cfg->companion_mode;
+         
+         cfg->global_enable = chkGlobalEnable->isChecked();
+         cfg->model_path = editModelPath->text().toStdString();
+@@ -976,6 +1073,7 @@ bool ConfigDialog::onApply() {
+ 
+         cfg->sync_mode = comboSyncMode->currentData().toInt();
+         cfg->auto_filter_microphones = chkAutoFilterMic->isChecked();
++        cfg->companion_mode = comboBroadcastMode->currentData().toInt() == 1;
+         cfg->delay_follows_padding = chkDelayAuto->isChecked();
+         cfg->NormalizeDelay();
+ 
+@@ -988,12 +1086,74 @@ bool ConfigDialog::onApply() {
+     cfg->Save();
+ 
+     // Apply state change ONLY if switch toggled
+-    if (old_sync_mode != cfg->sync_mode || old_auto_mic != cfg->auto_filter_microphones) {
++    if (cfg->companion_mode && !old_companion) {
++        // Turning the mode on fixes a cable default device right away (the VB-CABLE
++        // installer or Windows often makes the cable the default communications device).
++        auto st = QueryCompanionAudio();
++        if (st.console_is_cable || st.communications_is_cable) {
++            std::string message;
++            bool ok = RestoreDefaultPlayback(message);
++            blog(LOG_INFO, "[Speech Sync] restore default playback: %s", message.c_str());
++            if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
++            else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
++        }
++        showCompanionChecklist();
++    }
++    if (old_sync_mode != cfg->sync_mode || old_auto_mic != cfg->auto_filter_microphones ||
++        old_companion != cfg->companion_mode) {
+         UpdateVideoDelayFiltersState();
+     }
++    updateCompanionUI();
+     return true;
+ }
+ 
++// Checklist for the companion app side, which the plugin cannot configure. Confirming
++// clears the status-bar reminder; settings it can read are still checked every few seconds.
++bool ConfigDialog::showCompanionChecklist() {
++    QMessageBox box(this);
++    box.setWindowTitle("直播伴侣端设置清单");
++    box.setIcon(QMessageBox::Information);
++    box.setText("请在抖音直播伴侣里完成以下设置（插件无法替你修改伴侣）：");
++    box.setInformativeText("① 添加“摄像头”素材，设备选 OBS Virtual Camera\n② 麦克风选 CABLE Output (VB-Audio Virtual Cable)\n③ 关闭伴侣的“系统声音/扬声器”，不要再添加真实麦克风或程序声音\n\n否则KOOK、麦克风等原声会绕过过滤直接进入直播。\n插件能读到伴侣的声音设置时，也会自动检查第②③项。");
++    QPushButton *done = box.addButton("我已完成", QMessageBox::AcceptRole);
++    box.addButton("稍后", QMessageBox::RejectRole);
++    box.exec();
++    bool confirmed = box.clickedButton() == done;
++    GlobalConfig *cfg = GetGlobalConfig();
++    if (cfg && confirmed) {
++        {
++            lock_guard<std::mutex> lock(cfg->mutex);
++            cfg->companion_confirmed = true;
++        }
++        cfg->Save();
++    }
++    return confirmed;
++}
++
++void ConfigDialog::updateCompanionUI() {
++    auto st = QueryCompanionAudio();
++    std::string text;
++    if (comboBroadcastMode->currentData().toInt() != 1) {
++        lblCompanion->setText("OBS自己推流：不需要VB-CABLE，也不需要直播伴侣。");
++        return;
++    }
++    if (!st.supported) text = "仅支持Windows。";
++    else if (!st.cable_found) text = "未检测到VB-CABLE：请从 vb-cable.com 下载安装（安装后重启电脑），再开启本模式。";
++    else {
++        text = "已检测到 " + st.cable_name + "。";
++        if (st.console_is_cable || st.communications_is_cable)
++            text += std::string("⚠ Windows默认") + (st.console_is_cable ? "播放" : "通信") +
++                    "设备是CABLE，其他程序的原声会绕过过滤进入直播，请点下方按钮修复。";
++    }
++    bool readable = false;
++    auto problems = CheckCompanionAppAudio(readable);
++    if (!readable) text += "\n未读取到直播伴侣的声音设置，请按清单自行确认。";
++    else if (problems.empty()) text += "\n✓ 伴侣声音设置检查通过（只采集 CABLE Output）。";
++    else for (auto &p : problems) text += "\n⚠ " + p;
++    text += "\n直播伴侣里：①添加“摄像头”素材，设备选 OBS Virtual Camera；②麦克风选 CABLE Output (VB-Audio Virtual Cable)；③关闭伴侣的“系统声音/扬声器”采集，不要再添加其他麦克风。";
++    lblCompanion->setText(QString::fromStdString(text));
++}
++
+ void ConfigDialog::onSave() {
+     if (onApply()) accept();
+ }
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 463ac58..ddd3138 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -35,6 +35,11 @@ std::string GetViewerLatencyText();
+ // Set by UpdateVideoDelayFiltersState: why the picture is (not) delayed and which
+ // filtered voice sources lag the picture when it is not.
+ void SetSyncSummary(const std::string &reason, const std::string &voices);
++// Reads the Douyin companion app's own audio mix settings (webcast_mate audioStore.json,
++// an internal format seen in 直播伴侣 13.2.x) and returns problems: an enabled source other
++// than CABLE Output (system sound, a real microphone, a program's sound) bypasses the
++// filter. readable=false when the file is missing or not understood (then no warnings).
++std::vector<std::string> CheckCompanionAppAudio(bool &readable);
+ 
+ struct GlobalConfig {
+     bool loaded = false;
+@@ -61,6 +66,10 @@ struct GlobalConfig {
+     // the picture/game/desktop), 1 = always, 2 = never.
+     int sync_mode = 0;
+     bool auto_filter_microphones = true; // attach a recognizing filter to microphone inputs
++    // Douyin companion (直播伴侣) route: picture via OBS virtual camera, censored sound via
++    // OBS audio monitoring into VB-CABLE; guarded by checks in UpdateVideoDelayFiltersState.
++    bool companion_mode = false;
++    bool companion_confirmed = false; // user confirmed the companion-app checklist
+     // Delay = padding + recognition margin. The delay must exceed the front padding plus
+     // the time recognition needs, otherwise a word starts playing before it is muted.
+     bool delay_follows_padding = true;
+@@ -131,6 +140,10 @@ private:
+     QSpinBox *spinCensorPadding;
+     QCheckBox *chkEnableAGC;
+     QCheckBox *chkAutoFilterMic;
++    QComboBox *comboBroadcastMode; // 0 = OBS streams itself, 1 = companion app
++    bool showCompanionChecklist();
++    QLabel *lblCompanion;
++    void updateCompanionUI();
+     QCheckBox *chkDelayAuto;
+     QLabel *lblLatency;
+     void updateDelayUI();
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index dd69346..f07719f 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -6,6 +6,8 @@
+ #include "profanity-filter.hpp"
+ #include "plugin-config.hpp"
+ #include "video-delay.hpp"
++#include "companion-audio.hpp"
++#include <util/config-file.h>
+ #include <QMainWindow>
+ #include <QStatusBar>
+ #include <QLabel>
+@@ -84,6 +86,12 @@ static void start_filter_warning() {
+             ? "color: #88cc88; padding: 3px;"
+             : "color: #ffcc66; font-weight: bold; padding: 3px;");
+         std::string latency = GetViewerLatencyText();
++        bool companion = false;
++        if (cfg) {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            companion = cfg->companion_mode;
++        }
++        if (companion && !latency.empty()) latency += "；直播伴侣模式（虚拟摄像头+CABLE）";
+         filter_warning->setText(QString::fromStdString(message.empty()
+             ? (latency.empty() ? std::string("语音过滤已关闭") : latency) : message));
+         static std::string last_message;
+@@ -322,6 +330,127 @@ static bool has_recognizing_filter(obs_source_t *source) {
+     return found;
+ }
+ 
++static bool is_audio_input(obs_source_t *s) {
++    uint32_t flags = obs_source_get_output_flags(s);
++    return obs_source_get_type(s) == OBS_SOURCE_TYPE_INPUT && (flags & OBS_SOURCE_AUDIO) &&
++           !(flags & OBS_SOURCE_COMPOSITE);
++}
++
++static void set_monitoring_device(const char *name, const char *id) {
++    obs_set_audio_monitoring_device(name, id);
++    config_t *profile = obs_frontend_get_profile_config();
++    if (profile) {
++        config_set_string(profile, "Audio", "MonitoringDeviceName", name);
++        config_set_string(profile, "Audio", "MonitoringDeviceId", id);
++        config_save_safe(profile, "tmp", nullptr);
++    }
++    blog(LOG_INFO, "[Speech Sync] monitoring device set to %s", name);
++}
++
++// Companion mode (直播伴侣): the companion app captures the OBS virtual camera and the
++// VB-CABLE output. OBS audio monitoring carries the stream mix into the cable, so every
++// source that would be in the OBS output gets "monitor and output" (marked in its private
++// settings so turning the mode off restores it). Anything else playing into the cable
++// bypasses the filter, which is why a cable default playback device is a warning.
++static bool companion_was_on = false;
++static int companion_tick = 0;
++static CompanionAudioState companion_state;
++static bool companion_app_readable = false;
++static std::vector<std::string> companion_app_problems;
++
++static void maintain_companion(const std::vector<obs_source_t *> &sources, bool on) {
++    if (!on) {
++        if (companion_was_on) {
++            for (auto *s : sources) {
++                if (!is_audio_input(s)) continue;
++                obs_data_t *priv = obs_source_get_private_settings(s);
++                if (obs_data_get_bool(priv, "companion_monitor")) {
++                    if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
++                        obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++                    obs_data_set_bool(priv, "companion_monitor", false);
++                }
++                obs_data_release(priv);
++            }
++            const char *name = nullptr, *id = nullptr;
++            obs_get_audio_monitoring_device(&name, &id);
++            if (name && strstr(name, "CABLE")) set_monitoring_device("Default", "default");
++            blog(LOG_INFO, "[Speech Sync] companion mode off");
++        }
++        companion_was_on = false;
++        return;
++    }
++    if (!companion_was_on || companion_tick++ % 3 == 0) {
++        companion_state = QueryCompanionAudio();
++        auto problems = CheckCompanionAppAudio(companion_app_readable);
++        if (problems != companion_app_problems)
++            for (auto &p : problems) blog(LOG_INFO, "[Speech Sync] companion app: %s", p.c_str());
++        companion_app_problems = problems;
++    }
++    if (!companion_was_on) {
++        blog(LOG_INFO, "[Speech Sync] companion mode on");
++        if (!obs_frontend_virtualcam_active()) obs_frontend_start_virtualcam();
++    }
++    companion_was_on = true;
++    const auto &st = companion_state;
++    if (!st.supported) {
++        append_sync_warning("直播伴侣模式仅支持Windows");
++        return;
++    }
++    if (!st.cable_found) {
++        append_sync_warning("直播伴侣模式：未找到VB-CABLE虚拟声卡，请从 vb-cable.com 安装并重启电脑，伴侣现在收不到声音");
++        return;
++    }
++    const char *name = nullptr, *id = nullptr;
++    obs_get_audio_monitoring_device(&name, &id);
++    if (!id || st.cable_id != id) set_monitoring_device(st.cable_name.c_str(), st.cable_id.c_str());
++    // Mirror the OBS output mix: only sources active in the program are monitored, so a
++    // source in another scene cannot reach the cable; it is restored when it leaves.
++    for (auto *s : sources) {
++        if (!is_audio_input(s)) continue;
++        auto type = obs_source_get_monitoring_type(s);
++        obs_data_t *priv = obs_source_get_private_settings(s);
++        bool ours = obs_data_get_bool(priv, "companion_monitor");
++        bool active = obs_source_active(s);
++        if (active && type == OBS_MONITORING_TYPE_NONE) {
++            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
++            obs_data_set_bool(priv, "companion_monitor", true);
++            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" monitor and output", obs_source_get_name(s));
++        } else if (!active && ours) {
++            if (type == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
++                obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++            obs_data_set_bool(priv, "companion_monitor", false);
++            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" inactive, monitoring off", obs_source_get_name(s));
++        }
++        obs_data_release(priv);
++        if (type == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) && !obs_source_muted(s)) {
++            append_sync_warning(std::string("“") + obs_source_get_name(s) +
++                                "”设为仅监听，伴侣模式下它也会进入直播");
++        }
++    }
++    if (st.console_is_cable || st.communications_is_cable)
++        append_sync_warning(std::string("原声会绕过过滤进入直播：Windows默认") +
++                            (st.console_is_cable ? "播放" : "通信") +
++                            "设备是CABLE，请在插件设置点“修复Windows默认播放设备”");
++    for (auto &p : companion_app_problems) append_sync_warning(p);
++    bool confirmed = false;
++    if (GlobalConfig *cfg = GetGlobalConfig()) {
++        std::lock_guard<std::mutex> lock(cfg->mutex);
++        confirmed = cfg->companion_confirmed;
++    }
++    if (!confirmed && !companion_app_readable)
++        append_sync_warning("直播伴侣模式：请在插件设置点“伴侣端设置清单”，确认已关闭伴侣的系统声音");
++    if (!obs_frontend_virtualcam_active()) {
++        append_sync_warning("直播伴侣模式：虚拟摄像头未启动，伴侣收不到画面");
++    } else if (obs_output_t *vcam = obs_frontend_get_virtualcam_output()) {
++        // "Program" output renders the main mix, which carries the picture-sync delay on
++        // the transition; a single scene/source output bypasses it and freezes the view
++        // on that scene when the program changes.
++        if (obs_output_video(vcam) != obs_get_video())
++            append_sync_warning("直播伴侣模式：虚拟摄像头输出的不是“节目”画面（不跟随场景切换、不经过画面同步），请点虚拟摄像机旁的齿轮把输出类型改为“节目”");
++        obs_output_release(vcam);
++    }
++}
++
+ // Automatic picture sync. Delaying only separately captured voices (KOOK app audio,
+ // microphone) leaves game picture and sound in real time, saves the video cache, and
+ // keeps the voices in step with each other; they then lag the picture by the delay.
+@@ -376,10 +505,12 @@ void UpdateVideoDelayFiltersState() {
+     bool enable;
+     bool global_enable;
+     bool auto_mic;
++    bool companion;
+     int sync_mode;
+     {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         global_enable = cfg->global_enable;
++        companion = cfg->companion_mode;
+         sync_mode = cfg->sync_mode;
+         auto_mic = cfg->auto_filter_microphones && global_enable;
+     }
+@@ -414,6 +545,7 @@ void UpdateVideoDelayFiltersState() {
+             cfg->video_delay_enabled = enable;
+         }
+         SetSyncSummary(reason, voices);
++        maintain_companion(sources, companion);
+         if (changed)
+             blog(LOG_INFO, "[Speech Sync] picture sync %s (%s)", enable ? "on" : "off",
+                  enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
+-- 
+2.55.0.windows.5
+

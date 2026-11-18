@@ -1,0 +1,85 @@
+From 90d2f1aa9a98a91c66d4202d04f24c07bf377af2 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 03:57:26 -0700
+Subject: [PATCH] censor-engine: effect 4 plays a host-supplied mono clip
+ (clip, clip_rate) from the start of each mute, repeated every clip_period
+ samples with silence between repeats, linearly interpolated to the stream
+ rate and faded in and out over 5 ms at the mute edges; without a clip it
+ mutes. BeepRange keeps the mute's first start (origin) so the clip position
+ stays fixed while the range is played. The plugin does not offer effect 4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/censor-engine.cpp | 19 ++++++++++++++++++-
+ src/censor-engine.hpp |  9 ++++++++-
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+index 096a57a..791e7be 100644
+--- a/src/censor-engine.cpp
++++ b/src/censor-engine.cpp
+@@ -789,7 +789,7 @@ void CensorEngine::ASRLoop() {
+                         }
+                         if (!covered) {
+                             lock_guard<mutex> b_lock(beep_mutex);
+-                            pending_beeps.push_back({m.start_sample, m.end_sample, word_start});
++                            pending_beeps.push_back({m.start_sample, m.end_sample, word_start, m.start_sample});
+                             mute_history.emplace_back(m.start_sample, m.end_sample);
+                             if (mute_history.size() > kMuteHistory) mute_history.pop_front();
+                             if (!same_word) {
+@@ -1159,6 +1159,23 @@ void CensorEngine::Process(float *const *planes, uint32_t frames, uint64_t times
+                              
+                              val = sample_A * gain_A + sample_B * gain_B;
+                              mix = 1.0f; // Force wet mix for voice change
++                        } else if (global_effect == 4) { // Clip (sound chosen by the host)
++                             val = 0.0f;
++                             const auto &clip = cfg.clip;
++                             if (clip && !clip->empty() && cfg.clip_rate > 0) {
++                                 const size_t period = std::max(cfg.clip_period, clip->size());
++                                 const double pos = std::fmod((double)(s - it->origin) * cfg.clip_rate / current_sr, (double)period);
++                                 const size_t i0 = (size_t)pos;
++                                 if (i0 + 1 < clip->size()) {
++                                     const float f = (float)(pos - (double)i0);
++                                     val = (*clip)[i0] * (1.0f - f) + (*clip)[i0 + 1] * f;
++                                 } else if (i0 < clip->size()) {
++                                     val = (*clip)[i0];
++                                 }
++                                 const double edge = 0.005 * current_sr;
++                                 val *= (float)std::min({1.0, (double)(s - it->origin) / edge, (double)(it->end_sample - s) / edge});
++                             }
++                             mix = 1.0f;
+                         } else if (global_effect == 3) { // Telegraph (Morse Code Style)
+                              double t = (double)s / (double)current_sr;
+                              
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+index 7875b39..d3b66d2 100644
+--- a/src/censor-engine.hpp
++++ b/src/censor-engine.hpp
+@@ -27,9 +27,15 @@ struct CensorAudioSettings {
+     bool enable = true; // false: pass the audio through unchanged and unload the model
+     std::string model_path;
+     double delay_seconds = 2.0;
+-    int effect = 1; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
++    int effect = 1; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot, 4=Clip
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
++    // Effect 4: mono samples at clip_rate played from the start of each mute, repeated every
++    // clip_period samples (silence between repeats when longer than the clip), faded in and out
++    // over 5 ms at the mute edges. Without a clip, effect 4 mutes.
++    std::shared_ptr<const std::vector<float>> clip;
++    int clip_rate = 48000;
++    size_t clip_period = 0;
+ };
+ 
+ // Read by the recognition thread every loop.
+@@ -179,6 +185,7 @@ public:
+         uint64_t start_sample;
+         uint64_t end_sample;
+         uint64_t word_start; // matched word start before padding, used to detect leaks
++        uint64_t origin;     // start as first added; start_sample moves on as the range is played
+     };
+     std::mutex beep_mutex;
+     std::vector<BeepRange> pending_beeps;
+-- 
+2.55.0.windows.5
+

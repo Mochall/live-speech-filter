@@ -1,0 +1,390 @@
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index e8f03f9..4e17771 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -46,7 +46,7 @@ static void start_filter_warning() {
+         std::string message = get_sync_warning();
+         GlobalConfig *cfg = GetGlobalConfig();
+         bool syncing = false;
+-        {
++        if (cfg) {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+             syncing = cfg->global_enable && cfg->video_delay_enabled;
+         }
+@@ -68,6 +68,11 @@ static void start_filter_warning() {
+             if (!message.empty()) message += "；";
+             message += status.second;
+         }
++        auto recognition = ProfanityFilter::GetRecognitionWarning();
++        if (!recognition.empty()) {
++            if (!message.empty()) message += "；";
++            message += recognition;
++        }
+         filter_warning->setStyleSheet(message.empty()
+             ? "color: #88cc88; padding: 3px;"
+             : "color: #ffcc66; font-weight: bold; padding: 3px;");
+@@ -243,7 +248,7 @@ static void frontend_event(enum obs_frontend_event event, void *) {
+                event == OBS_FRONTEND_EVENT_TRANSITION_CHANGED ||
+                event == OBS_FRONTEND_EVENT_TRANSITION_LIST_CHANGED) {
+         auto *cfg = GetGlobalConfig();
+-        {
++        if (cfg) {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+             scene_settle_until = os_gettime_ns() + (uint64_t)(cfg->delay_seconds * 1000000000.0);
+         }
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index ada641e..75dd67d 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -17,6 +17,7 @@ static void ModuleLocator() {}
+ #include <regex>
+ #include <filesystem>
+ #include <windows.h>
++#include <util/platform.h>
+ 
+ using namespace std;
+ 
+@@ -51,6 +52,7 @@ ProfanityFilter::~ProfanityFilter() {
+ 
+ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+     GlobalConfig *cfg = GetGlobalConfig();
++    if (!cfg) return {false, "过滤未生效，原声继续输出（插件配置未加载）"};
+     string expected_path;
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+@@ -91,6 +93,49 @@ std::string ProfanityFilter::GetAudioSyncWarning() {
+     return "";
+ }
+ 
++std::string ProfanityFilter::GetRecognitionWarning() {
++    GlobalConfig *cfg = GetGlobalConfig();
++    if (!cfg) return "";
++    double delay;
++    {
++        lock_guard<mutex> lock(cfg->mutex);
++        if (!cfg->global_enable) return "";
++        delay = cfg->delay_seconds;
++    }
++    const uint64_t now = os_gettime_ns();
++    const double backlog_limit = max(1.0, delay * 0.5);
++    string out;
++    lock_guard<mutex> lock(instances_mutex);
++    for (auto *filter : instances) {
++        obs_source_t *parent = obs_filter_get_parent(filter->context);
++        if (filter->delay_only || !filter->enabled || !obs_source_enabled(filter->context) ||
++            !parent || !obs_source_active(parent) || filter->is_loading) continue;
++        string name = obs_source_get_name(parent);
++        char text[256];
++        uint64_t late = filter->last_late_beep_ns.load();
++        if (late && now > late && now - late < 10000000000ULL) {
++            snprintf(text, sizeof(text), "消音迟到：%s 有命中词在静音前已播出（累计%zu次），请增大延迟",
++                     name.c_str(), filter->late_beeps_count.load());
++            if (!out.empty()) out += "；";
++            out += text;
++            continue;
++        }
++        size_t queued;
++        {
++            lock_guard<mutex> q_lock(filter->queue_mutex);
++            queued = filter->asr_queue.size();
++        }
++        double backlog = queued / 16000.0;
++        if (backlog >= backlog_limit) {
++            snprintf(text, sizeof(text), "识别积压：%s 约%.1f秒（延迟%.1f秒），超过延迟将漏消音",
++                     name.c_str(), backlog, delay);
++            if (!out.empty()) out += "；";
++            out += text;
++        }
++    }
++    return out;
++}
++
+ void ProfanityFilter::LoadModel(const string& path) {
+     {
+         lock_guard<mutex> lock(history_mutex);
+@@ -258,6 +303,7 @@ void ProfanityFilter::ASRLoop() {
+                 {
+                     lock_guard<mutex> lock(queue_mutex);
+                     asr_queue.clear();
++                    asr_dropped_16k = 0; // the time re-sync below covers dropped audio
+                 }
+ 
+                 // Re-sync time after clearing queue
+@@ -280,6 +326,23 @@ void ProfanityFilter::ASRLoop() {
+ 
+         {
+             lock_guard<mutex> lock(queue_mutex);
++            // Audio removed without recognition (overflow or a long source gap) still
++            // occupied input time. Advance the 16 kHz timeline and start a new stream so
++            // later token timestamps map to the right samples in the delay buffer.
++            if (asr_dropped_16k) {
++                total_samples_popped_16k += asr_dropped_16k;
++                asr_dropped_16k = 0;
++                if (asr_model && asr_model->recognizer && stream) {
++                    SherpaOnnxDestroyOnlineStream(stream);
++                    stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++                }
++                last_reset_sample_16k = total_samples_popped_16k;
++                processed_matches.clear();
++                {
++                    lock_guard<mutex> h_lock(history_mutex);
++                    current_partial_text = "";
++                }
++            }
+             if (!asr_queue.empty()) {
+                 // Gap Check: If start_offset_input jumped significantly (e.g. > 0.5s), reset stream
+                 // This handles cases where filter was disabled/idle for a long time, ensuring fresh context
+@@ -428,6 +491,7 @@ void ProfanityFilter::ASRLoop() {
+                         uint64_t end_sample;
+                         string log_text;
+                         bool is_pinyin;
++                        uint64_t word_start;
+                     };
+                     vector<MatchCandidate> candidates;
+ 
+@@ -479,10 +543,11 @@ void ProfanityFilter::ASRLoop() {
+                                 }
+                                 
+                                 uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
++                                uint64_t word_start = start_abs;
+                                 start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+                                 end_abs += margin; 
+                                 
+-                                candidates.push_back({m_start_char, start_abs, end_abs, match.str(), false});
++                                candidates.push_back({m_start_char, start_abs, end_abs, match.str(), false, word_start});
+                             }
+                         }
+                     }
+@@ -658,6 +723,7 @@ void ProfanityFilter::ASRLoop() {
+                                         }
+                                         
+                                         uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
++                                        uint64_t word_start = start_abs;
+                                         start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+                                         end_abs += margin; 
+                                         
+@@ -668,7 +734,7 @@ void ProfanityFilter::ASRLoop() {
+                                         for(int k=0; k<pat.size(); k++) ss << text_pinyins[i+k] << " ";
+                                         ss << "]";
+                                         
+-                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true});
++                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start});
+                                     }
+                                 }
+                             }
+@@ -686,7 +752,7 @@ void ProfanityFilter::ASRLoop() {
+                         
+                         {
+                             lock_guard<mutex> b_lock(beep_mutex);
+-                            pending_beeps.push_back({m.start_sample, m.end_sample, m.start_sample});
++                            pending_beeps.push_back({m.start_sample, m.end_sample, m.word_start});
+                             BLOG(LOG_INFO, "%s", m.log_text.c_str());
+                         }
+                         
+@@ -784,6 +850,38 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+     }
+     
+     double current_ratio = sample_rate_ratio.load();
++    size_t delay_samples = (size_t)(cached_delay * current_sr);
++
++    // Source timestamps say how much real time passed since the previous packet.
++    // Application captures can stop delivering packets while the app is silent; such a
++    // pause has to advance the delay line (as silence) instead of discarding the tail
++    // that is still waiting in the buffer, otherwise utterance endings are cut off and
++    // the remaining audio would play late relative to the delayed video.
++    // libobs (obs-source.c source_output_audio_data) smooths timestamp jumps below
++    // TS_SMOOTHING_THRESHOLD (70 ms) as contiguous and places larger jumps at their
++    // timestamp; use the same threshold so the delay line matches what is played.
++    const uint64_t gap_tolerance_ns = 70000000ULL;
++    bool reset_buffer = !previous_audio_end || delay_samples != previous_delay_samples;
++    uint64_t gap_frames = 0;
++    if (!reset_buffer && audio->timestamp > previous_audio_end + gap_tolerance_ns) {
++        gap_frames = (audio->timestamp - previous_audio_end) * current_sr / 1000000000ULL;
++    } else if (!reset_buffer && audio->timestamp + gap_tolerance_ns < previous_audio_end) {
++        reset_buffer = true; // timestamps went backwards: treat as a source restart
++    }
++    const bool gap_elapsed_buffer = gap_frames && gap_frames >= delay_samples;
++    if (gap_frames) {
++        size_t gaps = ++audio_gap_count;
++        if (gaps <= 5 || gaps % 50 == 0) {
++            obs_source_t *parent = obs_filter_get_parent(context);
++            // A filter only outputs when input arrives, so delayed audio that fell due
++            // during the gap (up to one delay length) cannot be output any more.
++            BLOG(LOG_INFO, "[Speech Sync] source=\"%s\" audio gap %.0f ms; %.0f ms of delayed audio unplayable (gaps=%zu)",
++                 parent ? obs_source_get_name(parent) : "?", gap_frames * 1000.0 / current_sr,
++                 (double)min<uint64_t>(gap_frames, delay_samples) * 1000.0 / current_sr, gaps);
++        }
++    }
++    previous_delay_samples = delay_samples;
++    previous_audio_end = audio->timestamp + (uint64_t)frames * 1000000000ULL / current_sr;
+ 
+     if (enabled && !target_model_path.empty()) {
+         lock_guard<mutex> lock(queue_mutex);
+@@ -791,9 +889,29 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+         // Safety: Limit queue size to prevent memory leak if ASR is too slow
+         // Limit to ~60 seconds of audio (16000 * 60 = 960,000 samples)
+         if (asr_queue.size() > 960000) {
++            BLOG(LOG_WARNING, "ASR backlog exceeded 60s; dropping %zu queued samples (timeline kept aligned)",
++                 asr_queue.size());
++            asr_dropped_16k += asr_queue.size();
+             asr_queue.clear();
+         }
+ 
++        // Keep the recognizer timeline equal to source time across packet gaps.
++        if (gap_elapsed_buffer) {
++            // Pre-gap samples still queued would otherwise be decoded after the
++            // timeline jump and mapped onto post-gap audio; their output is gone anyway.
++            asr_dropped_16k += asr_queue.size();
++            asr_queue.clear();
++            asr_dropped_16k += (uint64_t)(gap_frames / current_ratio);
++        } else {
++            for (uint64_t i = 0; i < gap_frames; i++) {
++                resample_acc += 1.0f;
++                if (resample_acc >= current_ratio) {
++                    resample_acc -= (float)current_ratio;
++                    asr_queue.push_back(0.0f);
++                }
++            }
++        }
++
+         // Dynamic Downsampling (Nearest Neighbor / Accumulator)
+         for (size_t i = 0; i < frames; i++) {
+                 resample_acc += 1.0f;
+@@ -820,24 +938,8 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+     }
+     
+     // Ensure buffer size covers delay
+-    size_t delay_samples = (size_t)(cached_delay * current_sr);
+     size_t current_buf_size = channels[0].buffer.size();
+ 
+-    // A source restart must not replay samples left from an earlier activation.
+-    uint64_t gap = audio->timestamp > previous_audio_end
+-        ? audio->timestamp - previous_audio_end : previous_audio_end - audio->timestamp;
+-    if (!previous_audio_end || gap > 100000000ULL || delay_samples != previous_delay_samples) {
+-        for (auto &ch : channels) {
+-            std::fill(ch.buffer.begin(), ch.buffer.end(), 0.0f);
+-            std::fill(ch.clean_buffer.begin(), ch.clean_buffer.end(), 0.0f);
+-        }
+-        buffered_samples = 0;
+-    }
+-    previous_delay_samples = delay_samples;
+-    previous_audio_end = audio->timestamp + (uint64_t)frames * 1000000000ULL / current_sr;
+-    buffered_samples += frames;
+-    audio_warming = buffered_samples < delay_samples;
+-    
+     // Resize check (handle sample rate change or large delay)
+     if (delay_samples * 2 > current_buf_size || current_buf_size != current_sr * 12) {
+             size_t new_size = max((size_t)(current_sr * 12), delay_samples * 2);
+@@ -853,6 +955,39 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+     }
+     
+     if (delay_samples >= current_buf_size) delay_samples = current_buf_size - current_sr;
++
++    if (reset_buffer || gap_elapsed_buffer) {
++        // A source restart must not replay samples from an earlier activation; after a
++        // gap longer than the delay everything buffered would already have played.
++        for (auto &ch : channels) {
++            std::fill(ch.buffer.begin(), ch.buffer.end(), 0.0f);
++            std::fill(ch.clean_buffer.begin(), ch.clean_buffer.end(), 0.0f);
++        }
++        // Pending mutes refer to audio that was discarded or already elapsed.
++        lock_guard<mutex> b_lock(beep_mutex);
++        pending_beeps.clear();
++    }
++    if (reset_buffer) {
++        buffered_samples = 0;
++    } else if (gap_frames) {
++        // Advance the delay line by the gap. Short gaps are written as silence so the
++        // buffered tail keeps playing at its original time; for long gaps the buffer is
++        // already all silence, so only the absolute positions move forward.
++        for (auto &ch : channels) {
++            if (!gap_elapsed_buffer) {
++                for (uint64_t i = 0; i < gap_frames; i++) {
++                    ch.buffer[ch.head] = 0.0f;
++                    ch.clean_buffer[ch.head] = 0.0f;
++                    ch.head = (ch.head + 1) % current_buf_size;
++                }
++            }
++            ch.total_written += gap_frames;
++        }
++        total_samples_written.fetch_add(gap_frames);
++        buffered_samples += gap_frames;
++    }
++    buffered_samples += frames;
++    audio_warming = buffered_samples < delay_samples;
+     
+     // Write to buffer
+     for (size_t c = 0; c < channels_count; c++) {
+@@ -880,6 +1015,16 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+         for (auto it = pending_beeps.begin(); it != pending_beeps.end(); ) {
+                 // 1. Handling Late Beeps (Latency > Delay)
+                 if (it->start_sample < play_head_pos) {
++                    // Losing only the pre-padding is expected; losing part of the word
++                    // itself means original speech was already output unmuted.
++                    if (it->word_start < play_head_pos) {
++                        size_t late = ++late_beeps_count;
++                        last_late_beep_ns = os_gettime_ns();
++                        if (late <= 5 || late % 10 == 0) {
++                            BLOG(LOG_WARNING, "Censor late: word start already played by %.0f ms (late=%zu). Increase delay setting.",
++                                 (play_head_pos - it->word_start) * 1000.0 / current_sr, late);
++                        }
++                    }
+                     it->start_sample = play_head_pos;
+                 }
+ 
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index a922683..3d8b079 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -58,13 +58,16 @@ public:
+     std::thread asr_thread;
+     std::atomic<bool> running{false};
+     std::mutex queue_mutex;
+-    std::deque<float> asr_queue; 
+-    
++    std::deque<float> asr_queue;
++    // 16 kHz samples removed from asr_queue without recognition (guarded by queue_mutex).
++    // The ASR thread advances its timeline by this amount so later matches stay aligned.
++    uint64_t asr_dropped_16k = 0;
++
+     // Beep Map
+     struct BeepRange {
+-        uint64_t start_sample; 
++        uint64_t start_sample;
+         uint64_t end_sample;
+-        uint64_t original_start;
++        uint64_t word_start; // matched word start before padding, used to detect leaks
+     };
+     std::mutex beep_mutex;
+     std::vector<BeepRange> pending_beeps;
+@@ -77,6 +80,10 @@ public:
+     uint64_t last_reset_sample_16k = 0;
+     std::set<size_t> processed_matches; 
+     std::atomic<size_t> dropped_beeps_count{0};
++    // Matches whose unpadded word start was already played before muting began.
++    std::atomic<size_t> late_beeps_count{0};
++    std::atomic<uint64_t> last_late_beep_ns{0};
++    std::atomic<size_t> audio_gap_count{0};
+     
+     // Pinyin Support
+     std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
+@@ -101,6 +108,7 @@ public:
+     static std::mutex instances_mutex;
+     static std::pair<bool, std::string> GetGlobalModelStatus();
+     static std::string GetAudioSyncWarning();
++    static std::string GetRecognitionWarning();
+ 
+ private:
+     uint64_t previous_audio_end = 0;
+diff --git a/src/video-delay.cpp b/src/video-delay.cpp
+index a28ff06..578d0a0 100644
+--- a/src/video-delay.cpp
++++ b/src/video-delay.cpp
+@@ -377,6 +377,7 @@ void VideoDelayFilter::Render(gs_effect_t *effect) {
+ 
+ std::string VideoDelayFilter::GetSyncWarning() {
+     GlobalConfig *cfg = GetGlobalConfig();
++    if (!cfg) return "";
+     uint64_t expected;
+     {
+         std::lock_guard<std::mutex> lock(cfg->mutex);

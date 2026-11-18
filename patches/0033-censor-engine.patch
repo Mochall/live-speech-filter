@@ -1,0 +1,2880 @@
+From 87ba49a089ed504ce9a3e90e8095250a13971062 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Fri, 13 Nov 2026 06:33:43 -0700
+Subject: [PATCH] censor-engine: recognition, word matching, muting and the
+ delay line move out of ProfanityFilter into CensorEngine
+ (censor-engine.cpp/.hpp), which reads settings, lexicon, source name, pinyin
+ dictionary and the 16 kHz resampler through a CensorHost interface and logs
+ through censor-log.hpp; ProfanityFilter becomes the OBS host (libobs
+ audio_resampler, blog, plugin config); word list building and pattern parsing
+ are shared functions; no change in plugin behaviour, so a standalone program
+ can use the same engine
+
+---
+ CMakeLists.txt           |    1 +
+ src/asr-model.cpp        |    9 +-
+ src/censor-engine.cpp    | 1041 ++++++++++++++++++++++++++++++++
+ src/censor-engine.hpp    |  192 ++++++
+ src/censor-log.hpp       |   18 +
+ src/plugin-config.cpp    |   22 +-
+ src/plugin-main.cpp      |    5 +-
+ src/profanity-filter.cpp | 1208 +++++---------------------------------
+ src/profanity-filter.hpp |  125 +---
+ 9 files changed, 1434 insertions(+), 1187 deletions(-)
+ create mode 100644 src/censor-engine.cpp
+ create mode 100644 src/censor-engine.hpp
+ create mode 100644 src/censor-log.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 60938bc..8374e7b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -155,6 +155,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+     src/model-manager.cpp
+     src/asr-model.cpp
+     src/utils.cpp
++    src/censor-engine.cpp
+     src/profanity-filter.cpp
+     src/video-delay.cpp
+     src/file-downloader.cpp
+diff --git a/src/asr-model.cpp b/src/asr-model.cpp
+index 6684a91..720a9c3 100644
+--- a/src/asr-model.cpp
++++ b/src/asr-model.cpp
+@@ -1,8 +1,7 @@
+ #include "asr-model.hpp"
+-#include <obs.h>
+ #include <cstring>
+ #include <cstdio>
+-#include "logging-macros.hpp"
++#include "censor-log.hpp"
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+@@ -123,14 +122,14 @@ ASRModel::ASRModel(const std::string& path, const std::string& prov, std::string
+     if (!recognizer) {
+         error_msg = "引擎创建失败 (内部错误)";
+     } else {
+-        BLOG(LOG_INFO, "ASR Model Loaded: %s (provider: %s)", model_path.c_str(), provider.c_str());
++        CLOG(censor::kLogInfo, "ASR Model Loaded: %s (provider: %s)", model_path.c_str(), provider.c_str());
+     }
+ }
+ 
+ ASRModel::~ASRModel() {
+     if (recognizer) {
+         SherpaOnnxDestroyOnlineRecognizer(recognizer);
+-        BLOG(LOG_INFO, "ASR Model Unloaded: %s", model_path.c_str());
++        CLOG(censor::kLogInfo, "ASR Model Unloaded: %s", model_path.c_str());
+     }
+ }
+ 
+@@ -153,7 +152,7 @@ std::shared_ptr<ASRModel> ModelManager::Get(const std::string& path, const std::
+     }
+ 
+     // Load new
+-    BLOG(LOG_INFO, "🆕 [ModelManager] Loading NEW model for: %s (provider: %s)", path.c_str(), provider.c_str());
++    CLOG(censor::kLogInfo, "🆕 [ModelManager] Loading NEW model for: %s (provider: %s)", path.c_str(), provider.c_str());
+     auto ptr = std::make_shared<ASRModel>(path, provider, error_out);
+     if (!ptr->recognizer) {
+         return nullptr; // Failed
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+new file mode 100644
+index 0000000..a8bcd34
+--- /dev/null
++++ b/src/censor-engine.cpp
+@@ -0,0 +1,1041 @@
++#include "censor-engine.hpp"
++#include "censor-log.hpp"
++#include "utils.hpp"
++
++#include <cpp-pinyin/G2pglobal.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <sstream>
++
++using namespace std;
++
++namespace censor {
++static LogHandler g_log_handler = nullptr;
++
++void SetLogHandler(LogHandler handler) { g_log_handler = handler; }
++
++void Log(int level, const char *format, ...) {
++    if (!g_log_handler) return;
++    char small[1024];
++    va_list args;
++    va_start(args, format);
++    va_list copy;
++    va_copy(copy, args);
++    int n = vsnprintf(small, sizeof(small), format, args);
++    va_end(args);
++    if (n < 0) { va_end(copy); return; }
++    if ((size_t)n < sizeof(small)) {
++        va_end(copy);
++        g_log_handler(level, small);
++        return;
++    }
++    string big((size_t)n + 1, '\0');
++    vsnprintf(big.data(), big.size(), format, copy);
++    va_end(copy);
++    g_log_handler(level, big.c_str());
++}
++} // namespace censor
++
++string CensorBuildWordList(const string &builtin, const string &custom) {
++    string words = builtin;
++    for (const auto &word : SplitWordList(custom)) {
++        if (!words.empty()) words += ", ";
++        words += EscapeRegexLiteral(word);
++    }
++    return words;
++}
++
++vector<regex> CensorParsePatterns(const string &word_list) {
++    vector<regex> patterns;
++    stringstream ss(word_list);
++    string item;
++    while (getline(ss, item, ',')) {
++        // Trim
++        item.erase(0, item.find_first_not_of(" \t\n\r"));
++        item.erase(item.find_last_not_of(" \t\n\r") + 1);
++        if (!item.empty()) {
++            try {
++                patterns.emplace_back(item, regex::icase);
++            } catch(...) {}
++        }
++    }
++    return patterns;
++}
++
++uint64_t CensorEngine::NowNs() {
++    return (uint64_t)chrono::duration_cast<chrono::nanoseconds>(chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++CensorEngine::CensorEngine(CensorHost *h) : host(h) {
++    created_ns = NowNs();
++}
++
++CensorEngine::~CensorEngine() {
++    Stop();
++    if (stream) {
++        SherpaOnnxDestroyOnlineStream(stream);
++        stream = nullptr;
++    }
++    asr_model.reset();
++    asr_resampler.reset();
++}
++
++// Called with queue_mutex held.
++void CensorEngine::FeedAsrResampler(const float *const *planes, uint32_t frames, double ratio) {
++    if (!asr_resampler || !frames) return;
++    asr_resampler_buf.clear();
++    if (!asr_resampler->Resample(planes, frames, asr_resampler_buf)) return;
++    const uint32_t out_frames = (uint32_t)asr_resampler_buf.size();
++    for (uint32_t i = 0; i < out_frames; i++) asr_queue.push_back(asr_resampler_buf[i]);
++    asr_resampler_in += frames;
++    asr_resampler_out += out_frames;
++    asr_resampler_held = (int64_t)asr_resampler_in - (int64_t)llround(asr_resampler_out * ratio);
++}
++
++void CensorEngine::LoadModel(const string& path, const string& provider, bool enable) {
++    {
++        lock_guard<mutex> lock(history_mutex);
++        loading_target_path = path;
++    }
++    is_loading = true;
++    if (stream) {
++        SherpaOnnxDestroyOnlineStream(stream);
++        stream = nullptr;
++    }
++
++    if (asr_model) {
++        // If this is the last instance, the underlying model will be destroyed here
++        CLOG(censor::kLogInfo, "正在释放旧模型引用...");
++    }
++    asr_model.reset();
++    { lock_guard<mutex> lock(history_mutex); initialization_error = ""; }
++
++    if (path.empty()) {
++        { lock_guard<mutex> lock(history_mutex); loaded_model_path = ""; loaded_provider = ""; }
++
++        // Check if it's due to global disable
++        if (enable) {
++            { lock_guard<mutex> lock(history_mutex); initialization_error = "未选择模型路径"; }
++            CLOG(censor::kLogError, "错误: %s", initialization_error.c_str());
++        } else {
++            // Just unloaded, no error
++        }
++        is_loading = false;
++        return;
++    }
++
++    string err;
++    asr_model = ModelManager::Get(path, provider, err);
++
++    if (asr_model && asr_model->recognizer) {
++        stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++        if (!stream) {
++            lock_guard<mutex> lock(history_mutex);
++            initialization_error = "识别流创建失败";
++        }
++        {
++            lock_guard<mutex> lock(history_mutex);
++            loaded_model_path = path;
++            loaded_provider = provider;
++        }
++        CLOG(censor::kLogInfo, "引擎初始化成功 (provider: %s)", provider.c_str());
++    } else {
++        { lock_guard<mutex> lock(history_mutex); initialization_error = err.empty() ? "引擎初始化失败" : err; }
++        CLOG(censor::kLogError, "错误: %s", initialization_error.c_str());
++
++        // IMPORTANT: Even if failed, update loaded_model_path to prevent infinite retry loop in ASRLoop
++        {
++            lock_guard<mutex> lock(history_mutex);
++            loaded_model_path = path;
++            loaded_provider = provider;
++        }
++    }
++    is_loading = false;
++}
++
++void CensorEngine::Start() {
++    if (running) return;
++    running = true;
++    asr_thread = thread(&CensorEngine::ASRLoop, this);
++}
++
++void CensorEngine::Stop() {
++    running = false;
++    if (asr_thread.joinable()) asr_thread.join();
++}
++
++void CensorEngine::ASRLoop() {
++    uint64_t total_samples_popped_16k = 0;
++    
++    // Time sync
++    uint64_t start_offset_input = 0;
++    uint64_t last_feed_offset = 0;
++    
++    
++    uint64_t tw = total_samples_written.load();
++    if (tw > 0) {
++        size_t q_size;
++        {
++            lock_guard<mutex> lock(queue_mutex);
++            q_size = asr_queue.size();
++        }
++        double ratio = sample_rate_ratio.load();
++        uint64_t backlog_input = (uint64_t)(q_size * ratio);
++        if (tw > backlog_input) {
++            start_offset_input = tw - backlog_input;
++        }
++        last_feed_offset = start_offset_input;
++    }
++
++    string last_debug_text;
++    uint64_t last_debug_segment = 0;
++    while (running) {
++        // Poll Global Config for model path changes and Gain settings
++        int censor_padding_ms;
++        bool asr_debug_logging;
++        string target_provider;
++        bool asr_enable;
++        int model_offset_ms;
++
++        {
++            CensorAsrSettings cfg;
++            host->GetAsrSettings(cfg);
++
++            std::string desired_path = cfg.enable ? cfg.model_path : "";
++            censor_padding_ms = cfg.censor_padding_ms;
++            asr_debug_logging = cfg.debug_logging;
++            asr_enable = cfg.enable;
++            model_offset_ms = cfg.model_offset_ms;
++
++            // 获取 provider 设置
++            target_provider = cfg.provider;
++
++            if (target_model_path != desired_path) {
++                std::lock_guard<std::mutex> q_lock(queue_mutex);
++                target_model_path = desired_path;
++            }
++        }
++
++        if (!asr_debug_logging) last_debug_text.clear();
++
++        // 1. Check for Model Change or Provider Change
++        {
++            string target;
++            {
++                lock_guard<mutex> lock(queue_mutex);
++                target = target_model_path;
++            }
++
++            // 检测路径变化或 provider 变化
++            bool needs_reload = (target != loaded_model_path) || (target_provider != loaded_provider);
++
++            if (needs_reload) {
++                LoadModel(target, target_provider, asr_enable);
++                // Reset stream implies resetting timestamp reference
++                last_reset_sample_16k = total_samples_popped_16k;
++
++                // Fix: Clear queue and processed matches to prevent latency accumulation and index collision
++                {
++                    lock_guard<mutex> lock(queue_mutex);
++                    asr_queue.clear();
++                    asr_dropped_16k = 0; // the time re-sync below covers dropped audio
++                }
++
++                // Re-sync time after clearing queue
++                uint64_t tw_now = total_samples_written.load();
++                double ratio_now = sample_rate_ratio.load();
++                int64_t diff = (int64_t)tw_now - (int64_t)(total_samples_popped_16k * ratio_now);
++                if (diff >= 0) {
++                    start_offset_input = (uint64_t)diff;
++                }
++                last_feed_offset = start_offset_input;
++
++                processed_matches.clear();
++            }
++        }
++        
++        // 2. Process Audio
++        vector<float> chunk;
++        double current_ratio = sample_rate_ratio.load();
++        uint32_t current_sr = sample_rate.load();
++
++        {
++            lock_guard<mutex> lock(queue_mutex);
++            // Audio removed without recognition (overflow or a long source gap) still
++            // occupied input time. Advance the 16 kHz timeline and start a new stream so
++            // later token timestamps map to the right samples in the delay buffer.
++            if (asr_dropped_16k) {
++                total_samples_popped_16k += asr_dropped_16k;
++                asr_dropped_16k = 0;
++                if (asr_model && asr_model->recognizer && stream) {
++                    SherpaOnnxDestroyOnlineStream(stream);
++                    stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++                }
++                last_reset_sample_16k = total_samples_popped_16k;
++                processed_matches.clear();
++                {
++                    lock_guard<mutex> h_lock(history_mutex);
++                    current_partial_text = "";
++                }
++            }
++            if (!asr_queue.empty()) {
++                // Gap Check: If start_offset_input jumped significantly (e.g. > 0.5s), reset stream
++                // This handles cases where filter was disabled/idle for a long time, ensuring fresh context
++                // and preventing latency accumulation from stale state.
++                if (start_offset_input > last_feed_offset + (uint64_t)(current_sr * 0.5)) {
++                        if (asr_model && asr_model->recognizer && stream) {
++                            SherpaOnnxDestroyOnlineStream(stream);
++                            stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++                            last_reset_sample_16k = total_samples_popped_16k;
++                            processed_matches.clear();
++                            {
++                                lock_guard<mutex> h_lock(history_mutex);
++                                current_partial_text = "";
++                            }
++                        }
++                }
++                last_feed_offset = start_offset_input;
++
++                size_t n = min((size_t)3200, asr_queue.size()); 
++                chunk.assign(asr_queue.begin(), asr_queue.begin() + n);
++                asr_queue.erase(asr_queue.begin(), asr_queue.begin() + n);
++            } else {
++                // Re-sync offset to handle gaps (e.g. toggle enabled, queue clear)
++                // This ensures timestamps remain accurate even if we dropped samples
++                uint64_t tw = total_samples_written.load();
++                if (tw > 0) {
++                    // Calculate what start_offset_input SHOULD be so that:
++                    // current_time ~= start_offset + total_popped * ratio
++                    // We assume since queue is empty, current_time == tw
++                    
++                    // Use signed math to handle potential small drift
++                    // Input still inside the resampler has not reached the model yet.
++                    int64_t diff = (int64_t)tw - asr_resampler_held -
++                                   (int64_t)(total_samples_popped_16k * current_ratio);
++                    // start_offset_input is uint64, assuming positive result
++                    if (diff >= 0) {
++                        start_offset_input = (uint64_t)diff;
++                    }
++                }
++            }
++        }
++        
++        if (chunk.empty()) {
++            this_thread::sleep_for(chrono::milliseconds(10));
++            continue;
++        }
++        
++        total_samples_popped_16k += chunk.size();
++        
++        // The model gets the resampled input unchanged. The former AGC (removed in 0019) lifted
++        // normal-level speech up to 31.6x and clipped it at +-1, which cost recognitions.
++        const vector<float> &model_chunk = chunk;
++
++        if (asr_model && asr_model->recognizer && stream) {
++            SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, model_chunk.data(), (int32_t)model_chunk.size());
++            while (SherpaOnnxIsOnlineStreamReady(asr_model->recognizer, stream)) {
++                SherpaOnnxDecodeOnlineStream(asr_model->recognizer, stream);
++            }
++            
++            const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(asr_model->recognizer, stream);
++            if (result) {
++                // Get Patterns and Config from Global
++                CensorLexicon lexicon;
++                host->GetLexicon(lexicon);
++                const vector<regex> &patterns = lexicon.patterns;
++                const bool use_pinyin = lexicon.use_pinyin;
++                const string &current_dirty_words = lexicon.dirty_words;
++                const string &current_pinyin_words = lexicon.pinyin_words;
++                
++                // Byte-fallback tokens merged into characters; all matching below uses these.
++                vector<string> tokens;
++                vector<float> token_times;
++                MergeByteTokens(result->tokens_arr, result->timestamps, result->count, tokens, token_times);
++                const int token_count = (int)tokens.size();
++                if (token_count > 0) {
++                    string full_text = "";
++                    // Reconstruct text
++                    for(int i=0; i<token_count; i++) full_text += tokens[i];
++
++                    // Stream results are revisable partials, not a final transcript.
++                    if (asr_debug_logging && !full_text.empty() &&
++                        (full_text != last_debug_text || last_reset_sample_16k != last_debug_segment)) {
++                        const string source_name = host->SourceName();
++                        double segment_seconds = last_reset_sample_16k / 16000.0 +
++                                                 (double)start_offset_input / current_sr;
++                        string log_text = full_text;
++                        for (char &c : log_text) {
++                            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
++                        }
++                        CLOG(censor::kLogInfo, "[ASR Debug] source=\"%s\" input=%.3f..%.3f partial=\"%s\"",
++                             source_name.c_str(),
++                             segment_seconds + token_times[0],
++                             segment_seconds + token_times[token_count - 1], log_text.c_str());
++                        last_debug_text = full_text;
++                        last_debug_segment = last_reset_sample_16k;
++                    }
++                    
++                    if (!full_text.empty()) {
++                        {
++                            lock_guard<mutex> lock(history_mutex);
++                            current_partial_text = full_text;
++                        }
++                    }
++
++                    // Collect Candidates
++                    struct MatchCandidate {
++                        size_t start_char;
++                        uint64_t start_sample;
++                        uint64_t end_sample;
++                        string log_text;
++                        bool is_pinyin;
++                        uint64_t word_start;
++                    };
++                    vector<MatchCandidate> candidates;
++
++                    // 1. Regex Matching
++                    for (const auto& pattern : patterns) {
++                        sregex_iterator begin(full_text.begin(), full_text.end(), pattern);
++                        sregex_iterator end;
++                        
++                        for (auto i = begin; i != end; ++i) {
++                            smatch match = *i;
++                            size_t m_start_char = match.position();
++                            
++                            // Find timestamps
++                            float m_start_time = -1.0f;
++                            float m_end_time = -1.0f;
++                            
++                            size_t current_char = 0;
++                            for(int t=0; t<token_count; t++) {
++                                string tok = tokens[t];
++                                size_t tok_len = tok.length();
++                                float tok_start = token_times[t];
++                                float tok_end = (t < token_count - 1) ? token_times[t+1] : (tok_start + 0.2f);
++                                
++                                // Check overlap
++                                size_t m_end_char = m_start_char + match.length();
++                                if (current_char + tok_len > m_start_char && current_char < m_end_char) {
++                                    if (m_start_time < 0) m_start_time = tok_start;
++                                    m_end_time = tok_end;
++                                }
++                                current_char += tok_len;
++                            }
++                            
++                            if (m_start_time >= 0) {
++                                uint64_t start_16k = last_reset_sample_16k + (uint64_t)(m_start_time * 16000.0f);
++                                uint64_t end_16k = last_reset_sample_16k + (uint64_t)(m_end_time * 16000.0f);
++                                
++                                uint64_t start_abs = (uint64_t)(start_16k * current_ratio) + start_offset_input;
++                                uint64_t end_abs = (uint64_t)(end_16k * current_ratio) + start_offset_input;
++                                
++                                // Apply Model Latency Offset
++                                int64_t offset_samples = (int64_t)((model_offset_ms / 1000.0) * current_sr);
++                                if (offset_samples >= 0) {
++                                    start_abs += offset_samples;
++                                    end_abs += offset_samples;
++                                } else {
++                                    uint64_t sub = (uint64_t)(-offset_samples);
++                                    start_abs = (start_abs > sub) ? start_abs - sub : 0;
++                                    end_abs = (end_abs > sub) ? end_abs - sub : 0;
++                                }
++                                
++                                uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
++                                uint64_t word_start = start_abs;
++                                start_abs = (start_abs > margin) ? start_abs - margin : 0; 
++                                end_abs += margin; 
++                                
++                                candidates.push_back({m_start_char, start_abs, end_abs, match.str(), false, word_start});
++                            }
++                        }
++                    }
++
++                    // 2. Pinyin Matching
++                    if (use_pinyin) {
++                        if (!pinyin_converter) {
++                            // Locate the dict directory. Paths are kept as filesystem::path built
++                            // from UTF-8/wide strings: a narrow std::string is read in the ANSI
++                            // code page and misses folders with Chinese names (then homophone
++                            // matching was silently off).
++                            filesystem::path dict_dir = host->PinyinDictDir();
++
++                            if (!dict_dir.empty()) {
++                                Pinyin::setDictionaryPath(dict_dir);
++                                pinyin_converter = make_shared<Pinyin::Pinyin>();
++                                auto u8 = dict_dir.u8string();
++                                CLOG(censor::kLogInfo, "Pinyin Engine Initialized from: %s", std::string(u8.begin(), u8.end()).c_str());
++                            } else {
++                                static bool logged_error = false;
++                                if (!logged_error) {
++                                    CLOG(censor::kLogError, "Error: Could not find 'dict' directory for Pinyin engine.");
++                                    logged_error = true;
++                                }
++                            }
++                        }
++
++                        if (pinyin_converter) {
++                            // Update patterns if changed
++                            if (current_dirty_words != cached_dirty_words_str_for_pinyin ||
++                                current_pinyin_words != cached_pinyin_words_str) {
++                                cached_pinyin_patterns.clear();
++                                stringstream ss(current_dirty_words);
++                                string item;
++                                while (getline(ss, item, ',')) {
++                                    item.erase(0, item.find_first_not_of(" \t\n\r"));
++                                    item.erase(item.find_last_not_of(" \t\n\r") + 1);
++                                    if (!item.empty()) {
++                                        auto res = pinyin_converter->hanziToPinyin(item, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false);
++                                        vector<string> pat;
++                                        for(const auto& r : res) {
++                                            if (!r.pinyin.empty() && r.pinyin != " ") {
++                                                    pat.push_back(NormalizePinyin(r.pinyin));
++                                            }
++                                        }
++                                        if (!pat.empty()) cached_pinyin_patterns.push_back(pat);
++                                    }
++                                }
++                                vector<vector<string>> supplemental_patterns;
++                                string parse_error;
++                                if (ParsePinyinWords(current_pinyin_words, supplemental_patterns, parse_error)) {
++                                    cached_pinyin_patterns.insert(cached_pinyin_patterns.end(),
++                                        supplemental_patterns.begin(), supplemental_patterns.end());
++                                } else {
++                                    CLOG(censor::kLogError, "Supplemental pinyin lexicon ignored: %s", parse_error.c_str());
++                                }
++                                cached_dirty_words_str_for_pinyin = current_dirty_words;
++                                cached_pinyin_words_str = current_pinyin_words;
++                            }
++
++                            // Prepare text pinyin
++                            vector<string> text_pinyins;
++                            vector<int> pinyin_to_token;
++                            
++                            for(int t=0; t<token_count; t++) {
++                                string tok = tokens[t];
++                                
++                                // Try cache first
++                                vector<string> pinyins;
++                                auto it = pinyin_cache.find(tok);
++                                if (it != pinyin_cache.end()) {
++                                    pinyins = it->second;
++                                } else {
++                                    // Not in cache, convert
++                                    auto res = pinyin_converter->hanziToPinyin(tok, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false);
++                                    for(const auto& r : res) {
++                                            if (!r.pinyin.empty() && r.pinyin != " ") {
++                                                pinyins.push_back(NormalizePinyin(r.pinyin));
++                                            }
++                                    }
++                                    // Store in cache (limit size to prevent memory leak)
++                                    if (pinyin_cache.size() > 5000) pinyin_cache.clear();
++                                    pinyin_cache[tok] = pinyins;
++                                }
++
++                                for(const auto& p : pinyins) {
++                                        text_pinyins.push_back(p);
++                                        pinyin_to_token.push_back(t);
++                                }
++                            }
++                            
++                            // Debug Log Pinyin (First 3s only to avoid spam)
++                            static int debug_log_count = 0;
++                            if (asr_debug_logging && debug_log_count < 3 && !text_pinyins.empty()) {
++                                stringstream ss;
++                                ss << "DEBUG Pinyin: ";
++                                for(auto& p : text_pinyins) ss << p << " ";
++                                CLOG(censor::kLogInfo, "%s", ss.str().c_str());
++                                debug_log_count++;
++                            }
++
++                            // Match
++                            for (const auto& pat : cached_pinyin_patterns) {
++                                if (pat.size() > text_pinyins.size()) continue;
++                                for (size_t i = 0; i <= text_pinyins.size() - pat.size(); ++i) {
++                                    bool match = true;
++                                    for (size_t j = 0; j < pat.size(); ++j) {
++                                        if (text_pinyins[i+j] != pat[j]) {
++                                            match = false;
++                                            break;
++                                        }
++                                    }
++                                    
++                                    if (match) {
++                                        int start_token = pinyin_to_token[i];
++                                        int end_token = pinyin_to_token[i + pat.size() - 1];
++                                        
++                                        // Calculate char pos for processed_matches check
++                                        size_t char_pos = 0;
++                                        for(int k=0; k<start_token; k++) char_pos += tokens[k].length();
++                                        
++                                        float start_time = token_times[start_token];
++                                        float end_time = (end_token < token_count - 1) ? token_times[end_token+1] : (token_times[end_token] + 0.2f);
++                                        
++                                        uint64_t start_16k = last_reset_sample_16k + (uint64_t)(start_time * 16000.0f);
++                                        uint64_t end_16k = last_reset_sample_16k + (uint64_t)(end_time * 16000.0f);
++                                        
++                                        uint64_t start_abs = (uint64_t)(start_16k * current_ratio) + start_offset_input;
++                                        uint64_t end_abs = (uint64_t)(end_16k * current_ratio) + start_offset_input;
++
++                                        // Apply Model Latency Offset
++                                        int64_t offset_samples = (int64_t)((model_offset_ms / 1000.0) * current_sr);
++                                        if (offset_samples >= 0) {
++                                            start_abs += offset_samples;
++                                            end_abs += offset_samples;
++                                        } else {
++                                            uint64_t sub = (uint64_t)(-offset_samples);
++                                            start_abs = (start_abs > sub) ? start_abs - sub : 0;
++                                            end_abs = (end_abs > sub) ? end_abs - sub : 0;
++                                        }
++                                        
++                                        uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
++                                        uint64_t word_start = start_abs;
++                                        start_abs = (start_abs > margin) ? start_abs - margin : 0; 
++                                        end_abs += margin; 
++                                        
++                                        stringstream ss;
++                                        ss << "已屏蔽(拼音): ";
++                                        for(const auto& p : pat) ss << p << " ";
++                                        ss << "[匹配源: ";
++                                        for(int k=0; k<pat.size(); k++) ss << text_pinyins[i+k] << " ";
++                                        ss << "]";
++                                        
++                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start});
++                                    }
++                                }
++                            }
++                        }
++                    }
++
++                    // 3. Sort and Apply Candidates
++                    sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
++                        return (a.end_sample - a.start_sample) > (b.end_sample - b.start_sample);
++                    });
++
++                    for(const auto& m : candidates) {
++                        // Skip if already processed in previous frames
++                        if (processed_matches.count(m.start_char)) continue;
++                        
++                        {
++                            lock_guard<mutex> b_lock(beep_mutex);
++                            pending_beeps.push_back({m.start_sample, m.end_sample, m.word_start});
++                            censored_count++;
++                            CLOG(censor::kLogInfo, "%s", m.log_text.c_str());
++                        }
++                        
++                        // Always mark as processed to prevent re-evaluation or double-application
++                        processed_matches.insert(m.start_char);
++                    }
++                }
++                SherpaOnnxDestroyOnlineRecognizerResult(result);
++            }
++            
++            // Check endpoint or force reset if segment is too long (> 600s = 10min)
++            bool force_reset = (total_samples_popped_16k - last_reset_sample_16k) > (16000 * 600);
++
++            if (force_reset || SherpaOnnxOnlineStreamIsEndpoint(asr_model->recognizer, stream)) {
++                if (force_reset) {
++                    CLOG(censor::kLogInfo, "Info: Periodic reset of ASR stream (segment > 10min)");
++                }
++                SherpaOnnxOnlineStreamReset(asr_model->recognizer, stream);
++                last_reset_sample_16k = total_samples_popped_16k;
++                {
++                    lock_guard<mutex> lock(history_mutex);
++                    current_partial_text = "";
++                }
++                processed_matches.clear();
++            }
++        }
++    }
++}
++
++void CensorEngine::Process(float *const *planes, uint32_t frames, uint64_t timestamp_ns, uint32_t rate, int layout) {
++    if (!planes[0]) return;
++
++    // Sync with Global Config
++    CensorAudioSettings cfg;
++    host->GetAudioSettings(cfg);
++    const double global_delay = cfg.delay_seconds;
++    const string &global_model = cfg.model_path;
++    const int global_effect = cfg.effect; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
++    const int global_freq = cfg.beep_frequency;
++    const int global_mix = cfg.beep_mix_percent;
++    const bool global_enable = cfg.enable;
++    
++    // If disabled globally, pass through and signal unload
++    if (!global_enable) {
++        previous_audio_end = 0;
++        buffered_samples = 0;
++        audio_warming = true;
++        {
++            lock_guard<mutex> lock(queue_mutex);
++            target_model_path = ""; // Signal unload
++        }
++        return;
++    }
++    
++    // Update Filter State
++    {
++        lock_guard<mutex> lock(queue_mutex);
++        target_model_path = global_model;
++    }
++    cached_delay = global_delay;
++    
++    last_packet_ns = NowNs();
++
++    // Update Sample Rate (Dynamic)
++    uint32_t current_sr = rate;
++    if (current_sr == 0) current_sr = 48000; // Fallback
++    const int current_layout = layout;
++
++    // Update state if changed
++    if (sample_rate != current_sr) {
++        previous_audio_end = 0;
++        sample_rate = current_sr;
++        sample_rate_ratio = (double)current_sr / 16000.0;
++    }
++    if (!asr_resampler || asr_resampler_rate != current_sr || asr_resampler_layout != current_layout) {
++        lock_guard<mutex> lock(queue_mutex);
++        size_t plane_count = 0;
++        while (plane_count < kMaxPlanes && planes[plane_count]) plane_count++;
++        asr_resampler = host->CreateResampler(current_sr, current_layout, plane_count);
++        if (!asr_resampler) CLOG(censor::kLogError, "Unable to create the 16 kHz model input resampler");
++        asr_resampler_rate = current_sr;
++        asr_resampler_layout = current_layout;
++        asr_resampler_in = asr_resampler_out = 0;
++        asr_resampler_held = 0;
++    }
++    
++    double current_ratio = sample_rate_ratio.load();
++    size_t delay_samples = (size_t)(cached_delay * current_sr);
++
++    // Source timestamps say how much real time passed since the previous packet.
++    // Application captures can stop delivering packets while the app is silent; such a
++    // pause has to advance the delay line (as silence) instead of discarding the tail
++    // that is still waiting in the buffer, otherwise utterance endings are cut off and
++    // the remaining audio would play late relative to the delayed video.
++    // libobs (obs-source.c source_output_audio_data) smooths timestamp jumps below
++    // TS_SMOOTHING_THRESHOLD (70 ms) as contiguous and places larger jumps at their
++    // timestamp; use the same threshold so the delay line matches what is played.
++    const uint64_t gap_tolerance_ns = 70000000ULL;
++    bool reset_buffer = !previous_audio_end || delay_samples != previous_delay_samples;
++    uint64_t gap_frames = 0;
++    if (!reset_buffer && timestamp_ns > previous_audio_end + gap_tolerance_ns) {
++        gap_frames = (timestamp_ns - previous_audio_end) * current_sr / 1000000000ULL;
++    } else if (!reset_buffer && timestamp_ns + gap_tolerance_ns < previous_audio_end) {
++        reset_buffer = true; // timestamps went backwards: treat as a source restart
++    }
++    const bool gap_elapsed_buffer = gap_frames && gap_frames >= delay_samples;
++    if (gap_frames) {
++        size_t gaps = ++audio_gap_count;
++        if (gaps <= 5 || gaps % 50 == 0) {
++            const string source_name = host->SourceName();
++            // A filter only outputs when input arrives, so delayed audio that fell due
++            // during the gap (up to one delay length) cannot be output any more.
++            CLOG(censor::kLogInfo, "[Speech Sync] source=\"%s\" audio gap %.0f ms; %.0f ms of delayed audio unplayable (gaps=%zu)",
++                 source_name.c_str(), gap_frames * 1000.0 / current_sr,
++                 (double)min<uint64_t>(gap_frames, delay_samples) * 1000.0 / current_sr, gaps);
++        }
++    }
++    previous_delay_samples = delay_samples;
++    previous_audio_end = timestamp_ns + (uint64_t)frames * 1000000000ULL / current_sr;
++
++    if (enabled && !target_model_path.empty()) {
++        lock_guard<mutex> lock(queue_mutex);
++
++        // Safety: Limit queue size to prevent memory leak if ASR is too slow
++        // Limit to ~60 seconds of audio (16000 * 60 = 960,000 samples)
++        if (asr_queue.size() > 960000) {
++            CLOG(censor::kLogWarning, "ASR backlog exceeded 60s; dropping %zu queued samples (timeline kept aligned)",
++                 asr_queue.size());
++            asr_dropped_16k += asr_queue.size();
++            asr_queue.clear();
++        }
++
++        // Keep the recognizer timeline equal to source time across packet gaps.
++        if (gap_elapsed_buffer) {
++            // Pre-gap samples still queued would otherwise be decoded after the
++            // timeline jump and mapped onto post-gap audio; their output is gone anyway.
++            asr_dropped_16k += asr_queue.size();
++            asr_queue.clear();
++            asr_dropped_16k += (uint64_t)(gap_frames / current_ratio);
++        } else if (gap_frames) {
++            // Short gap: feed silence so the model timeline and the resampler stay continuous.
++            static const vector<float> silence(1024, 0.0f);
++            const float *silence_planes[kMaxPlanes];
++            for (auto &plane : silence_planes) plane = silence.data();
++            for (uint64_t done = 0; done < gap_frames;) {
++                uint32_t n = (uint32_t)min<uint64_t>(silence.size(), gap_frames - done);
++                FeedAsrResampler(silence_planes, n, current_ratio);
++                done += n;
++            }
++        }
++
++        // Model input: 16 kHz mono via the host's resampler (OBS: libobs/swresample; anti-aliased, all channels).
++        // The plugin used to keep every 3rd sample of the first channel without a low-pass
++        // filter, which folded content above 8 kHz into the speech band (0018).
++        FeedAsrResampler(planes, frames, current_ratio);
++    }
++    
++    // 2. Buffer Logic
++    if (channels.empty()) {
++        for (size_t c = 0; c < 8; c++) {
++            if (planes[c]) channels_count++; else break;
++        }
++        if (channels_count == 0) channels_count = 1;
++        channels.resize(channels_count);
++        
++        size_t buf_size = current_sr * 12; // Max 12s
++        for (auto& ch : channels) {
++            ch.buffer.resize(buf_size, 0.0f);
++            ch.clean_buffer.resize(buf_size, 0.0f);
++        }
++    }
++    
++    // Ensure buffer size covers delay
++    size_t current_buf_size = channels[0].buffer.size();
++
++    // Resize check (handle sample rate change or large delay)
++    if (delay_samples * 2 > current_buf_size || current_buf_size != current_sr * 12) {
++            size_t new_size = max((size_t)(current_sr * 12), delay_samples * 2);
++            if (new_size != current_buf_size) {
++                current_buf_size = new_size;
++                for (auto& ch : channels) {
++                    vector<float> new_buf(new_size, 0.0f);
++                    ch.buffer = new_buf;
++                    ch.clean_buffer = new_buf;
++                    ch.head = 0;
++                }
++            }
++    }
++    
++    if (delay_samples >= current_buf_size) delay_samples = current_buf_size - current_sr;
++
++    if (reset_buffer || gap_elapsed_buffer) {
++        // A source restart must not replay samples from an earlier activation; after a
++        // gap longer than the delay everything buffered would already have played.
++        for (auto &ch : channels) {
++            std::fill(ch.buffer.begin(), ch.buffer.end(), 0.0f);
++            std::fill(ch.clean_buffer.begin(), ch.clean_buffer.end(), 0.0f);
++        }
++        // Pending mutes refer to audio that was discarded or already elapsed.
++        lock_guard<mutex> b_lock(beep_mutex);
++        pending_beeps.clear();
++    }
++    if (reset_buffer) {
++        buffered_samples = 0;
++    } else if (gap_frames) {
++        // Advance the delay line by the gap. Short gaps are written as silence so the
++        // buffered tail keeps playing at its original time; for long gaps the buffer is
++        // already all silence, so only the absolute positions move forward.
++        for (auto &ch : channels) {
++            if (!gap_elapsed_buffer) {
++                for (uint64_t i = 0; i < gap_frames; i++) {
++                    ch.buffer[ch.head] = 0.0f;
++                    ch.clean_buffer[ch.head] = 0.0f;
++                    ch.head = (ch.head + 1) % current_buf_size;
++                }
++            }
++            ch.total_written += gap_frames;
++        }
++        total_samples_written.fetch_add(gap_frames);
++        buffered_samples += gap_frames;
++    }
++    buffered_samples += frames;
++    audio_warming = buffered_samples < delay_samples;
++    
++    // Write to buffer
++    for (size_t c = 0; c < channels_count; c++) {
++        if (!planes[c]) continue;
++        float *data_in = planes[c];
++        auto& ch = channels[c];
++        for (size_t i = 0; i < frames; i++) {
++            ch.buffer[ch.head] = data_in[i];
++            ch.clean_buffer[ch.head] = data_in[i];
++            ch.head = (ch.head + 1) % current_buf_size;
++            ch.total_written++;
++        }
++    }
++    total_samples_written.fetch_add(frames);
++    
++    // Apply Beeps (Only if enabled)
++    if (enabled) {
++        lock_guard<mutex> lock(beep_mutex);
++        uint64_t current_write_pos = channels[0].total_written;
++        uint64_t play_head_pos = 0;
++        if (current_write_pos > delay_samples) {
++            play_head_pos = current_write_pos - delay_samples;
++        }
++        
++        for (auto it = pending_beeps.begin(); it != pending_beeps.end(); ) {
++                // 1. Handling Late Beeps (Latency > Delay)
++                if (it->start_sample < play_head_pos) {
++                    // Losing only the pre-padding is expected; losing part of the word
++                    // itself means original speech was already output unmuted.
++                    if (it->word_start < play_head_pos) {
++                        size_t late = ++late_beeps_count;
++                        last_late_beep_ns = NowNs();
++                        if (late <= 5 || late % 10 == 0) {
++                            CLOG(censor::kLogWarning, "Censor late: word start already played by %.0f ms (late=%zu). Increase delay setting.",
++                                 (play_head_pos - it->word_start) * 1000.0 / current_sr, late);
++                        }
++                    }
++                    it->start_sample = play_head_pos;
++                }
++
++                uint64_t start = it->start_sample;
++                uint64_t end = it->end_sample;
++                
++                if (start >= end) {
++                    size_t dropped = ++dropped_beeps_count;
++                    if (dropped <= 5 || dropped % 10 == 0) {
++                        CLOG(censor::kLogWarning, "Beep dropped! Latency > Delay. Increase delay setting. (Start: %llu, End: %llu, Head: %llu)", 
++                            (unsigned long long)start, (unsigned long long)end, (unsigned long long)play_head_pos);
++                    }
++
++                    it = pending_beeps.erase(it);
++                    continue;
++                }
++                
++                if (end < current_write_pos - current_buf_size) {
++                    it = pending_beeps.erase(it);
++                    continue;
++                }
++                
++                for (size_t c = 0; c < channels_count; c++) {
++                    auto& ch = channels[c];
++                    
++                    // Minion Effect: Pre-fetch original audio to avoid feedback loop
++                    // Only needed for global_effect == 2
++                    std::vector<float> temp_source;
++                    uint64_t temp_start_idx = 0;
++                    if (global_effect == 2) {
++                        uint64_t window_size = 2048; // Approx 40ms
++                        // Ensure we have enough history for pitch shifter lookback
++                        uint64_t safe_start = (start > window_size) ? start - window_size : 0;
++                        // Check buffer limits (don't go before what we have)
++                        if (safe_start < current_write_pos - current_buf_size) {
++                             safe_start = current_write_pos - current_buf_size;
++                        }
++                        
++                        temp_start_idx = safe_start;
++                        size_t len = (size_t)(end - safe_start);
++                        temp_source.resize(len);
++                        
++                        for(size_t k=0; k<len; k++) {
++                             uint64_t s_abs = safe_start + k;
++                             size_t diff = (size_t)(current_write_pos - s_abs);
++                             size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
++                             temp_source[k] = ch.clean_buffer[idx];
++                        }
++                    }
++
++                    for (uint64_t s = start; s < end; s++) {
++                        if (s >= current_write_pos) break; 
++                        if (s < current_write_pos - current_buf_size) continue;
++                        
++                        size_t diff = (size_t)(current_write_pos - s);
++                        size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
++                        
++                        float val = 0.0f;
++                        float original = ch.buffer[idx];
++                        float mix = (float)global_mix / 100.0f;
++
++                        if (global_effect == 1) { // Silence
++                             val = 0.0f;
++                        } else if (global_effect == 2) { // Minion (Pitch Shifter)
++                             // Barberpole Pitch Shifter
++                             // Pitch Ratio: 2.0 (Octave up) for sharper Minion sound
++                             double pitch_ratio = 2.0;
++                             double window_size = 2048.0; // Must match pre-fetch window approx
++                             
++                             // Phase runs 0..1
++                             double speed = pitch_ratio - 1.0;
++                             double phase = (double)(s % (uint64_t)(window_size / speed)) * speed / window_size;
++                             phase -= floor(phase);
++
++                             // Delay decreases from window_size to 0 for Pitch Up
++                             double delay_A = (1.0 - phase) * window_size;
++                             double delay_B = (1.0 - ((phase + 0.5) - floor(phase + 0.5))) * window_size;
++                             
++                             // Read from temp_source
++                             // temp_source[0] corresponds to temp_start_idx
++                             // Current time s corresponds to index (s - temp_start_idx)
++                             // We want to read at (s - delay)
++                             
++                             int64_t read_idx_A = (int64_t)(s - temp_start_idx) - (int64_t)delay_A;
++                             int64_t read_idx_B = (int64_t)(s - temp_start_idx) - (int64_t)delay_B;
++                             
++                             float sample_A = 0.0f;
++                             float sample_B = 0.0f;
++                             
++                             if (read_idx_A >= 0 && read_idx_A < (int64_t)temp_source.size()) sample_A = temp_source[read_idx_A];
++                             if (read_idx_B >= 0 && read_idx_B < (int64_t)temp_source.size()) sample_B = temp_source[read_idx_B];
++                             
++                             // Triangle Window
++                             float gain_A = 1.0f - 2.0f * (float)fabs(phase - 0.5);
++                             float gain_B = 1.0f - 2.0f * (float)fabs(((phase + 0.5) - floor(phase + 0.5)) - 0.5);
++                             
++                             val = sample_A * gain_A + sample_B * gain_B;
++                             mix = 1.0f; // Force wet mix for voice change
++                        } else if (global_effect == 3) { // Telegraph (Morse Code Style)
++                             double t = (double)s / (double)current_sr;
++                             
++                             // Carrier: 750Hz Sine Wave (Classic CW tone)
++                             double carrier = sin(2.0 * 3.14159265358979323846 * 750.0 * t);
++                             
++                             // Pseudo-random Morse Pattern Generator
++                             // Use sine waves at different prime frequencies to create a non-repeating pattern of "dits" and "dahs"
++                             // 8Hz = fast dits, 3Hz = word spacing rhythm
++                             double rhythm = sin(2.0 * 3.14159265358979323846 * 8.0 * t) + 
++                                             sin(2.0 * 3.14159265358979323846 * 3.0 * t);
++                             
++                             // Threshold to create on/off keying
++                             // If rhythm > 0, tone is ON. Else OFF.
++                             float envelope = (rhythm > 0.0) ? 1.0f : 0.0f;
++                             
++                             val = 0.15f * (float)carrier * envelope;
++                             mix = 1.0f; // Force 100% replacement
++                        } else { // Default: Beep
++                             double cycles = (double)s * (double)global_freq / (double)current_sr;
++                             double phase = cycles - floor(cycles);
++                             val = 0.1f * (float)sin(2.0 * 3.14159265358979323846 * phase);
++                        }
++                        
++                        ch.buffer[idx] = (val * mix) + (original * (1.0f - mix));
++                    }
++                }
++
++                if (end > current_write_pos) {
++                    if (it->start_sample < current_write_pos) {
++                        it->start_sample = current_write_pos;
++                    }
++                    ++it;
++                } else {
++                    it = pending_beeps.erase(it);
++                }
++        }
++    }
++    
++    // Output Delayed
++    uint64_t current_written = channels[0].total_written;
++    for (size_t c = 0; c < channels_count; c++) {
++        if (!planes[c]) continue;
++        float *data_out = planes[c];
++        auto& ch = channels[c];
++        
++        for (size_t i = 0; i < frames; i++) {
++            int64_t target_abs = (int64_t)(current_written - frames + i) - (int64_t)delay_samples;
++            if (target_abs < 0) {
++                data_out[i] = 0.0f;
++            } else {
++                size_t diff = (size_t)(current_written - target_abs);
++                size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
++                data_out[i] = ch.buffer[idx];
++            }
++        }
++    }
++}
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+new file mode 100644
+index 0000000..bc4ac11
+--- /dev/null
++++ b/src/censor-engine.hpp
+@@ -0,0 +1,192 @@
++#pragma once
++
++// Recognition and muting of one audio stream, independent of OBS: delay line, 16 kHz model
++// input, streaming recognition thread, word/pinyin matching and muting inside the delay line.
++// Used by the OBS filter (profanity-filter.cpp) and by the standalone program. The host
++// supplies settings, the pinyin dictionary location, the model-input resampler and logging.
++
++#include <atomic>
++#include <cstdint>
++#include <deque>
++#include <filesystem>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <regex>
++#include <set>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "sherpa-onnx/c-api/c-api.h"
++#include "asr-model.hpp"
++#include "cpp-pinyin/Pinyin.h"
++
++// Read for every audio packet.
++struct CensorAudioSettings {
++    bool enable = true; // false: pass the audio through unchanged and unload the model
++    std::string model_path;
++    double delay_seconds = 2.0;
++    int effect = 1; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
++    int beep_frequency = 1000;
++    int beep_mix_percent = 100;
++};
++
++// Read by the recognition thread every loop.
++struct CensorAsrSettings {
++    bool enable = true;
++    std::string model_path;
++    std::string provider = "cpu";
++    int censor_padding_ms = 500;
++    int model_offset_ms = 0;
++    bool debug_logging = false;
++};
++
++// Read when the recognizer has a result.
++struct CensorLexicon {
++    std::vector<std::regex> patterns;
++    bool use_pinyin = true;
++    std::string dirty_words;  // comma separated, the source of the automatic pinyin patterns
++    std::string pinyin_words; // supplemental pinyin lexicon text
++};
++
++// Effective word list: the built-in list (regex syntax) plus the user's plain words, escaped
++// so they match literally; comma separated.
++std::string CensorBuildWordList(const std::string &builtin, const std::string &custom);
++// One case-insensitive regex per comma-separated item; invalid items are skipped.
++std::vector<std::regex> CensorParsePatterns(const std::string &word_list);
++
++// Planar float at the stream rate -> 16 kHz mono, the plain average of all channels.
++class CensorResampler {
++public:
++    virtual ~CensorResampler() = default;
++    // Appends the converted samples to out; false if conversion failed (input not counted).
++    virtual bool Resample(const float *const *planes, uint32_t frames, std::vector<float> &out) = 0;
++};
++
++class CensorHost {
++public:
++    virtual ~CensorHost() = default;
++    virtual void GetAudioSettings(CensorAudioSettings &settings) = 0;
++    virtual void GetAsrSettings(CensorAsrSettings &settings) = 0;
++    virtual void GetLexicon(CensorLexicon &lexicon) = 0;
++    virtual std::string SourceName() = 0;
++    virtual std::filesystem::path PinyinDictDir() = 0; // empty if not found
++    // layout is a host-defined key; a different value recreates the resampler.
++    virtual std::unique_ptr<CensorResampler> CreateResampler(uint32_t rate, int layout, size_t channels) = 0;
++};
++
++class CensorEngine {
++public:
++    static constexpr size_t kMaxPlanes = 8;
++
++    explicit CensorEngine(CensorHost *host);
++    ~CensorEngine();
++
++    // Monotonic clock used for last_packet_ns, created_ns and last_late_beep_ns.
++    static uint64_t NowNs();
++
++    void Start();
++    void Stop();
++
++    // Processes one packet in place: planes is an array of kMaxPlanes pointers (unused ones
++    // nullptr, the first nullptr ends the list); each holds
++    // frames float samples; the output is the input delayed by the configured delay with
++    // recognized words muted. timestamp_ns is the packet start time on any monotonic clock.
++    void Process(float *const *planes, uint32_t frames, uint64_t timestamp_ns, uint32_t rate, int layout);
++
++    CensorHost *host;
++
++    std::atomic<bool> enabled{true};
++
++    // Global Cache
++    std::string target_model_path;
++    std::string loaded_model_path;
++    std::string loaded_provider;  // Provider used for currently loaded model
++    double cached_delay = 1.5;
++
++    // History
++    std::string current_partial_text;
++    std::string loading_target_path;
++    std::mutex history_mutex;
++
++    // State
++    std::shared_ptr<ASRModel> asr_model;
++    const SherpaOnnxOnlineStream *stream = nullptr;
++
++    // Audio Buffer
++    struct ChannelBuffer {
++        std::vector<float> buffer;
++        std::vector<float> clean_buffer; // Stores original audio for effect lookback
++        size_t head = 0;
++        uint64_t total_written = 0;
++    };
++
++    std::vector<ChannelBuffer> channels;
++    std::atomic<uint32_t> sample_rate{48000};
++    std::atomic<double> sample_rate_ratio{3.0}; // sample_rate / 16000.0
++    std::atomic<uint64_t> total_samples_written{0};
++    size_t channels_count = 0;
++
++    // Model input resampler (audio thread only). Output sample k corresponds exactly to
++    // input sample k * ratio; the resampler holds back ~1 ms of input (tools/resampler-align-check.cpp).
++    std::unique_ptr<CensorResampler> asr_resampler;
++    uint32_t asr_resampler_rate = 0;
++    int asr_resampler_layout = -1;
++    uint64_t asr_resampler_in = 0;   // input frames fed
++    uint64_t asr_resampler_out = 0;  // 16 kHz samples produced
++    int64_t asr_resampler_held = 0;  // input frames inside the resampler (queue_mutex)
++    std::vector<float> asr_resampler_buf;
++    void FeedAsrResampler(const float *const *planes, uint32_t frames, double ratio);
++
++    // ASR Thread
++    std::thread asr_thread;
++    std::atomic<bool> running{false};
++    std::mutex queue_mutex;
++    std::deque<float> asr_queue;
++    // 16 kHz samples removed from asr_queue without recognition (guarded by queue_mutex).
++    // The ASR thread advances its timeline by this amount so later matches stay aligned.
++    uint64_t asr_dropped_16k = 0;
++
++    // Beep Map
++    struct BeepRange {
++        uint64_t start_sample;
++        uint64_t end_sample;
++        uint64_t word_start; // matched word start before padding, used to detect leaks
++    };
++    std::mutex beep_mutex;
++    std::vector<BeepRange> pending_beeps;
++
++    std::string initialization_error = "";
++    std::atomic<bool> is_loading{false};
++
++    uint64_t last_reset_sample_16k = 0;
++    std::set<size_t> processed_matches;
++    std::atomic<size_t> dropped_beeps_count{0};
++    // Matches whose unpadded word start was already played before muting began.
++    std::atomic<size_t> late_beeps_count{0};
++    std::atomic<uint64_t> last_late_beep_ns{0};
++    std::atomic<size_t> audio_gap_count{0};
++    // Recognized words muted (one per match applied).
++    std::atomic<size_t> censored_count{0};
++
++    std::atomic<uint64_t> last_packet_ns{0};
++    uint64_t created_ns = 0;
++    std::atomic<bool> audio_warming{true};
++
++    // Pinyin Support
++    std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
++    std::vector<std::vector<std::string>> cached_pinyin_patterns;
++    std::string cached_dirty_words_str_for_pinyin;
++    std::string cached_pinyin_words_str;
++    // Cache for single hanzi pinyin to avoid re-conversion
++    std::map<std::string, std::vector<std::string>> pinyin_cache;
++
++    void LoadModel(const std::string &path, const std::string &provider, bool enable);
++    void ASRLoop();
++
++private:
++    uint64_t previous_audio_end = 0;
++    size_t previous_delay_samples = 0;
++    uint64_t buffered_samples = 0;
++};
+diff --git a/src/censor-log.hpp b/src/censor-log.hpp
+new file mode 100644
+index 0000000..44f309f
+--- /dev/null
++++ b/src/censor-log.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++
++// Logging for the OBS-independent recognition/muting code (censor-engine, asr-model).
++// The host installs a handler: the OBS plugin forwards to blog() with its usual prefix,
++// the standalone program writes its own log file. Levels use the libobs values.
++
++namespace censor {
++
++enum LogLevel { kLogError = 100, kLogWarning = 200, kLogInfo = 300 };
++
++using LogHandler = void (*)(int level, const char *message);
++
++void SetLogHandler(LogHandler handler);
++void Log(int level, const char *format, ...);
++
++} // namespace censor
++
++#define CLOG(level, format, ...) censor::Log(level, format, ##__VA_ARGS__)
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 01f9faa..e60f3df 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -1,4 +1,5 @@
+ #include "plugin-config.hpp"
++#include "censor-engine.hpp"
+ #include "video-delay.hpp"
+ #include "profanity-filter.hpp"
+ #include "logging-macros.hpp"
+@@ -93,28 +94,11 @@ static QString BuiltinWordsPath() {
+ // The built-in list is read from the plugin each start (so it updates with the plugin) and
+ // is not user-editable; users add plain words, matched literally (plus pinyin if enabled).
+ void GlobalConfig::RebuildWords() {
+-    dirty_words_str = builtin_words_str;
+-    for (const auto &word : SplitWordList(custom_words_str)) {
+-        if (!dirty_words_str.empty()) dirty_words_str += ", ";
+-        dirty_words_str += EscapeRegexLiteral(word);
+-    }
++    dirty_words_str = CensorBuildWordList(builtin_words_str, custom_words_str);
+ }
+ 
+ void GlobalConfig::ParsePatterns() {
+-    dirty_patterns.clear();
+-    
+-    stringstream ss(dirty_words_str);
+-    string item;
+-    while (getline(ss, item, ',')) {
+-        // Trim
+-        item.erase(0, item.find_first_not_of(" \t\n\r"));
+-        item.erase(item.find_last_not_of(" \t\n\r") + 1);
+-        if (!item.empty()) {
+-            try {
+-                dirty_patterns.emplace_back(item, regex::icase);
+-            } catch(...) {}
+-        }
+-    }
++    dirty_patterns = CensorParsePatterns(dirty_words_str);
+ }
+ 
+ void GlobalConfig::NormalizeDelay() {
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index a318f23..fc5bae9 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -172,7 +172,7 @@ static const char *get_name(void *unused) { return "语音消音"; }
+ static void *create(obs_data_t *settings, obs_source_t *context) {
+     ProfanityFilter *filter = new ProfanityFilter(context);
+     filter->delay_only = obs_data_get_bool(settings, "sync_delay_only");
+-    filter->enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
++    filter->engine.enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
+     filter->settings = settings;
+     obs_data_addref(settings);
+     if (!filter->delay_only) filter->Start();
+@@ -193,7 +193,7 @@ static void update(void *data, obs_data_t *settings) {
+     filter->settings = settings;
+     if (old) obs_data_release(old);
+ 
+-    filter->enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
++    filter->engine.enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
+ }
+ 
+ static obs_properties_t *get_properties(void *data) {
+@@ -340,6 +340,7 @@ static void frontend_event(enum obs_frontend_event event, void *) {
+ 
+ MODULE_EXPORT bool obs_module_load(void)
+ {
++    InstallCensorLogHandler();
+     obs_register_source(&profanity_filter_info);
+     obs_register_source(&profanity_video_delay_info);
+     
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 8d241df..5923ae1 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -2,9 +2,9 @@
+ #include "plugin-config.hpp"
+ #include "utils.hpp"
+ #include "logging-macros.hpp"
++#include "censor-log.hpp"
+ 
+ #include <obs-module.h>
+-#include <obs-frontend-api.h>
+ 
+ #include <cpp-pinyin/G2pglobal.h>
+ 
+@@ -23,9 +23,7 @@ using namespace std;
+ 
+ std::set<ProfanityFilter*> ProfanityFilter::instances;
+ std::mutex ProfanityFilter::instances_mutex;
+-
+ ProfanityFilter::ProfanityFilter(obs_source_t *ctx) : context(ctx) {
+-    created_ns = os_gettime_ns();
+     {
+         lock_guard<mutex> lock(instances_mutex);
+         instances.insert(this);
+@@ -33,8 +31,8 @@ ProfanityFilter::ProfanityFilter(obs_source_t *ctx) : context(ctx) {
+     // Initial sync with global config
+     GlobalConfig *cfg = GetGlobalConfig();
+     lock_guard<mutex> lock(cfg->mutex);
+-    target_model_path = cfg->model_path;
+-    cached_delay = cfg->delay_seconds;
++    engine.target_model_path = cfg->model_path;
++    engine.cached_delay = cfg->delay_seconds;
+ }
+ 
+ ProfanityFilter::~ProfanityFilter() {
+@@ -42,30 +40,142 @@ ProfanityFilter::~ProfanityFilter() {
+         lock_guard<mutex> lock(instances_mutex);
+         instances.erase(this);
+     }
+-    Stop();
++    engine.Stop(); // the recognition thread calls back into this object
+     if (settings) obs_data_release(settings);
+-    if (stream) {
+-        SherpaOnnxDestroyOnlineStream(stream);
+-        stream = nullptr;
++}
++
++static void censor_log_to_obs(int level, const char *message) {
++    blog(level, "[Profanity Filter] %s", message);
++}
++
++void InstallCensorLogHandler() {
++    censor::SetLogHandler(censor_log_to_obs);
++}
++
++void ProfanityFilter::GetAudioSettings(CensorAudioSettings &s) {
++    GlobalConfig *cfg = GetGlobalConfig();
++    lock_guard<mutex> lock(cfg->mutex);
++    s.delay_seconds = cfg->delay_seconds;
++    s.model_path = cfg->model_path;
++    s.effect = cfg->audio_effect;
++    s.beep_frequency = cfg->beep_frequency;
++    s.beep_mix_percent = cfg->beep_mix_percent;
++    s.enable = cfg->global_enable;
++    if (delay_only && !cfg->video_delay_enabled) s.enable = false;
++}
++
++void ProfanityFilter::GetAsrSettings(CensorAsrSettings &s) {
++    GlobalConfig *cfg = GetGlobalConfig();
++    lock_guard<mutex> lock(cfg->mutex);
++    s.enable = cfg->global_enable;
++    s.model_path = cfg->model_path;
++    s.provider = cfg->enable_gpu ? cfg->onnx_provider : string("cpu");
++    s.censor_padding_ms = cfg->censor_padding_ms;
++    s.model_offset_ms = cfg->model_offset_ms;
++    s.debug_logging = cfg->asr_debug_logging;
++}
++
++void ProfanityFilter::GetLexicon(CensorLexicon &l) {
++    GlobalConfig *cfg = GetGlobalConfig();
++    lock_guard<mutex> lock(cfg->mutex);
++    l.patterns = cfg->dirty_patterns; // Copy
++    l.use_pinyin = cfg->use_pinyin;
++    l.dirty_words = cfg->dirty_words_str;
++    l.pinyin_words = cfg->pinyin_words_str;
++}
++
++string ProfanityFilter::SourceName() {
++    obs_source_t *parent = obs_filter_get_parent(context);
++    return parent ? obs_source_get_name(parent) : obs_source_get_name(context);
++}
++
++// Locate the dict directory. Paths are kept as filesystem::path built from UTF-8/wide
++// strings: a narrow std::string is read in the ANSI code page and misses folders with
++// Chinese names (then homophone matching was silently off).
++filesystem::path ProfanityFilter::PinyinDictDir() {
++    filesystem::path dict_dir;
++    std::error_code ec;
++
++    // Method 1: OBS data path (data/obs-plugins/<plugin>/dict), UTF-8
++    char *obs_data_ptr = obs_module_file("dict");
++    if (obs_data_ptr) {
++        int wn = MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, nullptr, 0);
++        std::wstring wide(wn > 0 ? wn - 1 : 0, L' ');
++        if (wn > 1) MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, wide.data(), wn);
++        filesystem::path p(wide);
++        if (filesystem::exists(p, ec)) dict_dir = p;
++        bfree(obs_data_ptr);
++    }
++
++    // Method 2: next to the DLL (dev build) or <root>/data/dict
++    if (dict_dir.empty()) {
++        MEMORY_BASIC_INFORMATION mbi;
++        HMODULE hMod = VirtualQuery((LPCVOID)&ModuleLocator, &mbi, sizeof(mbi))
++                           ? (HMODULE)mbi.AllocationBase : nullptr;
++        wchar_t path[MAX_PATH];
++        if (hMod && GetModuleFileNameW(hMod, path, MAX_PATH)) {
++            filesystem::path p(path);
++            filesystem::path p_next = p.parent_path() / "dict";
++            filesystem::path p_bundle = p.parent_path().parent_path().parent_path() / "data" / "dict";
++            if (filesystem::exists(p_next, ec)) dict_dir = p_next;
++            else if (filesystem::exists(p_bundle, ec)) dict_dir = p_bundle;
++        }
+     }
+-    asr_model.reset();
+-    if (asr_resampler) audio_resampler_destroy(asr_resampler);
++    return dict_dir;
+ }
+ 
+-// Called with queue_mutex held.
+-void ProfanityFilter::FeedAsrResampler(const uint8_t *const *data, uint32_t frames, double ratio) {
+-    if (!asr_resampler || !frames) return;
+-    uint8_t *out[MAX_AV_PLANES] = {};
+-    uint32_t out_frames = 0;
+-    uint64_t ts_offset = 0;
+-    if (!audio_resampler_resample(asr_resampler, out, &out_frames, &ts_offset, data, frames)) return;
+-    // swresample's stereo-to-mono downmix is 0.707 * (L + R); scale to the plain average.
+-    const float scale = asr_resampler_layout == SPEAKERS_MONO ? 1.0f : 0.70710678f;
+-    const float *samples = (const float *)out[0];
+-    for (uint32_t i = 0; i < out_frames; i++) asr_queue.push_back(samples[i] * scale);
+-    asr_resampler_in += frames;
+-    asr_resampler_out += out_frames;
+-    asr_resampler_held = (int64_t)asr_resampler_in - (int64_t)llround(asr_resampler_out * ratio);
++namespace {
++// libobs/FFmpeg swresample: low-pass before decimation, all channels downmixed to mono.
++class ObsResampler : public CensorResampler {
++public:
++    ObsResampler(uint32_t rate, enum speaker_layout layout) : layout_(layout) {
++        struct resample_info src = {rate, AUDIO_FORMAT_FLOAT_PLANAR, layout};
++        struct resample_info dst = {16000, AUDIO_FORMAT_FLOAT, SPEAKERS_MONO};
++        resampler_ = audio_resampler_create(&dst, &src);
++    }
++    ~ObsResampler() override {
++        if (resampler_) audio_resampler_destroy(resampler_);
++    }
++    bool ok() const { return resampler_ != nullptr; }
++    bool Resample(const float *const *planes, uint32_t frames, std::vector<float> &out) override {
++        uint8_t *res[MAX_AV_PLANES] = {};
++        uint32_t out_frames = 0;
++        uint64_t ts_offset = 0;
++        if (!audio_resampler_resample(resampler_, res, &out_frames, &ts_offset, (const uint8_t *const *)planes, frames))
++            return false;
++        // swresample's stereo-to-mono downmix is 0.707 * (L + R); scale to the plain average.
++        const float scale = layout_ == SPEAKERS_MONO ? 1.0f : 0.70710678f;
++        const float *samples = (const float *)res[0];
++        out.reserve(out.size() + out_frames);
++        for (uint32_t i = 0; i < out_frames; i++) out.push_back(samples[i] * scale);
++        return true;
++    }
++
++private:
++    audio_resampler_t *resampler_ = nullptr;
++    enum speaker_layout layout_;
++};
++} // namespace
++
++std::unique_ptr<CensorResampler> ProfanityFilter::CreateResampler(uint32_t rate, int layout, size_t) {
++    auto r = std::make_unique<ObsResampler>(rate, (enum speaker_layout)layout);
++    if (!r->ok()) return nullptr;
++    return r;
++}
++
++struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audio) {
++    if (!audio->data[0]) return audio;
++    uint32_t rate = 0;
++    enum speaker_layout layout = SPEAKERS_STEREO;
++    struct obs_audio_info aoi;
++    if (obs_get_audio_info(&aoi)) {
++        rate = aoi.samples_per_sec;
++        if (aoi.speakers != SPEAKERS_UNKNOWN) layout = aoi.speakers;
++    }
++    float *planes[CensorEngine::kMaxPlanes] = {};
++    for (size_t c = 0; c < CensorEngine::kMaxPlanes && c < MAX_AV_PLANES; c++) planes[c] = (float *)audio->data[c];
++    engine.Process(planes, audio->frames, audio->timestamp, rate, (int)layout);
++    return audio;
+ }
+ 
+ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+@@ -82,16 +192,16 @@ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+     string loading;
+     for (auto *filter : instances) {
+         obs_source_t *parent = obs_filter_get_parent(filter->context);
+-        if (!filter->enabled || !obs_source_enabled(filter->context) ||
++        if (!filter->engine.enabled || !obs_source_enabled(filter->context) ||
+             !parent || !obs_source_active(parent)) continue;
+         active = true;
+         string name = obs_source_get_name(parent);
+-        lock_guard<mutex> history_lock(filter->history_mutex);
+-        if (filter->is_loading) {
++        lock_guard<mutex> history_lock(filter->engine.history_mutex);
++        if (filter->engine.is_loading) {
+             loading = "消音未生效，原声继续输出：" + name + "（模型加载中）";
+-        } else if (!filter->initialization_error.empty()) {
+-            return {false, "消音未生效，原声继续输出：" + name + "（错误：" + filter->initialization_error + "）"};
+-        } else if (expected_path.empty() || filter->loaded_model_path != expected_path) {
++        } else if (!filter->engine.initialization_error.empty()) {
++            return {false, "消音未生效，原声继续输出：" + name + "（错误：" + filter->engine.initialization_error + "）"};
++        } else if (expected_path.empty() || filter->engine.loaded_model_path != expected_path) {
+             loading = "消音未生效，原声继续输出：" + name + "（等待识别引擎）";
+         }
+     }
+@@ -105,7 +215,7 @@ std::string ProfanityFilter::GetAudioSyncWarning() {
+     for (auto *filter : instances) {
+         auto *parent = obs_filter_get_parent(filter->context);
+         if (parent && obs_source_active(parent) && !obs_source_muted(parent) &&
+-            obs_source_enabled(filter->context) && filter->audio_warming)
++            obs_source_enabled(filter->context) && filter->engine.audio_warming)
+             return "声音同步缓冲中：" + string(obs_source_get_name(parent));
+     }
+     return "";
+@@ -120,28 +230,28 @@ std::string ProfanityFilter::GetRecognitionWarning() {
+         if (!cfg->global_enable) return "";
+         delay = cfg->delay_seconds;
+     }
+-    const uint64_t now = os_gettime_ns();
++    const uint64_t now = CensorEngine::NowNs();
+     const double backlog_limit = max(1.0, delay * 0.5);
+     string out;
+     lock_guard<mutex> lock(instances_mutex);
+     for (auto *filter : instances) {
+         obs_source_t *parent = obs_filter_get_parent(filter->context);
+-        if (filter->delay_only || !filter->enabled || !obs_source_enabled(filter->context) ||
+-            !parent || !obs_source_active(parent) || filter->is_loading) continue;
++        if (filter->delay_only || !filter->engine.enabled || !obs_source_enabled(filter->context) ||
++            !parent || !obs_source_active(parent) || filter->engine.is_loading) continue;
+         string name = obs_source_get_name(parent);
+         char text[256];
+-        uint64_t late = filter->last_late_beep_ns.load();
++        uint64_t late = filter->engine.last_late_beep_ns.load();
+         if (late && now > late && now - late < 10000000000ULL) {
+             snprintf(text, sizeof(text), "消音迟到：%s 有命中词在静音前已播出（累计%zu次），请增大延迟",
+-                     name.c_str(), filter->late_beeps_count.load());
++                     name.c_str(), filter->engine.late_beeps_count.load());
+             if (!out.empty()) out += "；";
+             out += text;
+             continue;
+         }
+         size_t queued;
+         {
+-            lock_guard<mutex> q_lock(filter->queue_mutex);
+-            queued = filter->asr_queue.size();
++            lock_guard<mutex> q_lock(filter->engine.queue_mutex);
++            queued = filter->engine.asr_queue.size();
+         }
+         double backlog = queued / 16000.0;
+         if (backlog >= backlog_limit) {
+@@ -171,1032 +281,18 @@ std::string ProfanityFilter::GetMicDataWarning() {
+         lock_guard<mutex> lock(cfg->mutex);
+         if (!cfg->global_enable) return "";
+     }
+-    const uint64_t now = os_gettime_ns();
++    const uint64_t now = CensorEngine::NowNs();
+     string out;
+     lock_guard<mutex> lock(instances_mutex);
+     for (auto *filter : instances) {
+         obs_source_t *parent = obs_filter_get_parent(filter->context);
+-        if (filter->delay_only || !filter->enabled || !obs_source_enabled(filter->context) ||
++        if (filter->delay_only || !filter->engine.enabled || !obs_source_enabled(filter->context) ||
+             !parent || !obs_source_active(parent) || obs_source_muted(parent) || !is_microphone_source(parent))
+             continue;
+-        if (now - max(filter->last_packet_ns.load(), filter->created_ns) > 3000000000ULL) {
++        if (now - max(filter->engine.last_packet_ns.load(), filter->engine.created_ns) > 3000000000ULL) {
+             if (!out.empty()) out += "；";
+             out += string("麦克风无数据：") + obs_source_get_name(parent) + "（设备断开或被占用？）";
+         }
+     }
+     return out;
+ }
+-
+-void ProfanityFilter::LoadModel(const string& path) {
+-    {
+-        lock_guard<mutex> lock(history_mutex);
+-        loading_target_path = path;
+-    }
+-    is_loading = true;
+-    if (stream) {
+-        SherpaOnnxDestroyOnlineStream(stream);
+-        stream = nullptr;
+-    }
+-
+-    if (asr_model) {
+-        // If this is the last instance, the underlying model will be destroyed here
+-        BLOG(LOG_INFO, "正在释放旧模型引用...");
+-    }
+-    asr_model.reset();
+-    { lock_guard<mutex> lock(history_mutex); initialization_error = ""; }
+-
+-    if (path.empty()) {
+-        { lock_guard<mutex> lock(history_mutex); loaded_model_path = ""; loaded_provider = ""; }
+-
+-        // Check if it's due to global disable
+-        GlobalConfig *cfg = GetGlobalConfig();
+-        bool global_enable = true;
+-        if (cfg) {
+-            lock_guard<mutex> lock(cfg->mutex);
+-            global_enable = cfg->global_enable;
+-        }
+-
+-        if (global_enable) {
+-            { lock_guard<mutex> lock(history_mutex); initialization_error = "未选择模型路径"; }
+-            BLOG(LOG_ERROR, "错误: %s", initialization_error.c_str());
+-        } else {
+-            // Just unloaded, no error
+-        }
+-        is_loading = false;
+-        return;
+-    }
+-
+-    // 获取当前 provider 设置
+-    string provider = "cpu";
+-    {
+-        GlobalConfig *cfg = GetGlobalConfig();
+-        if (cfg) {
+-            lock_guard<mutex> lock(cfg->mutex);
+-            if (cfg->enable_gpu) {
+-                provider = cfg->onnx_provider;
+-            }
+-        }
+-    }
+-
+-    string err;
+-    asr_model = ModelManager::Get(path, provider, err);
+-
+-    if (asr_model && asr_model->recognizer) {
+-        stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-        if (!stream) {
+-            lock_guard<mutex> lock(history_mutex);
+-            initialization_error = "识别流创建失败";
+-        }
+-        {
+-            lock_guard<mutex> lock(history_mutex);
+-            loaded_model_path = path;
+-            loaded_provider = provider;
+-        }
+-        BLOG(LOG_INFO, "引擎初始化成功 (provider: %s)", provider.c_str());
+-    } else {
+-        { lock_guard<mutex> lock(history_mutex); initialization_error = err.empty() ? "引擎初始化失败" : err; }
+-        BLOG(LOG_ERROR, "错误: %s", initialization_error.c_str());
+-
+-        // IMPORTANT: Even if failed, update loaded_model_path to prevent infinite retry loop in ASRLoop
+-        {
+-            lock_guard<mutex> lock(history_mutex);
+-            loaded_model_path = path;
+-            loaded_provider = provider;
+-        }
+-    }
+-    is_loading = false;
+-}
+-
+-void ProfanityFilter::Start() {
+-    if (running) return;
+-    running = true;
+-    asr_thread = thread(&ProfanityFilter::ASRLoop, this);
+-}
+-
+-void ProfanityFilter::Stop() {
+-    running = false;
+-    if (asr_thread.joinable()) asr_thread.join();
+-}
+-
+-void ProfanityFilter::ASRLoop() {
+-    uint64_t total_samples_popped_16k = 0;
+-    
+-    // Time sync
+-    uint64_t start_offset_input = 0;
+-    uint64_t last_feed_offset = 0;
+-    
+-    
+-    uint64_t tw = total_samples_written.load();
+-    if (tw > 0) {
+-        size_t q_size;
+-        {
+-            lock_guard<mutex> lock(queue_mutex);
+-            q_size = asr_queue.size();
+-        }
+-        double ratio = sample_rate_ratio.load();
+-        uint64_t backlog_input = (uint64_t)(q_size * ratio);
+-        if (tw > backlog_input) {
+-            start_offset_input = tw - backlog_input;
+-        }
+-        last_feed_offset = start_offset_input;
+-    }
+-
+-    string last_debug_text;
+-    uint64_t last_debug_segment = 0;
+-    while (running) {
+-        // Poll Global Config for model path changes and Gain settings
+-        int censor_padding_ms;
+-        bool asr_debug_logging;
+-        string target_provider = "cpu";
+-
+-        {
+-            GlobalConfig *cfg = GetGlobalConfig();
+-            std::lock_guard<std::mutex> lock(cfg->mutex);
+-
+-            std::string desired_path = cfg->global_enable ? cfg->model_path : "";
+-            censor_padding_ms = cfg->censor_padding_ms;
+-            asr_debug_logging = cfg->asr_debug_logging;
+-
+-            // 获取 provider 设置
+-            if (cfg->enable_gpu) {
+-                target_provider = cfg->onnx_provider;
+-            }
+-
+-            if (target_model_path != desired_path) {
+-                std::lock_guard<std::mutex> q_lock(queue_mutex);
+-                target_model_path = desired_path;
+-            }
+-        }
+-
+-        if (!asr_debug_logging) last_debug_text.clear();
+-
+-        // 1. Check for Model Change or Provider Change
+-        {
+-            string target;
+-            {
+-                lock_guard<mutex> lock(queue_mutex);
+-                target = target_model_path;
+-            }
+-
+-            // 检测路径变化或 provider 变化
+-            bool needs_reload = (target != loaded_model_path) || (target_provider != loaded_provider);
+-
+-            if (needs_reload) {
+-                LoadModel(target);
+-                // Reset stream implies resetting timestamp reference
+-                last_reset_sample_16k = total_samples_popped_16k;
+-
+-                // Fix: Clear queue and processed matches to prevent latency accumulation and index collision
+-                {
+-                    lock_guard<mutex> lock(queue_mutex);
+-                    asr_queue.clear();
+-                    asr_dropped_16k = 0; // the time re-sync below covers dropped audio
+-                }
+-
+-                // Re-sync time after clearing queue
+-                uint64_t tw_now = total_samples_written.load();
+-                double ratio_now = sample_rate_ratio.load();
+-                int64_t diff = (int64_t)tw_now - (int64_t)(total_samples_popped_16k * ratio_now);
+-                if (diff >= 0) {
+-                    start_offset_input = (uint64_t)diff;
+-                }
+-                last_feed_offset = start_offset_input;
+-
+-                processed_matches.clear();
+-            }
+-        }
+-        
+-        // 2. Process Audio
+-        vector<float> chunk;
+-        double current_ratio = sample_rate_ratio.load();
+-        uint32_t current_sr = sample_rate.load();
+-
+-        {
+-            lock_guard<mutex> lock(queue_mutex);
+-            // Audio removed without recognition (overflow or a long source gap) still
+-            // occupied input time. Advance the 16 kHz timeline and start a new stream so
+-            // later token timestamps map to the right samples in the delay buffer.
+-            if (asr_dropped_16k) {
+-                total_samples_popped_16k += asr_dropped_16k;
+-                asr_dropped_16k = 0;
+-                if (asr_model && asr_model->recognizer && stream) {
+-                    SherpaOnnxDestroyOnlineStream(stream);
+-                    stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-                }
+-                last_reset_sample_16k = total_samples_popped_16k;
+-                processed_matches.clear();
+-                {
+-                    lock_guard<mutex> h_lock(history_mutex);
+-                    current_partial_text = "";
+-                }
+-            }
+-            if (!asr_queue.empty()) {
+-                // Gap Check: If start_offset_input jumped significantly (e.g. > 0.5s), reset stream
+-                // This handles cases where filter was disabled/idle for a long time, ensuring fresh context
+-                // and preventing latency accumulation from stale state.
+-                if (start_offset_input > last_feed_offset + (uint64_t)(current_sr * 0.5)) {
+-                        if (asr_model && asr_model->recognizer && stream) {
+-                            SherpaOnnxDestroyOnlineStream(stream);
+-                            stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-                            last_reset_sample_16k = total_samples_popped_16k;
+-                            processed_matches.clear();
+-                            {
+-                                lock_guard<mutex> h_lock(history_mutex);
+-                                current_partial_text = "";
+-                            }
+-                        }
+-                }
+-                last_feed_offset = start_offset_input;
+-
+-                size_t n = min((size_t)3200, asr_queue.size()); 
+-                chunk.assign(asr_queue.begin(), asr_queue.begin() + n);
+-                asr_queue.erase(asr_queue.begin(), asr_queue.begin() + n);
+-            } else {
+-                // Re-sync offset to handle gaps (e.g. toggle enabled, queue clear)
+-                // This ensures timestamps remain accurate even if we dropped samples
+-                uint64_t tw = total_samples_written.load();
+-                if (tw > 0) {
+-                    // Calculate what start_offset_input SHOULD be so that:
+-                    // current_time ~= start_offset + total_popped * ratio
+-                    // We assume since queue is empty, current_time == tw
+-                    
+-                    // Use signed math to handle potential small drift
+-                    // Input still inside the resampler has not reached the model yet.
+-                    int64_t diff = (int64_t)tw - asr_resampler_held -
+-                                   (int64_t)(total_samples_popped_16k * current_ratio);
+-                    // start_offset_input is uint64, assuming positive result
+-                    if (diff >= 0) {
+-                        start_offset_input = (uint64_t)diff;
+-                    }
+-                }
+-            }
+-        }
+-        
+-        if (chunk.empty()) {
+-            this_thread::sleep_for(chrono::milliseconds(10));
+-            continue;
+-        }
+-        
+-        total_samples_popped_16k += chunk.size();
+-        
+-        // The model gets the resampled input unchanged. The former AGC (removed in 0019) lifted
+-        // normal-level speech up to 31.6x and clipped it at +-1, which cost recognitions.
+-        const vector<float> &model_chunk = chunk;
+-
+-        if (asr_model && asr_model->recognizer && stream) {
+-            SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, model_chunk.data(), (int32_t)model_chunk.size());
+-            while (SherpaOnnxIsOnlineStreamReady(asr_model->recognizer, stream)) {
+-                SherpaOnnxDecodeOnlineStream(asr_model->recognizer, stream);
+-            }
+-            
+-            const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(asr_model->recognizer, stream);
+-            if (result) {
+-                // Get Patterns and Config from Global
+-                GlobalConfig *cfg = GetGlobalConfig();
+-                vector<regex> patterns;
+-                bool use_pinyin;
+-                int model_offset_ms;
+-                string current_dirty_words;
+-                string current_pinyin_words;
+-                {
+-                    lock_guard<mutex> lock(cfg->mutex);
+-                    patterns = cfg->dirty_patterns; // Copy
+-                    use_pinyin = cfg->use_pinyin;
+-                    model_offset_ms = cfg->model_offset_ms;
+-                    current_dirty_words = cfg->dirty_words_str;
+-                    current_pinyin_words = cfg->pinyin_words_str;
+-                }
+-                
+-                // Byte-fallback tokens merged into characters; all matching below uses these.
+-                vector<string> tokens;
+-                vector<float> token_times;
+-                MergeByteTokens(result->tokens_arr, result->timestamps, result->count, tokens, token_times);
+-                const int token_count = (int)tokens.size();
+-                if (token_count > 0) {
+-                    string full_text = "";
+-                    // Reconstruct text
+-                    for(int i=0; i<token_count; i++) full_text += tokens[i];
+-
+-                    // Stream results are revisable partials, not a final transcript.
+-                    if (asr_debug_logging && !full_text.empty() &&
+-                        (full_text != last_debug_text || last_reset_sample_16k != last_debug_segment)) {
+-                        obs_source_t *parent = obs_filter_get_parent(context);
+-                        double segment_seconds = last_reset_sample_16k / 16000.0 +
+-                                                 (double)start_offset_input / current_sr;
+-                        string log_text = full_text;
+-                        for (char &c : log_text) {
+-                            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+-                        }
+-                        BLOG(LOG_INFO, "[ASR Debug] source=\"%s\" input=%.3f..%.3f partial=\"%s\"",
+-                             parent ? obs_source_get_name(parent) : obs_source_get_name(context),
+-                             segment_seconds + token_times[0],
+-                             segment_seconds + token_times[token_count - 1], log_text.c_str());
+-                        last_debug_text = full_text;
+-                        last_debug_segment = last_reset_sample_16k;
+-                    }
+-                    
+-                    if (!full_text.empty()) {
+-                        {
+-                            lock_guard<mutex> lock(history_mutex);
+-                            current_partial_text = full_text;
+-                        }
+-                    }
+-
+-                    // Collect Candidates
+-                    struct MatchCandidate {
+-                        size_t start_char;
+-                        uint64_t start_sample;
+-                        uint64_t end_sample;
+-                        string log_text;
+-                        bool is_pinyin;
+-                        uint64_t word_start;
+-                    };
+-                    vector<MatchCandidate> candidates;
+-
+-                    // 1. Regex Matching
+-                    for (const auto& pattern : patterns) {
+-                        sregex_iterator begin(full_text.begin(), full_text.end(), pattern);
+-                        sregex_iterator end;
+-                        
+-                        for (auto i = begin; i != end; ++i) {
+-                            smatch match = *i;
+-                            size_t m_start_char = match.position();
+-                            
+-                            // Find timestamps
+-                            float m_start_time = -1.0f;
+-                            float m_end_time = -1.0f;
+-                            
+-                            size_t current_char = 0;
+-                            for(int t=0; t<token_count; t++) {
+-                                string tok = tokens[t];
+-                                size_t tok_len = tok.length();
+-                                float tok_start = token_times[t];
+-                                float tok_end = (t < token_count - 1) ? token_times[t+1] : (tok_start + 0.2f);
+-                                
+-                                // Check overlap
+-                                size_t m_end_char = m_start_char + match.length();
+-                                if (current_char + tok_len > m_start_char && current_char < m_end_char) {
+-                                    if (m_start_time < 0) m_start_time = tok_start;
+-                                    m_end_time = tok_end;
+-                                }
+-                                current_char += tok_len;
+-                            }
+-                            
+-                            if (m_start_time >= 0) {
+-                                uint64_t start_16k = last_reset_sample_16k + (uint64_t)(m_start_time * 16000.0f);
+-                                uint64_t end_16k = last_reset_sample_16k + (uint64_t)(m_end_time * 16000.0f);
+-                                
+-                                uint64_t start_abs = (uint64_t)(start_16k * current_ratio) + start_offset_input;
+-                                uint64_t end_abs = (uint64_t)(end_16k * current_ratio) + start_offset_input;
+-                                
+-                                // Apply Model Latency Offset
+-                                int64_t offset_samples = (int64_t)((model_offset_ms / 1000.0) * current_sr);
+-                                if (offset_samples >= 0) {
+-                                    start_abs += offset_samples;
+-                                    end_abs += offset_samples;
+-                                } else {
+-                                    uint64_t sub = (uint64_t)(-offset_samples);
+-                                    start_abs = (start_abs > sub) ? start_abs - sub : 0;
+-                                    end_abs = (end_abs > sub) ? end_abs - sub : 0;
+-                                }
+-                                
+-                                uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
+-                                uint64_t word_start = start_abs;
+-                                start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+-                                end_abs += margin; 
+-                                
+-                                candidates.push_back({m_start_char, start_abs, end_abs, match.str(), false, word_start});
+-                            }
+-                        }
+-                    }
+-
+-                    // 2. Pinyin Matching
+-                    if (use_pinyin) {
+-                        if (!pinyin_converter) {
+-                            // Locate the dict directory. Paths are kept as filesystem::path built
+-                            // from UTF-8/wide strings: a narrow std::string is read in the ANSI
+-                            // code page and misses folders with Chinese names (then homophone
+-                            // matching was silently off).
+-                            filesystem::path dict_dir;
+-                            std::error_code ec;
+-
+-                            // Method 1: OBS data path (data/obs-plugins/<plugin>/dict), UTF-8
+-                            char *obs_data_ptr = obs_module_file("dict");
+-                            if (obs_data_ptr) {
+-                                int wn = MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, nullptr, 0);
+-                                std::wstring wide(wn > 0 ? wn - 1 : 0, L' ');
+-                                if (wn > 1) MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, wide.data(), wn);
+-                                filesystem::path p(wide);
+-                                if (filesystem::exists(p, ec)) dict_dir = p;
+-                                bfree(obs_data_ptr);
+-                            }
+-
+-                            // Method 2: next to the DLL (dev build) or <root>/data/dict
+-                            if (dict_dir.empty()) {
+-                                MEMORY_BASIC_INFORMATION mbi;
+-                                HMODULE hMod = VirtualQuery((LPCVOID)&ModuleLocator, &mbi, sizeof(mbi))
+-                                                   ? (HMODULE)mbi.AllocationBase : nullptr;
+-                                wchar_t path[MAX_PATH];
+-                                if (hMod && GetModuleFileNameW(hMod, path, MAX_PATH)) {
+-                                    filesystem::path p(path);
+-                                    filesystem::path p_next = p.parent_path() / "dict";
+-                                    filesystem::path p_bundle = p.parent_path().parent_path().parent_path() / "data" / "dict";
+-                                    if (filesystem::exists(p_next, ec)) dict_dir = p_next;
+-                                    else if (filesystem::exists(p_bundle, ec)) dict_dir = p_bundle;
+-                                }
+-                            }
+-
+-                            if (!dict_dir.empty()) {
+-                                Pinyin::setDictionaryPath(dict_dir);
+-                                pinyin_converter = make_shared<Pinyin::Pinyin>();
+-                                auto u8 = dict_dir.u8string();
+-                                BLOG(LOG_INFO, "Pinyin Engine Initialized from: %s", std::string(u8.begin(), u8.end()).c_str());
+-                            } else {
+-                                static bool logged_error = false;
+-                                if (!logged_error) {
+-                                    BLOG(LOG_ERROR, "Error: Could not find 'dict' directory for Pinyin engine.");
+-                                    logged_error = true;
+-                                }
+-                            }
+-                        }
+-
+-                        if (pinyin_converter) {
+-                            // Update patterns if changed
+-                            if (current_dirty_words != cached_dirty_words_str_for_pinyin ||
+-                                current_pinyin_words != cached_pinyin_words_str) {
+-                                cached_pinyin_patterns.clear();
+-                                stringstream ss(current_dirty_words);
+-                                string item;
+-                                while (getline(ss, item, ',')) {
+-                                    item.erase(0, item.find_first_not_of(" \t\n\r"));
+-                                    item.erase(item.find_last_not_of(" \t\n\r") + 1);
+-                                    if (!item.empty()) {
+-                                        auto res = pinyin_converter->hanziToPinyin(item, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false);
+-                                        vector<string> pat;
+-                                        for(const auto& r : res) {
+-                                            if (!r.pinyin.empty() && r.pinyin != " ") {
+-                                                    pat.push_back(NormalizePinyin(r.pinyin));
+-                                            }
+-                                        }
+-                                        if (!pat.empty()) cached_pinyin_patterns.push_back(pat);
+-                                    }
+-                                }
+-                                vector<vector<string>> supplemental_patterns;
+-                                string parse_error;
+-                                if (ParsePinyinWords(current_pinyin_words, supplemental_patterns, parse_error)) {
+-                                    cached_pinyin_patterns.insert(cached_pinyin_patterns.end(),
+-                                        supplemental_patterns.begin(), supplemental_patterns.end());
+-                                } else {
+-                                    BLOG(LOG_ERROR, "Supplemental pinyin lexicon ignored: %s", parse_error.c_str());
+-                                }
+-                                cached_dirty_words_str_for_pinyin = current_dirty_words;
+-                                cached_pinyin_words_str = current_pinyin_words;
+-                            }
+-
+-                            // Prepare text pinyin
+-                            vector<string> text_pinyins;
+-                            vector<int> pinyin_to_token;
+-                            
+-                            for(int t=0; t<token_count; t++) {
+-                                string tok = tokens[t];
+-                                
+-                                // Try cache first
+-                                vector<string> pinyins;
+-                                auto it = pinyin_cache.find(tok);
+-                                if (it != pinyin_cache.end()) {
+-                                    pinyins = it->second;
+-                                } else {
+-                                    // Not in cache, convert
+-                                    auto res = pinyin_converter->hanziToPinyin(tok, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false);
+-                                    for(const auto& r : res) {
+-                                            if (!r.pinyin.empty() && r.pinyin != " ") {
+-                                                pinyins.push_back(NormalizePinyin(r.pinyin));
+-                                            }
+-                                    }
+-                                    // Store in cache (limit size to prevent memory leak)
+-                                    if (pinyin_cache.size() > 5000) pinyin_cache.clear();
+-                                    pinyin_cache[tok] = pinyins;
+-                                }
+-
+-                                for(const auto& p : pinyins) {
+-                                        text_pinyins.push_back(p);
+-                                        pinyin_to_token.push_back(t);
+-                                }
+-                            }
+-                            
+-                            // Debug Log Pinyin (First 3s only to avoid spam)
+-                            static int debug_log_count = 0;
+-                            if (asr_debug_logging && debug_log_count < 3 && !text_pinyins.empty()) {
+-                                stringstream ss;
+-                                ss << "DEBUG Pinyin: ";
+-                                for(auto& p : text_pinyins) ss << p << " ";
+-                                BLOG(LOG_INFO, "%s", ss.str().c_str());
+-                                debug_log_count++;
+-                            }
+-
+-                            // Match
+-                            for (const auto& pat : cached_pinyin_patterns) {
+-                                if (pat.size() > text_pinyins.size()) continue;
+-                                for (size_t i = 0; i <= text_pinyins.size() - pat.size(); ++i) {
+-                                    bool match = true;
+-                                    for (size_t j = 0; j < pat.size(); ++j) {
+-                                        if (text_pinyins[i+j] != pat[j]) {
+-                                            match = false;
+-                                            break;
+-                                        }
+-                                    }
+-                                    
+-                                    if (match) {
+-                                        int start_token = pinyin_to_token[i];
+-                                        int end_token = pinyin_to_token[i + pat.size() - 1];
+-                                        
+-                                        // Calculate char pos for processed_matches check
+-                                        size_t char_pos = 0;
+-                                        for(int k=0; k<start_token; k++) char_pos += tokens[k].length();
+-                                        
+-                                        float start_time = token_times[start_token];
+-                                        float end_time = (end_token < token_count - 1) ? token_times[end_token+1] : (token_times[end_token] + 0.2f);
+-                                        
+-                                        uint64_t start_16k = last_reset_sample_16k + (uint64_t)(start_time * 16000.0f);
+-                                        uint64_t end_16k = last_reset_sample_16k + (uint64_t)(end_time * 16000.0f);
+-                                        
+-                                        uint64_t start_abs = (uint64_t)(start_16k * current_ratio) + start_offset_input;
+-                                        uint64_t end_abs = (uint64_t)(end_16k * current_ratio) + start_offset_input;
+-
+-                                        // Apply Model Latency Offset
+-                                        int64_t offset_samples = (int64_t)((model_offset_ms / 1000.0) * current_sr);
+-                                        if (offset_samples >= 0) {
+-                                            start_abs += offset_samples;
+-                                            end_abs += offset_samples;
+-                                        } else {
+-                                            uint64_t sub = (uint64_t)(-offset_samples);
+-                                            start_abs = (start_abs > sub) ? start_abs - sub : 0;
+-                                            end_abs = (end_abs > sub) ? end_abs - sub : 0;
+-                                        }
+-                                        
+-                                        uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
+-                                        uint64_t word_start = start_abs;
+-                                        start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+-                                        end_abs += margin; 
+-                                        
+-                                        stringstream ss;
+-                                        ss << "已屏蔽(拼音): ";
+-                                        for(const auto& p : pat) ss << p << " ";
+-                                        ss << "[匹配源: ";
+-                                        for(int k=0; k<pat.size(); k++) ss << text_pinyins[i+k] << " ";
+-                                        ss << "]";
+-                                        
+-                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start});
+-                                    }
+-                                }
+-                            }
+-                        }
+-                    }
+-
+-                    // 3. Sort and Apply Candidates
+-                    sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
+-                        return (a.end_sample - a.start_sample) > (b.end_sample - b.start_sample);
+-                    });
+-
+-                    for(const auto& m : candidates) {
+-                        // Skip if already processed in previous frames
+-                        if (processed_matches.count(m.start_char)) continue;
+-                        
+-                        {
+-                            lock_guard<mutex> b_lock(beep_mutex);
+-                            pending_beeps.push_back({m.start_sample, m.end_sample, m.word_start});
+-                            BLOG(LOG_INFO, "%s", m.log_text.c_str());
+-                        }
+-                        
+-                        // Always mark as processed to prevent re-evaluation or double-application
+-                        processed_matches.insert(m.start_char);
+-                    }
+-                }
+-                SherpaOnnxDestroyOnlineRecognizerResult(result);
+-            }
+-            
+-            // Check endpoint or force reset if segment is too long (> 600s = 10min)
+-            bool force_reset = (total_samples_popped_16k - last_reset_sample_16k) > (16000 * 600);
+-
+-            if (force_reset || SherpaOnnxOnlineStreamIsEndpoint(asr_model->recognizer, stream)) {
+-                if (force_reset) {
+-                    BLOG(LOG_INFO, "Info: Periodic reset of ASR stream (segment > 10min)");
+-                }
+-                SherpaOnnxOnlineStreamReset(asr_model->recognizer, stream);
+-                last_reset_sample_16k = total_samples_popped_16k;
+-                {
+-                    lock_guard<mutex> lock(history_mutex);
+-                    current_partial_text = "";
+-                }
+-                processed_matches.clear();
+-            }
+-        }
+-    }
+-}
+-
+-struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audio) {
+-    uint32_t frames = audio->frames;
+-    if (!audio->data[0]) return audio;
+-
+-    // Sync with Global Config
+-    GlobalConfig *cfg = GetGlobalConfig();
+-    double global_delay;
+-    string global_model;
+-    int global_effect; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
+-    int global_freq;
+-    int global_mix;
+-    bool global_enable;
+-    
+-    {
+-        lock_guard<mutex> lock(cfg->mutex);
+-        global_delay = cfg->delay_seconds;
+-        global_model = cfg->model_path;
+-        global_effect = cfg->audio_effect;
+-        global_freq = cfg->beep_frequency;
+-        global_mix = cfg->beep_mix_percent;
+-        global_enable = cfg->global_enable;
+-        if (delay_only && !cfg->video_delay_enabled) global_enable = false;
+-    }
+-    
+-    // If disabled globally, pass through and signal unload
+-    if (!global_enable) {
+-        previous_audio_end = 0;
+-        buffered_samples = 0;
+-        audio_warming = true;
+-        {
+-            lock_guard<mutex> lock(queue_mutex);
+-            target_model_path = ""; // Signal unload
+-        }
+-        return audio;
+-    }
+-    
+-    // Update Filter State
+-    {
+-        lock_guard<mutex> lock(queue_mutex);
+-        target_model_path = global_model;
+-    }
+-    cached_delay = global_delay;
+-    
+-    last_packet_ns = os_gettime_ns();
+-
+-    // Update Sample Rate (Dynamic)
+-    uint32_t current_sr = 0;
+-    struct obs_audio_info aoi;
+-    if (obs_get_audio_info(&aoi)) {
+-        current_sr = aoi.samples_per_sec;
+-    }
+-    if (current_sr == 0) current_sr = 48000; // Fallback
+-    enum speaker_layout current_layout = SPEAKERS_STEREO;
+-    if (obs_get_audio_info(&aoi) && aoi.speakers != SPEAKERS_UNKNOWN) current_layout = aoi.speakers;
+-
+-    // Update state if changed
+-    if (sample_rate != current_sr) {
+-        previous_audio_end = 0;
+-        sample_rate = current_sr;
+-        sample_rate_ratio = (double)current_sr / 16000.0;
+-    }
+-    if (!asr_resampler || asr_resampler_rate != current_sr || asr_resampler_layout != current_layout) {
+-        lock_guard<mutex> lock(queue_mutex);
+-        if (asr_resampler) audio_resampler_destroy(asr_resampler);
+-        struct resample_info src = {current_sr, AUDIO_FORMAT_FLOAT_PLANAR, current_layout};
+-        struct resample_info dst = {16000, AUDIO_FORMAT_FLOAT, SPEAKERS_MONO};
+-        asr_resampler = audio_resampler_create(&dst, &src);
+-        if (!asr_resampler) BLOG(LOG_ERROR, "Unable to create the 16 kHz model input resampler");
+-        asr_resampler_rate = current_sr;
+-        asr_resampler_layout = current_layout;
+-        asr_resampler_in = asr_resampler_out = 0;
+-        asr_resampler_held = 0;
+-    }
+-    
+-    double current_ratio = sample_rate_ratio.load();
+-    size_t delay_samples = (size_t)(cached_delay * current_sr);
+-
+-    // Source timestamps say how much real time passed since the previous packet.
+-    // Application captures can stop delivering packets while the app is silent; such a
+-    // pause has to advance the delay line (as silence) instead of discarding the tail
+-    // that is still waiting in the buffer, otherwise utterance endings are cut off and
+-    // the remaining audio would play late relative to the delayed video.
+-    // libobs (obs-source.c source_output_audio_data) smooths timestamp jumps below
+-    // TS_SMOOTHING_THRESHOLD (70 ms) as contiguous and places larger jumps at their
+-    // timestamp; use the same threshold so the delay line matches what is played.
+-    const uint64_t gap_tolerance_ns = 70000000ULL;
+-    bool reset_buffer = !previous_audio_end || delay_samples != previous_delay_samples;
+-    uint64_t gap_frames = 0;
+-    if (!reset_buffer && audio->timestamp > previous_audio_end + gap_tolerance_ns) {
+-        gap_frames = (audio->timestamp - previous_audio_end) * current_sr / 1000000000ULL;
+-    } else if (!reset_buffer && audio->timestamp + gap_tolerance_ns < previous_audio_end) {
+-        reset_buffer = true; // timestamps went backwards: treat as a source restart
+-    }
+-    const bool gap_elapsed_buffer = gap_frames && gap_frames >= delay_samples;
+-    if (gap_frames) {
+-        size_t gaps = ++audio_gap_count;
+-        if (gaps <= 5 || gaps % 50 == 0) {
+-            obs_source_t *parent = obs_filter_get_parent(context);
+-            // A filter only outputs when input arrives, so delayed audio that fell due
+-            // during the gap (up to one delay length) cannot be output any more.
+-            BLOG(LOG_INFO, "[Speech Sync] source=\"%s\" audio gap %.0f ms; %.0f ms of delayed audio unplayable (gaps=%zu)",
+-                 parent ? obs_source_get_name(parent) : "?", gap_frames * 1000.0 / current_sr,
+-                 (double)min<uint64_t>(gap_frames, delay_samples) * 1000.0 / current_sr, gaps);
+-        }
+-    }
+-    previous_delay_samples = delay_samples;
+-    previous_audio_end = audio->timestamp + (uint64_t)frames * 1000000000ULL / current_sr;
+-
+-    if (enabled && !target_model_path.empty()) {
+-        lock_guard<mutex> lock(queue_mutex);
+-
+-        // Safety: Limit queue size to prevent memory leak if ASR is too slow
+-        // Limit to ~60 seconds of audio (16000 * 60 = 960,000 samples)
+-        if (asr_queue.size() > 960000) {
+-            BLOG(LOG_WARNING, "ASR backlog exceeded 60s; dropping %zu queued samples (timeline kept aligned)",
+-                 asr_queue.size());
+-            asr_dropped_16k += asr_queue.size();
+-            asr_queue.clear();
+-        }
+-
+-        // Keep the recognizer timeline equal to source time across packet gaps.
+-        if (gap_elapsed_buffer) {
+-            // Pre-gap samples still queued would otherwise be decoded after the
+-            // timeline jump and mapped onto post-gap audio; their output is gone anyway.
+-            asr_dropped_16k += asr_queue.size();
+-            asr_queue.clear();
+-            asr_dropped_16k += (uint64_t)(gap_frames / current_ratio);
+-        } else if (gap_frames) {
+-            // Short gap: feed silence so the model timeline and the resampler stay continuous.
+-            static const vector<float> silence(1024, 0.0f);
+-            const uint8_t *planes[MAX_AV_PLANES];
+-            for (auto &plane : planes) plane = (const uint8_t *)silence.data();
+-            for (uint64_t done = 0; done < gap_frames;) {
+-                uint32_t n = (uint32_t)min<uint64_t>(silence.size(), gap_frames - done);
+-                FeedAsrResampler(planes, n, current_ratio);
+-                done += n;
+-            }
+-        }
+-
+-        // Model input: 16 kHz mono via libobs' resampler (anti-aliased, all channels).
+-        // The plugin used to keep every 3rd sample of the first channel without a low-pass
+-        // filter, which folded content above 8 kHz into the speech band (0018).
+-        FeedAsrResampler((const uint8_t *const *)audio->data, frames, current_ratio);
+-    }
+-    
+-    // 2. Buffer Logic
+-    if (channels.empty()) {
+-        for (size_t c = 0; c < 8; c++) {
+-            if (audio->data[c]) channels_count++; else break;
+-        }
+-        if (channels_count == 0) channels_count = 1;
+-        channels.resize(channels_count);
+-        
+-        size_t buf_size = current_sr * 12; // Max 12s
+-        for (auto& ch : channels) {
+-            ch.buffer.resize(buf_size, 0.0f);
+-            ch.clean_buffer.resize(buf_size, 0.0f);
+-        }
+-    }
+-    
+-    // Ensure buffer size covers delay
+-    size_t current_buf_size = channels[0].buffer.size();
+-
+-    // Resize check (handle sample rate change or large delay)
+-    if (delay_samples * 2 > current_buf_size || current_buf_size != current_sr * 12) {
+-            size_t new_size = max((size_t)(current_sr * 12), delay_samples * 2);
+-            if (new_size != current_buf_size) {
+-                current_buf_size = new_size;
+-                for (auto& ch : channels) {
+-                    vector<float> new_buf(new_size, 0.0f);
+-                    ch.buffer = new_buf;
+-                    ch.clean_buffer = new_buf;
+-                    ch.head = 0;
+-                }
+-            }
+-    }
+-    
+-    if (delay_samples >= current_buf_size) delay_samples = current_buf_size - current_sr;
+-
+-    if (reset_buffer || gap_elapsed_buffer) {
+-        // A source restart must not replay samples from an earlier activation; after a
+-        // gap longer than the delay everything buffered would already have played.
+-        for (auto &ch : channels) {
+-            std::fill(ch.buffer.begin(), ch.buffer.end(), 0.0f);
+-            std::fill(ch.clean_buffer.begin(), ch.clean_buffer.end(), 0.0f);
+-        }
+-        // Pending mutes refer to audio that was discarded or already elapsed.
+-        lock_guard<mutex> b_lock(beep_mutex);
+-        pending_beeps.clear();
+-    }
+-    if (reset_buffer) {
+-        buffered_samples = 0;
+-    } else if (gap_frames) {
+-        // Advance the delay line by the gap. Short gaps are written as silence so the
+-        // buffered tail keeps playing at its original time; for long gaps the buffer is
+-        // already all silence, so only the absolute positions move forward.
+-        for (auto &ch : channels) {
+-            if (!gap_elapsed_buffer) {
+-                for (uint64_t i = 0; i < gap_frames; i++) {
+-                    ch.buffer[ch.head] = 0.0f;
+-                    ch.clean_buffer[ch.head] = 0.0f;
+-                    ch.head = (ch.head + 1) % current_buf_size;
+-                }
+-            }
+-            ch.total_written += gap_frames;
+-        }
+-        total_samples_written.fetch_add(gap_frames);
+-        buffered_samples += gap_frames;
+-    }
+-    buffered_samples += frames;
+-    audio_warming = buffered_samples < delay_samples;
+-    
+-    // Write to buffer
+-    for (size_t c = 0; c < channels_count; c++) {
+-        if (!audio->data[c]) continue;
+-        float *data_in = (float *)audio->data[c];
+-        auto& ch = channels[c];
+-        for (size_t i = 0; i < frames; i++) {
+-            ch.buffer[ch.head] = data_in[i];
+-            ch.clean_buffer[ch.head] = data_in[i];
+-            ch.head = (ch.head + 1) % current_buf_size;
+-            ch.total_written++;
+-        }
+-    }
+-    total_samples_written.fetch_add(frames);
+-    
+-    // Apply Beeps (Only if enabled)
+-    if (enabled) {
+-        lock_guard<mutex> lock(beep_mutex);
+-        uint64_t current_write_pos = channels[0].total_written;
+-        uint64_t play_head_pos = 0;
+-        if (current_write_pos > delay_samples) {
+-            play_head_pos = current_write_pos - delay_samples;
+-        }
+-        
+-        for (auto it = pending_beeps.begin(); it != pending_beeps.end(); ) {
+-                // 1. Handling Late Beeps (Latency > Delay)
+-                if (it->start_sample < play_head_pos) {
+-                    // Losing only the pre-padding is expected; losing part of the word
+-                    // itself means original speech was already output unmuted.
+-                    if (it->word_start < play_head_pos) {
+-                        size_t late = ++late_beeps_count;
+-                        last_late_beep_ns = os_gettime_ns();
+-                        if (late <= 5 || late % 10 == 0) {
+-                            BLOG(LOG_WARNING, "Censor late: word start already played by %.0f ms (late=%zu). Increase delay setting.",
+-                                 (play_head_pos - it->word_start) * 1000.0 / current_sr, late);
+-                        }
+-                    }
+-                    it->start_sample = play_head_pos;
+-                }
+-
+-                uint64_t start = it->start_sample;
+-                uint64_t end = it->end_sample;
+-                
+-                if (start >= end) {
+-                    size_t dropped = ++dropped_beeps_count;
+-                    if (dropped <= 5 || dropped % 10 == 0) {
+-                        BLOG(LOG_WARNING, "Beep dropped! Latency > Delay. Increase delay setting. (Start: %llu, End: %llu, Head: %llu)", 
+-                            (unsigned long long)start, (unsigned long long)end, (unsigned long long)play_head_pos);
+-                    }
+-
+-                    it = pending_beeps.erase(it);
+-                    continue;
+-                }
+-                
+-                if (end < current_write_pos - current_buf_size) {
+-                    it = pending_beeps.erase(it);
+-                    continue;
+-                }
+-                
+-                for (size_t c = 0; c < channels_count; c++) {
+-                    auto& ch = channels[c];
+-                    
+-                    // Minion Effect: Pre-fetch original audio to avoid feedback loop
+-                    // Only needed for global_effect == 2
+-                    std::vector<float> temp_source;
+-                    uint64_t temp_start_idx = 0;
+-                    if (global_effect == 2) {
+-                        uint64_t window_size = 2048; // Approx 40ms
+-                        // Ensure we have enough history for pitch shifter lookback
+-                        uint64_t safe_start = (start > window_size) ? start - window_size : 0;
+-                        // Check buffer limits (don't go before what we have)
+-                        if (safe_start < current_write_pos - current_buf_size) {
+-                             safe_start = current_write_pos - current_buf_size;
+-                        }
+-                        
+-                        temp_start_idx = safe_start;
+-                        size_t len = (size_t)(end - safe_start);
+-                        temp_source.resize(len);
+-                        
+-                        for(size_t k=0; k<len; k++) {
+-                             uint64_t s_abs = safe_start + k;
+-                             size_t diff = (size_t)(current_write_pos - s_abs);
+-                             size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
+-                             temp_source[k] = ch.clean_buffer[idx];
+-                        }
+-                    }
+-
+-                    for (uint64_t s = start; s < end; s++) {
+-                        if (s >= current_write_pos) break; 
+-                        if (s < current_write_pos - current_buf_size) continue;
+-                        
+-                        size_t diff = (size_t)(current_write_pos - s);
+-                        size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
+-                        
+-                        float val = 0.0f;
+-                        float original = ch.buffer[idx];
+-                        float mix = (float)global_mix / 100.0f;
+-
+-                        if (global_effect == 1) { // Silence
+-                             val = 0.0f;
+-                        } else if (global_effect == 2) { // Minion (Pitch Shifter)
+-                             // Barberpole Pitch Shifter
+-                             // Pitch Ratio: 2.0 (Octave up) for sharper Minion sound
+-                             double pitch_ratio = 2.0;
+-                             double window_size = 2048.0; // Must match pre-fetch window approx
+-                             
+-                             // Phase runs 0..1
+-                             double speed = pitch_ratio - 1.0;
+-                             double phase = (double)(s % (uint64_t)(window_size / speed)) * speed / window_size;
+-                             phase -= floor(phase);
+-
+-                             // Delay decreases from window_size to 0 for Pitch Up
+-                             double delay_A = (1.0 - phase) * window_size;
+-                             double delay_B = (1.0 - ((phase + 0.5) - floor(phase + 0.5))) * window_size;
+-                             
+-                             // Read from temp_source
+-                             // temp_source[0] corresponds to temp_start_idx
+-                             // Current time s corresponds to index (s - temp_start_idx)
+-                             // We want to read at (s - delay)
+-                             
+-                             int64_t read_idx_A = (int64_t)(s - temp_start_idx) - (int64_t)delay_A;
+-                             int64_t read_idx_B = (int64_t)(s - temp_start_idx) - (int64_t)delay_B;
+-                             
+-                             float sample_A = 0.0f;
+-                             float sample_B = 0.0f;
+-                             
+-                             if (read_idx_A >= 0 && read_idx_A < (int64_t)temp_source.size()) sample_A = temp_source[read_idx_A];
+-                             if (read_idx_B >= 0 && read_idx_B < (int64_t)temp_source.size()) sample_B = temp_source[read_idx_B];
+-                             
+-                             // Triangle Window
+-                             float gain_A = 1.0f - 2.0f * (float)fabs(phase - 0.5);
+-                             float gain_B = 1.0f - 2.0f * (float)fabs(((phase + 0.5) - floor(phase + 0.5)) - 0.5);
+-                             
+-                             val = sample_A * gain_A + sample_B * gain_B;
+-                             mix = 1.0f; // Force wet mix for voice change
+-                        } else if (global_effect == 3) { // Telegraph (Morse Code Style)
+-                             double t = (double)s / (double)current_sr;
+-                             
+-                             // Carrier: 750Hz Sine Wave (Classic CW tone)
+-                             double carrier = sin(2.0 * 3.14159265358979323846 * 750.0 * t);
+-                             
+-                             // Pseudo-random Morse Pattern Generator
+-                             // Use sine waves at different prime frequencies to create a non-repeating pattern of "dits" and "dahs"
+-                             // 8Hz = fast dits, 3Hz = word spacing rhythm
+-                             double rhythm = sin(2.0 * 3.14159265358979323846 * 8.0 * t) + 
+-                                             sin(2.0 * 3.14159265358979323846 * 3.0 * t);
+-                             
+-                             // Threshold to create on/off keying
+-                             // If rhythm > 0, tone is ON. Else OFF.
+-                             float envelope = (rhythm > 0.0) ? 1.0f : 0.0f;
+-                             
+-                             val = 0.15f * (float)carrier * envelope;
+-                             mix = 1.0f; // Force 100% replacement
+-                        } else { // Default: Beep
+-                             double cycles = (double)s * (double)global_freq / (double)current_sr;
+-                             double phase = cycles - floor(cycles);
+-                             val = 0.1f * (float)sin(2.0 * 3.14159265358979323846 * phase);
+-                        }
+-                        
+-                        ch.buffer[idx] = (val * mix) + (original * (1.0f - mix));
+-                    }
+-                }
+-
+-                if (end > current_write_pos) {
+-                    if (it->start_sample < current_write_pos) {
+-                        it->start_sample = current_write_pos;
+-                    }
+-                    ++it;
+-                } else {
+-                    it = pending_beeps.erase(it);
+-                }
+-        }
+-    }
+-    
+-    // Output Delayed
+-    uint64_t current_written = channels[0].total_written;
+-    for (size_t c = 0; c < channels_count; c++) {
+-        if (!audio->data[c]) continue;
+-        float *data_out = (float *)audio->data[c];
+-        auto& ch = channels[c];
+-        
+-        for (size_t i = 0; i < frames; i++) {
+-            int64_t target_abs = (int64_t)(current_written - frames + i) - (int64_t)delay_samples;
+-            if (target_abs < 0) {
+-                data_out[i] = 0.0f;
+-            } else {
+-                size_t diff = (size_t)(current_written - target_abs);
+-                size_t idx = (ch.head + current_buf_size - (diff % current_buf_size)) % current_buf_size;
+-                data_out[i] = ch.buffer[idx];
+-            }
+-        }
+-    }
+-    
+-    return audio;
+-}
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index bb162ed..b912ac2 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -2,119 +2,37 @@
+ 
+ #include <obs.h>
+ #include <media-io/audio-resampler.h>
+-#include <media-io/audio-resampler.h>
+ #include <string>
+-#include <vector>
+-#include <deque>
+ #include <mutex>
+-#include <atomic>
+-#include <thread>
+ #include <set>
+-#include <map>
+-#include "sherpa-onnx/c-api/c-api.h"
+-#include "asr-model.hpp"
+-#include "cpp-pinyin/Pinyin.h"
++#include "censor-engine.hpp"
+ 
+-class ProfanityFilter {
++// OBS audio filter: recognition and muting are done by CensorEngine (shared with the
++// standalone program); this class supplies the plugin's global settings, the libobs
++// model-input resampler, the pinyin dictionary location and the status-bar texts.
++class ProfanityFilter : public CensorHost {
+ public:
+     obs_source_t *context;
+-    
+-    bool delay_only = false;
+-
+-    // Local Properties
+-    std::atomic<bool> enabled{true};
+-    
+-    // Global Cache
+-    std::string target_model_path;
+-    std::string loaded_model_path;
+-    std::string loaded_provider;  // Provider used for currently loaded model
+-    double cached_delay = 1.5;
+-    
+-    // History
+-    std::string current_partial_text; 
+-    std::string loading_target_path;
+-    std::mutex history_mutex;
+ 
+-    // State
+-    std::shared_ptr<ASRModel> asr_model; 
+-    const SherpaOnnxOnlineStream *stream = nullptr;
+-    
+-    // Audio Buffer
+-    struct ChannelBuffer {
+-        std::vector<float> buffer;
+-        std::vector<float> clean_buffer; // Stores original audio for effect lookback
+-        size_t head = 0; 
+-        uint64_t total_written = 0;
+-    };
+-    
+-    std::vector<ChannelBuffer> channels;
+-    std::atomic<uint32_t> sample_rate{48000};
+-    std::atomic<double> sample_rate_ratio{3.0}; // sample_rate / 16000.0
+-    std::atomic<uint64_t> total_samples_written{0}; 
+-    size_t channels_count = 0;
+-    
+-    // Model input resampler (audio thread only): libobs/FFmpeg swresample, low-pass before
+-    // decimation and all channels downmixed to mono. Output sample k corresponds exactly to
+-    // input sample k * ratio; the resampler holds back ~1 ms of input (tools/resampler-align-check.cpp).
+-    audio_resampler_t *asr_resampler = nullptr;
+-    uint32_t asr_resampler_rate = 0;
+-    enum speaker_layout asr_resampler_layout = SPEAKERS_UNKNOWN;
+-    uint64_t asr_resampler_in = 0;   // input frames fed
+-    uint64_t asr_resampler_out = 0;  // 16 kHz samples produced
+-    int64_t asr_resampler_held = 0;  // input frames inside the resampler (queue_mutex)
+-    void FeedAsrResampler(const uint8_t *const *data, uint32_t frames, double ratio);
+-    
+-    // ASR Thread
+-    std::thread asr_thread;
+-    std::atomic<bool> running{false};
+-    std::mutex queue_mutex;
+-    std::deque<float> asr_queue;
+-    // 16 kHz samples removed from asr_queue without recognition (guarded by queue_mutex).
+-    // The ASR thread advances its timeline by this amount so later matches stay aligned.
+-    uint64_t asr_dropped_16k = 0;
+-
+-    // Beep Map
+-    struct BeepRange {
+-        uint64_t start_sample;
+-        uint64_t end_sample;
+-        uint64_t word_start; // matched word start before padding, used to detect leaks
+-    };
+-    std::mutex beep_mutex;
+-    std::vector<BeepRange> pending_beeps;
+-    
+-    std::string initialization_error = "";
+-    std::atomic<bool> is_loading{false};
+-    
++    bool delay_only = false;
+     obs_data_t *settings = nullptr;
+-    uint64_t last_reset_sample_16k = 0;
+-    std::set<size_t> processed_matches; 
+-    std::atomic<size_t> dropped_beeps_count{0};
+-    // Matches whose unpadded word start was already played before muting began.
+-    std::atomic<size_t> late_beeps_count{0};
+-    std::atomic<uint64_t> last_late_beep_ns{0};
+-    std::atomic<size_t> audio_gap_count{0};
+ 
+-    std::atomic<uint64_t> last_packet_ns{0}; // for GetMicDataWarning
+-    uint64_t created_ns = 0;
+-    
+-    // Pinyin Support
+-    std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
+-    std::vector<std::vector<std::string>> cached_pinyin_patterns;
+-    std::string cached_dirty_words_str_for_pinyin;
+-    std::string cached_pinyin_words_str;
+-    // Cache for single hanzi pinyin to avoid re-conversion
+-    std::map<std::string, std::vector<std::string>> pinyin_cache;
+-    
++    CensorEngine engine{this};
++
+     ProfanityFilter(obs_source_t *ctx);
+     ~ProfanityFilter();
+ 
+-    void LoadModel(const std::string& path);
+-    void Start();
+-    void Stop();
+-    void ASRLoop();
+-    
++    void Start() { engine.Start(); }
+     struct obs_audio_data *ProcessAudio(struct obs_audio_data *audio);
+ 
++    // CensorHost
++    void GetAudioSettings(CensorAudioSettings &settings) override;
++    void GetAsrSettings(CensorAsrSettings &settings) override;
++    void GetLexicon(CensorLexicon &lexicon) override;
++    std::string SourceName() override;
++    std::filesystem::path PinyinDictDir() override;
++    std::unique_ptr<CensorResampler> CreateResampler(uint32_t rate, int layout, size_t channels) override;
++
+     // Static Global Status Access
+     static std::set<ProfanityFilter*> instances;
+     static std::mutex instances_mutex;
+@@ -123,10 +41,7 @@ public:
+     static std::string GetRecognitionWarning();
+     // Per-source level lines (dialog) or level warnings only (status bar).
+     static std::string GetMicDataWarning();
+-
+-private:
+-    uint64_t previous_audio_end = 0;
+-    size_t previous_delay_samples = 0;
+-    uint64_t buffered_samples = 0;
+-    std::atomic<bool> audio_warming{true};
+ };
++
++// Routes CensorEngine/ASRModel log lines to blog() with the plugin prefix.
++void InstallCensorLogHandler();
+-- 
+2.55.0.windows.5
+

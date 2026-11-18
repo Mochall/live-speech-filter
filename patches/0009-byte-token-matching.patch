@@ -1,0 +1,149 @@
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 861dca8..c369618 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -568,10 +568,15 @@ void ProfanityFilter::ASRLoop() {
+                     current_pinyin_words = cfg->pinyin_words_str;
+                 }
+                 
+-                if (result->count > 0) {
++                // Byte-fallback tokens merged into characters; all matching below uses these.
++                vector<string> tokens;
++                vector<float> token_times;
++                MergeByteTokens(result->tokens_arr, result->timestamps, result->count, tokens, token_times);
++                const int token_count = (int)tokens.size();
++                if (token_count > 0) {
+                     string full_text = "";
+                     // Reconstruct text
+-                    for(int i=0; i<result->count; i++) full_text += result->tokens_arr[i];
++                    for(int i=0; i<token_count; i++) full_text += tokens[i];
+ 
+                     // Stream results are revisable partials, not a final transcript.
+                     if (asr_debug_logging && !full_text.empty() &&
+@@ -585,8 +590,8 @@ void ProfanityFilter::ASRLoop() {
+                         }
+                         BLOG(LOG_INFO, "[ASR Debug] source=\"%s\" input=%.3f..%.3f partial=\"%s\"",
+                              parent ? obs_source_get_name(parent) : obs_source_get_name(context),
+-                             segment_seconds + result->timestamps[0],
+-                             segment_seconds + result->timestamps[result->count - 1], log_text.c_str());
++                             segment_seconds + token_times[0],
++                             segment_seconds + token_times[token_count - 1], log_text.c_str());
+                         last_debug_text = full_text;
+                         last_debug_segment = last_reset_sample_16k;
+                     }
+@@ -623,11 +628,11 @@ void ProfanityFilter::ASRLoop() {
+                             float m_end_time = -1.0f;
+                             
+                             size_t current_char = 0;
+-                            for(int t=0; t<result->count; t++) {
+-                                string tok = result->tokens_arr[t];
++                            for(int t=0; t<token_count; t++) {
++                                string tok = tokens[t];
+                                 size_t tok_len = tok.length();
+-                                float tok_start = result->timestamps[t];
+-                                float tok_end = (t < result->count - 1) ? result->timestamps[t+1] : (tok_start + 0.2f);
++                                float tok_start = token_times[t];
++                                float tok_end = (t < token_count - 1) ? token_times[t+1] : (tok_start + 0.2f);
+                                 
+                                 // Check overlap
+                                 size_t m_end_char = m_start_char + match.length();
+@@ -759,8 +764,8 @@ void ProfanityFilter::ASRLoop() {
+                             vector<string> text_pinyins;
+                             vector<int> pinyin_to_token;
+                             
+-                            for(int t=0; t<result->count; t++) {
+-                                string tok = result->tokens_arr[t];
++                            for(int t=0; t<token_count; t++) {
++                                string tok = tokens[t];
+                                 
+                                 // Try cache first
+                                 vector<string> pinyins;
+@@ -814,10 +819,10 @@ void ProfanityFilter::ASRLoop() {
+                                         
+                                         // Calculate char pos for processed_matches check
+                                         size_t char_pos = 0;
+-                                        for(int k=0; k<start_token; k++) char_pos += string(result->tokens_arr[k]).length();
++                                        for(int k=0; k<start_token; k++) char_pos += tokens[k].length();
+                                         
+-                                        float start_time = result->timestamps[start_token];
+-                                        float end_time = (end_token < result->count - 1) ? result->timestamps[end_token+1] : (result->timestamps[end_token] + 0.2f);
++                                        float start_time = token_times[start_token];
++                                        float end_time = (end_token < token_count - 1) ? token_times[end_token+1] : (token_times[end_token] + 0.2f);
+                                         
+                                         uint64_t start_16k = last_reset_sample_16k + (uint64_t)(start_time * 16000.0f);
+                                         uint64_t end_16k = last_reset_sample_16k + (uint64_t)(end_time * 16000.0f);
+diff --git a/src/utils.cpp b/src/utils.cpp
+index 5205478..7bebb4e 100644
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -39,3 +39,55 @@ bool ParsePinyinWords(const std::string& text, std::vector<std::vector<std::stri
+     patterns = std::move(parsed);
+     return true;
+ }
++
++static int byte_token_value(const char *tok) {
++    // Exactly "<0xHH>"
++    if (!tok || tok[0] != '<' || tok[1] != '0' || (tok[2] != 'x' && tok[2] != 'X') || !tok[3] || !tok[4] ||
++        tok[5] != '>' || tok[6])
++        return -1;
++    auto hex = [](char c) {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++        return -1;
++    };
++    int hi = hex(tok[3]), lo = hex(tok[4]);
++    return hi < 0 || lo < 0 ? -1 : hi * 16 + lo;
++}
++
++static int utf8_length(int lead) {
++    if (lead >= 0xC2 && lead <= 0xDF) return 2;
++    if (lead >= 0xE0 && lead <= 0xEF) return 3;
++    if (lead >= 0xF0 && lead <= 0xF4) return 4;
++    return 0; // ASCII is never byte-encoded by these models; continuation/invalid lead
++}
++
++void MergeByteTokens(const char *const *tokens, const float *timestamps, int count,
++                     std::vector<std::string> &out_tokens, std::vector<float> &out_times) {
++    out_tokens.clear();
++    out_times.clear();
++    for (int i = 0; i < count; ++i) {
++        int lead = byte_token_value(tokens[i]);
++        int need = lead < 0 ? 0 : utf8_length(lead);
++        bool merged = false;
++        if (need && i + need <= count) {
++            std::string ch(1, (char)lead);
++            int k = 1;
++            for (; k < need; ++k) {
++                int b = byte_token_value(tokens[i + k]);
++                if (b < 0x80 || b > 0xBF) break;
++                ch += (char)b;
++            }
++            if (k == need) {
++                out_tokens.push_back(ch);
++                out_times.push_back(timestamps[i]);
++                i += need - 1;
++                merged = true;
++            }
++        }
++        if (!merged) {
++            out_tokens.push_back(tokens[i] ? tokens[i] : "");
++            out_times.push_back(timestamps[i]);
++        }
++    }
++}
+diff --git a/src/utils.hpp b/src/utils.hpp
+index 2add296..dbf3d01 100644
+--- a/src/utils.hpp
++++ b/src/utils.hpp
+@@ -6,3 +6,10 @@
+ std::string NormalizePinyin(const std::string& p);
+ bool ParsePinyinWords(const std::string& text, std::vector<std::vector<std::string>>& patterns,
+                       std::string& error);
++
++// Streaming models emit characters missing from their vocabulary as byte-fallback
++// tokens ("<0xE5>", "<0x8D>", ...). Merge each complete UTF-8 sequence of such tokens
++// into one token (timestamp of its first byte) so text and pinyin matching see the
++// real character. Incomplete or invalid sequences are kept as the original tokens.
++void MergeByteTokens(const char *const *tokens, const float *timestamps, int count,
++                     std::vector<std::string> &out_tokens, std::vector<float> &out_times);

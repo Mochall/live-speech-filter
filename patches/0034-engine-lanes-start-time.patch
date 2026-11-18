@@ -1,0 +1,371 @@
+From 3f0d9c32ab1faac1ef453c343443156bb23ac7b3 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Fri, 13 Nov 2026 10:34:45 -0700
+Subject: [PATCH] censor-engine: the segment start_time in the recognizer
+ result is used for word times after an endpoint reset; optional fixed
+ recognizer feed size (fixed_chunk_16k) and parallel recognizer lanes offset
+ by lane_step_16k (each decoded on its own thread, a word found by any lane is
+ muted) for hosts that set them, the plugin keeps one lane; a match already
+ covered by an earlier mute, or the same word found again, extends the mute
+ without counting, logging or a late/dropped warning
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/censor-engine.cpp | 169 ++++++++++++++++++++++++++++++++----------
+ src/censor-engine.hpp |  28 ++++++-
+ 2 files changed, 153 insertions(+), 44 deletions(-)
+
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+index a8bcd34..9da55e7 100644
+--- a/src/censor-engine.cpp
++++ b/src/censor-engine.cpp
+@@ -9,6 +9,8 @@
+ #include <cmath>
+ #include <cstdarg>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <sstream>
+ 
+ using namespace std;
+@@ -76,10 +78,9 @@ CensorEngine::CensorEngine(CensorHost *h) : host(h) {
+ 
+ CensorEngine::~CensorEngine() {
+     Stop();
+-    if (stream) {
+-        SherpaOnnxDestroyOnlineStream(stream);
+-        stream = nullptr;
+-    }
++    for (auto &lane : lanes)
++        if (lane.stream) SherpaOnnxDestroyOnlineStream(lane.stream);
++    lanes.clear();
+     asr_model.reset();
+     asr_resampler.reset();
+ }
+@@ -102,10 +103,9 @@ void CensorEngine::LoadModel(const string& path, const string& provider, bool en
+         loading_target_path = path;
+     }
+     is_loading = true;
+-    if (stream) {
+-        SherpaOnnxDestroyOnlineStream(stream);
+-        stream = nullptr;
+-    }
++    for (auto &lane : lanes)
++        if (lane.stream) SherpaOnnxDestroyOnlineStream(lane.stream);
++    lanes.clear();
+ 
+     if (asr_model) {
+         // If this is the last instance, the underlying model will be destroyed here
+@@ -132,8 +132,8 @@ void CensorEngine::LoadModel(const string& path, const string& provider, bool en
+     asr_model = ModelManager::Get(path, provider, err);
+ 
+     if (asr_model && asr_model->recognizer) {
+-        stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-        if (!stream) {
++        RecreateLanes(0); // the ASR loop recreates them at the current position
++        if (lanes.empty()) {
+             lock_guard<mutex> lock(history_mutex);
+             initialization_error = "识别流创建失败";
+         }
+@@ -157,6 +157,29 @@ void CensorEngine::LoadModel(const string& path, const string& provider, bool en
+     is_loading = false;
+ }
+ 
++void CensorEngine::RecreateLanes(uint64_t pos_16k) {
++    for (auto &lane : lanes)
++        if (lane.stream) SherpaOnnxDestroyOnlineStream(lane.stream);
++    lanes.clear();
++    recent_mutes.clear();
++    if (!asr_model || !asr_model->recognizer) return;
++    vector<float> silence;
++    for (size_t i = 0; i < lane_count; i++) {
++        Lane lane;
++        lane.stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
++        if (!lane.stream) break;
++        lane.lead_16k = (uint32_t)(i * lane_step_16k);
++        if (lane.lead_16k) {
++            silence.assign(lane.lead_16k, 0.0f);
++            SherpaOnnxOnlineStreamAcceptWaveform(lane.stream, 16000, silence.data(), (int32_t)silence.size());
++        }
++        // Token times count from the first fed sample, lead_16k before pos_16k.
++        lane.base_16k = pos_16k - lane.lead_16k; // may wrap at the start; only sums are used
++        lane.reset_16k = lane.base_16k;
++        lanes.push_back(std::move(lane));
++    }
++}
++
+ void CensorEngine::Start() {
+     if (running) return;
+     running = true;
+@@ -200,6 +223,8 @@ void CensorEngine::ASRLoop() {
+         string target_provider;
+         bool asr_enable;
+         int model_offset_ms;
++        size_t fixed_chunk = 0;
++        bool lanes_changed = false;
+ 
+         {
+             CensorAsrSettings cfg;
+@@ -210,6 +235,14 @@ void CensorEngine::ASRLoop() {
+             asr_debug_logging = cfg.debug_logging;
+             asr_enable = cfg.enable;
+             model_offset_ms = cfg.model_offset_ms;
++            fixed_chunk = cfg.fixed_chunk_16k > 0 ? (size_t)cfg.fixed_chunk_16k : 0;
++            size_t want_lanes = (size_t)std::clamp(cfg.recognizer_lanes, 1, 8);
++            uint32_t want_step = (uint32_t)std::clamp(cfg.lane_step_16k, 0, 16000);
++            if (want_lanes != lane_count || want_step != lane_step_16k) {
++                lane_count = want_lanes;
++                lane_step_16k = want_step;
++                lanes_changed = true;
++            }
+ 
+             // 获取 provider 设置
+             target_provider = cfg.provider;
+@@ -235,8 +268,7 @@ void CensorEngine::ASRLoop() {
+ 
+             if (needs_reload) {
+                 LoadModel(target, target_provider, asr_enable);
+-                // Reset stream implies resetting timestamp reference
+-                last_reset_sample_16k = total_samples_popped_16k;
++                RecreateLanes(total_samples_popped_16k);
+ 
+                 // Fix: Clear queue and processed matches to prevent latency accumulation and index collision
+                 {
+@@ -253,8 +285,8 @@ void CensorEngine::ASRLoop() {
+                     start_offset_input = (uint64_t)diff;
+                 }
+                 last_feed_offset = start_offset_input;
+-
+-                processed_matches.clear();
++            } else if (lanes_changed) {
++                RecreateLanes(total_samples_popped_16k);
+             }
+         }
+         
+@@ -271,27 +303,21 @@ void CensorEngine::ASRLoop() {
+             if (asr_dropped_16k) {
+                 total_samples_popped_16k += asr_dropped_16k;
+                 asr_dropped_16k = 0;
+-                if (asr_model && asr_model->recognizer && stream) {
+-                    SherpaOnnxDestroyOnlineStream(stream);
+-                    stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-                }
+-                last_reset_sample_16k = total_samples_popped_16k;
+-                processed_matches.clear();
++                RecreateLanes(total_samples_popped_16k);
+                 {
+                     lock_guard<mutex> h_lock(history_mutex);
+                     current_partial_text = "";
+                 }
+             }
+-            if (!asr_queue.empty()) {
++            if (fixed_chunk && !asr_queue.empty() && asr_queue.size() < fixed_chunk) {
++                // Fixed chunks: wait for a full one (the timeline re-sync below assumes an empty queue).
++            } else if (!asr_queue.empty()) {
+                 // Gap Check: If start_offset_input jumped significantly (e.g. > 0.5s), reset stream
+                 // This handles cases where filter was disabled/idle for a long time, ensuring fresh context
+                 // and preventing latency accumulation from stale state.
+                 if (start_offset_input > last_feed_offset + (uint64_t)(current_sr * 0.5)) {
+-                        if (asr_model && asr_model->recognizer && stream) {
+-                            SherpaOnnxDestroyOnlineStream(stream);
+-                            stream = SherpaOnnxCreateOnlineStream(asr_model->recognizer);
+-                            last_reset_sample_16k = total_samples_popped_16k;
+-                            processed_matches.clear();
++                        if (asr_model && asr_model->recognizer && !lanes.empty()) {
++                            RecreateLanes(total_samples_popped_16k);
+                             {
+                                 lock_guard<mutex> h_lock(history_mutex);
+                                 current_partial_text = "";
+@@ -300,7 +326,7 @@ void CensorEngine::ASRLoop() {
+                 }
+                 last_feed_offset = start_offset_input;
+ 
+-                size_t n = min((size_t)3200, asr_queue.size()); 
++                size_t n = fixed_chunk ? fixed_chunk : min((size_t)3200, asr_queue.size());
+                 chunk.assign(asr_queue.begin(), asr_queue.begin() + n);
+                 asr_queue.erase(asr_queue.begin(), asr_queue.begin() + n);
+             } else {
+@@ -335,14 +361,41 @@ void CensorEngine::ASRLoop() {
+         // normal-level speech up to 31.6x and clipped it at +-1, which cost recognitions.
+         const vector<float> &model_chunk = chunk;
+ 
+-        if (asr_model && asr_model->recognizer && stream) {
+-            SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, model_chunk.data(), (int32_t)model_chunk.size());
+-            while (SherpaOnnxIsOnlineStreamReady(asr_model->recognizer, stream)) {
+-                SherpaOnnxDecodeOnlineStream(asr_model->recognizer, stream);
+-            }
++        if (asr_model && asr_model->recognizer && !lanes.empty()) {
++            // Each stream decodes on its own thread (one stream already needs about 0.4 of a core;
++            // decoding several in turn on this thread fell behind). ONNX Runtime sessions allow
++            // concurrent Run calls, and the streams share no state.
++            const SherpaOnnxOnlineRecognizer *recognizer = asr_model->recognizer;
++            auto decode = [&](const SherpaOnnxOnlineStream *s) {
++                SherpaOnnxOnlineStreamAcceptWaveform(s, 16000, model_chunk.data(), (int32_t)model_chunk.size());
++                while (SherpaOnnxIsOnlineStreamReady(recognizer, s)) SherpaOnnxDecodeOnlineStream(recognizer, s);
++            };
++            vector<thread> decoders;
++            for (size_t i = 1; i < lanes.size(); i++) decoders.emplace_back(decode, lanes[i].stream);
++            decode(lanes[0].stream);
++            for (auto &t : decoders) t.join();
++        }
++        for (size_t lane_index = 0; asr_model && asr_model->recognizer && lane_index < lanes.size(); lane_index++) {
++            Lane &lane = lanes[lane_index];
++            const SherpaOnnxOnlineStream *stream = lane.stream;
++            uint64_t &last_reset_sample_16k = lane.reset_16k;
++            std::set<size_t> &processed_matches = lane.processed_matches;
+             
+             const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(asr_model->recognizer, stream);
+             if (result) {
++                // Token times are relative to the current segment. After an endpoint reset the
++                // segment starts where decoding had got to (sherpa-onnx start_time, in 10 ms feature
++                // frames since the stream was created), not at the end of the audio fed so far: up to
++                // a model chunk of fed audio may still be undecoded. Using the fed position put every
++                // word of the segment that much too late, so its start could be heard.
++                if (result->json) {
++                    const char *st = strstr(result->json, "\"start_time\":");
++                    if (st) {
++                        double start_s = atof(st + 13);
++                        if (start_s >= 0)
++                            last_reset_sample_16k = lane.base_16k + (uint64_t)llround(start_s * 16000.0);
++                    }
++                }
+                 // Get Patterns and Config from Global
+                 CensorLexicon lexicon;
+                 host->GetLexicon(lexicon);
+@@ -362,7 +415,7 @@ void CensorEngine::ASRLoop() {
+                     for(int i=0; i<token_count; i++) full_text += tokens[i];
+ 
+                     // Stream results are revisable partials, not a final transcript.
+-                    if (asr_debug_logging && !full_text.empty() &&
++                    if (asr_debug_logging && lane_index == 0 && !full_text.empty() &&
+                         (full_text != last_debug_text || last_reset_sample_16k != last_debug_segment)) {
+                         const string source_name = host->SourceName();
+                         double segment_seconds = last_reset_sample_16k / 16000.0 +
+@@ -379,7 +432,7 @@ void CensorEngine::ASRLoop() {
+                         last_debug_segment = last_reset_sample_16k;
+                     }
+                     
+-                    if (!full_text.empty()) {
++                    if (lane_index == 0 && !full_text.empty()) {
+                         {
+                             lock_guard<mutex> lock(history_mutex);
+                             current_partial_text = full_text;
+@@ -618,12 +671,45 @@ void CensorEngine::ASRLoop() {
+                     for(const auto& m : candidates) {
+                         // Skip if already processed in previous frames
+                         if (processed_matches.count(m.start_char)) continue;
+-                        
+-                        {
++
++                        // Another lane may already have sent this word. Skip it when an earlier mute
++                        // covers it; when it only overlaps, the unmuted part starts at the earlier end.
++                        // The late check then only looks at the part of the word itself (without padding)
++                        // that no earlier mute covers.
++                        bool covered = false, same_word = false;
++                        const uint64_t pad = (uint64_t)((censor_padding_ms / 1000.0) * current_sr);
++                        const uint64_t word_end = m.end_sample > pad ? m.end_sample - pad : 0;
++                        uint64_t word_start = m.word_start;
++                        for (const auto &r : recent_mutes) {
++                            if (r.first <= m.start_sample && r.second >= m.end_sample) covered = true;
++                            if (r.first < m.end_sample && r.second > m.start_sample &&
++                                r.first <= word_start && r.second > word_start)
++                                word_start = r.second;
++                        }
++                        // Half or more of the word inside one earlier mute: the same word again (another
++                        // lane, or this lane revising its text so the match moved). Only extend the mute.
++                        for (const auto &r : recent_mutes) {
++                            uint64_t a = max(r.first, m.word_start), b = min(r.second, word_end);
++                            if (word_end > m.word_start && b > a && (b - a) * 2 >= word_end - m.word_start) {
++                                same_word = true;
++                                word_start = UINT64_MAX;
++                            }
++                        }
++                        if (word_start >= word_end && word_start != m.word_start) {
++                            word_start = UINT64_MAX; // the word itself is already muted: only padding is added
++                            same_word = true;
++                        }
++                        if (!covered) {
+                             lock_guard<mutex> b_lock(beep_mutex);
+-                            pending_beeps.push_back({m.start_sample, m.end_sample, m.word_start});
+-                            censored_count++;
+-                            CLOG(censor::kLogInfo, "%s", m.log_text.c_str());
++                            pending_beeps.push_back({m.start_sample, m.end_sample, word_start});
++                            if (!same_word) {
++                                censored_count++;
++                                CLOG(censor::kLogInfo, "%s", m.log_text.c_str());
++                            } else if (asr_debug_logging) {
++                                CLOG(censor::kLogInfo, "%s (extended by stream %zu)", m.log_text.c_str(), lane_index);
++                            }
++                            recent_mutes.push_back({m.start_sample, m.end_sample});
++                            while (recent_mutes.size() > 64) recent_mutes.pop_front();
+                         }
+                         
+                         // Always mark as processed to prevent re-evaluation or double-application
+@@ -890,8 +976,9 @@ void CensorEngine::Process(float *const *planes, uint32_t frames, uint64_t times
+                 uint64_t end = it->end_sample;
+                 
+                 if (start >= end) {
+-                    size_t dropped = ++dropped_beeps_count;
+-                    if (dropped <= 5 || dropped % 10 == 0) {
++                    // A repeat of a word that is already muted (word_start == UINT64_MAX) is not a loss.
++                    size_t dropped = it->word_start == UINT64_MAX ? 0 : ++dropped_beeps_count;
++                    if (dropped && (dropped <= 5 || dropped % 10 == 0)) {
+                         CLOG(censor::kLogWarning, "Beep dropped! Latency > Delay. Increase delay setting. (Start: %llu, End: %llu, Head: %llu)", 
+                             (unsigned long long)start, (unsigned long long)end, (unsigned long long)play_head_pos);
+                     }
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+index bc4ac11..974f45c 100644
+--- a/src/censor-engine.hpp
++++ b/src/censor-engine.hpp
+@@ -40,6 +40,16 @@ struct CensorAsrSettings {
+     int censor_padding_ms = 500;
+     int model_offset_ms = 0;
+     bool debug_logging = false;
++    // 0: feed the recognizer whatever is queued (up to 3200 samples), as the plugin always did.
++    // N: feed exactly N samples at a time, waiting until that much is queued. The endpoint check
++    // then always falls on the same audio positions, so results no longer depend on thread timing.
++    int fixed_chunk_16k = 0;
++    // Number of recognizer streams run side by side on the same audio (1 = the plugin's single
++    // stream). Stream i starts lane_step_16k * i samples of silence ahead, so the model's 160 ms
++    // decode chunks fall on different audio positions; a word recognized by any stream is muted.
++    // The streaming model misses some words at some chunk positions and not at others.
++    int recognizer_lanes = 1;
++    int lane_step_16k = 1280;
+ };
+ 
+ // Read when the recognizer has a result.
+@@ -112,7 +122,21 @@ public:
+ 
+     // State
+     std::shared_ptr<ASRModel> asr_model;
+-    const SherpaOnnxOnlineStream *stream = nullptr;
++    // One recognizer stream (see CensorAsrSettings::recognizer_lanes). ASR thread only.
++    struct Lane {
++        const SherpaOnnxOnlineStream *stream = nullptr;
++        uint32_t lead_16k = 0;   // silence fed before the audio when the stream was created
++        uint64_t base_16k = 0;   // timeline position of the stream's first fed sample
++        uint64_t reset_16k = 0;  // start of the current recognizer segment (16 kHz samples)
++        std::set<size_t> processed_matches;
++    };
++    std::vector<Lane> lanes;
++    size_t lane_count = 1;
++    uint32_t lane_step_16k = 1280;
++    // Destroys all streams and, with a loaded model, creates lane_count new ones starting at pos.
++    void RecreateLanes(uint64_t pos_16k);
++    // Recent mute ranges (input samples) sent by any lane; a word already covered is not sent again.
++    std::deque<std::pair<uint64_t, uint64_t>> recent_mutes;
+ 
+     // Audio Buffer
+     struct ChannelBuffer {
+@@ -160,8 +184,6 @@ public:
+     std::string initialization_error = "";
+     std::atomic<bool> is_loading{false};
+ 
+-    uint64_t last_reset_sample_16k = 0;
+-    std::set<size_t> processed_matches;
+     std::atomic<size_t> dropped_beeps_count{0};
+     // Matches whose unpadded word start was already played before muting began.
+     std::atomic<size_t> late_beeps_count{0};
+-- 
+2.55.0.windows.5
+

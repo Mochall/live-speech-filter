@@ -1,0 +1,168 @@
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index f7de36c..f48c1ca 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -70,6 +70,7 @@ void GlobalConfig::Save() {
+         obs_data_set_string(data, "model_path", model_path.c_str());
+         obs_data_set_int(data, "model_offset_ms", model_offset_ms);
+         obs_data_set_double(data, "delay_seconds", delay_seconds);
++        obs_data_set_int(data, "censor_padding_ms", censor_padding_ms);
+         // dirty_words stored in external files now
+         obs_data_set_bool(data, "use_pinyin", use_pinyin);
+         obs_data_set_bool(data, "comedy_mode", comedy_mode);
+@@ -233,6 +234,9 @@ void GlobalConfig::Load() {
+ 
+         delay_seconds = obs_data_get_double(data, "delay_seconds");
+         if (delay_seconds < 0.01) delay_seconds = 0.5;
++        if (obs_data_has_user_value(data, "censor_padding_ms")) {
++            censor_padding_ms = (int)obs_data_get_int(data, "censor_padding_ms");
++        }
+         
+         use_pinyin = obs_data_get_bool(data, "use_pinyin");
+         
+@@ -394,6 +398,12 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     comboEffect->addItem("电报音效 (Telegraph)", 3);
+     
+     layoutAudio->addRow("全局延迟时间:", spinDelay);
++    spinCensorPadding = new QSpinBox();
++    spinCensorPadding->setRange(0, 5000);
++    spinCensorPadding->setSingleStep(100);
++    spinCensorPadding->setSuffix(" ms");
++    spinCensorPadding->setToolTip("在命中词开始前和结束后各扩展此时长。\n也会屏蔽相邻正常声音；不能补救完全未命中的词。\n全局延迟应大于前扩展时间，并留出识别耗时。");
++    layoutAudio->addRow("命中词前后各扩展:", spinCensorPadding);
+     layoutAudio->addRow("", chkEnableAGC);
+     layoutAudio->addRow("屏蔽音效:", comboEffect);
+     
+@@ -626,6 +636,7 @@ void ConfigDialog::LoadToUI() {
+     
+     spinModelOffset->setValue(cfg->model_offset_ms);
+     spinDelay->setValue((int)(cfg->delay_seconds * 1000));
++    spinCensorPadding->setValue(cfg->censor_padding_ms);
+     chkEnableAGC->setChecked(cfg->enable_agc);
+     
+     // Ensure we are in visible mode before setting text to avoid overwriting "Hidden" text
+@@ -822,7 +833,14 @@ void ConfigDialog::onBrowseModel() {
+     }
+ }
+ 
+-void ConfigDialog::onApply() {
++bool ConfigDialog::onApply() {
++    if (chkGlobalEnable->isChecked() && spinDelay->value() <= spinCensorPadding->value()) {
++        QMessageBox::warning(this, "缓存时间不足",
++            "全局延迟必须大于命中词前扩展时间，且应额外留出识别耗时。\n"
++            "例如前后各扩展1000ms，可先使用3000ms全局延迟测试。\n"
++            "已经播出的声音无法追回，请调整后应用。");
++        return false;
++    }
+     // Validation
+     if (chkGlobalEnable->isChecked()) {
+         QString path = editModelPath->text();
+@@ -841,7 +859,7 @@ void ConfigDialog::onApply() {
+                      "如果是自动下载的模型，可能解压失败或路径层级不正确。\n\n"
+                      "是否仍然保存设置?",
+                      QMessageBox::Yes | QMessageBox::No);
+-                 if (reply == QMessageBox::No) return;
++                 if (reply == QMessageBox::No) return false;
+              }
+         }
+     }
+@@ -857,6 +875,7 @@ void ConfigDialog::onApply() {
+         cfg->model_path = editModelPath->text().toStdString();
+         cfg->model_offset_ms = spinModelOffset->value();
+         cfg->delay_seconds = (double)spinDelay->value() / 1000.0;
++        cfg->censor_padding_ms = spinCensorPadding->value();
+         cfg->enable_agc = chkEnableAGC->isChecked();
+         
+         if (chkHideDirtyWords->isChecked()) {
+@@ -884,11 +903,11 @@ void ConfigDialog::onApply() {
+     if (old_enabled_state != cfg->video_delay_enabled) {
+         UpdateVideoDelayFiltersState();
+     }
++    return true;
+ }
+ 
+ void ConfigDialog::onSave() {
+-    onApply();
+-    accept();
++    if (onApply()) accept();
+ }
+ 
+ // --- GPU Runtime Slots ---
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 7a34d03..55eb76c 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -39,6 +39,7 @@ struct GlobalConfig {
+     std::string model_path;
+     int model_offset_ms = 0; // Model latency compensation
+     double delay_seconds = 0.5;
++    int censor_padding_ms = 1000;
+     std::string dirty_words_str; // Combined (for internal use)
+     std::string system_dirty_words_str; // Read-only built-in
+     std::string user_dirty_words_str;   // User custom
+@@ -79,7 +80,7 @@ public:
+ private slots:
+     void onBrowseModel();
+     void onSave();
+-    void onApply();
++    bool onApply();
+     void updateStatus();
+     void updateGpuStatus();
+     void onModelComboChanged(int index);
+@@ -108,6 +109,7 @@ private:
+     PluginModelManager *modelManager;
+ 
+     QSpinBox *spinDelay;
++    QSpinBox *spinCensorPadding;
+     QCheckBox *chkEnableAGC;
+     QTextEdit *editDirtyWords; // User Custom Words
+     QTextEdit *editSystemDirtyWords; // System Built-in Words (Read-only)
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 57f6df0..df4992d 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -201,6 +201,7 @@ void ProfanityFilter::ASRLoop() {
+     while (running) {
+         // Poll Global Config for model path changes and Gain settings
+         bool enable_agc = true;
++        int censor_padding_ms;
+         string target_provider = "cpu";
+ 
+         {
+@@ -209,6 +210,7 @@ void ProfanityFilter::ASRLoop() {
+ 
+             std::string desired_path = cfg->global_enable ? cfg->model_path : "";
+             enable_agc = cfg->enable_agc;
++            censor_padding_ms = cfg->censor_padding_ms;
+ 
+             // 获取 provider 设置
+             if (cfg->enable_gpu) {
+@@ -443,8 +445,7 @@ void ProfanityFilter::ASRLoop() {
+                                     end_abs = (end_abs > sub) ? end_abs - sub : 0;
+                                 }
+                                 
+-                                // Safe margin: 150ms = 0.15 * sr (Reduced from 400ms to avoid false positives)
+-                                uint32_t margin = (uint32_t)(0.15 * current_sr);
++                                uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
+                                 start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+                                 end_abs += margin; 
+                                 
+@@ -613,8 +614,7 @@ void ProfanityFilter::ASRLoop() {
+                                             end_abs = (end_abs > sub) ? end_abs - sub : 0;
+                                         }
+                                         
+-                                        // Safe margin: 150ms = 0.15 * sr
+-                                        uint32_t margin = (uint32_t)(0.15 * current_sr);
++                                        uint32_t margin = (uint32_t)((censor_padding_ms / 1000.0) * current_sr);
+                                         start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+                                         end_abs += margin; 
+                                         
+@@ -653,6 +653,8 @@ void ProfanityFilter::ASRLoop() {
+                         // Check overlap with currently selected candidates in this frame
+                         bool overlap = false;
+                         for(const auto& interval : covered_intervals) {
++                            // Normal mode must retain the tail of adjacent padded matches.
++                            if (!comedy_mode) break;
+                             if (m.start_sample < interval.second && m.end_sample > interval.first) {
+                                 overlap = true;
+                                 break;

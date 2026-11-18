@@ -1,0 +1,376 @@
+From a450cb6293fb3a9ddc03b6b45cffd7ab8c6ae57a Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 13:32:42 -0700
+Subject: [PATCH] bundled-model: X-ASR int8 default, quantized file names,
+ word-piece token spaces, silence default, VB-CABLE download button, lexicon
+ additions
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ data/builtin_dirty_words.txt |  2 +-
+ data/models.json             |  7 +++++
+ src/asr-model.cpp            | 56 +++++++++++-------------------------
+ src/model-manager.cpp        | 21 ++++++++++++++
+ src/model-manager.hpp        |  6 ++++
+ src/plugin-config.cpp        | 42 ++++++++++++++++++++++++++-
+ src/plugin-config.hpp        |  4 ++-
+ src/plugin-main.cpp          |  2 +-
+ src/utils.cpp                | 15 ++++++++--
+ 9 files changed, 108 insertions(+), 47 deletions(-)
+
+diff --git a/data/builtin_dirty_words.txt b/data/builtin_dirty_words.txt
+index 0121997..4ef26fc 100644
+--- a/data/builtin_dirty_words.txt
++++ b/data/builtin_dirty_words.txt
+@@ -1 +1 @@
+-卧槽, 他妈, 傻逼, 操, 逼的, 你妈, 死全家, 草, 尼马死了, 马没了, 尼玛, 畜生, 臭逼, 杂种, 鸡八, 阴道, 死母, 妈的, 靠, 滚, 滚蛋, 脑残, 智障, 弱智, 狗日的, 操你妈, 去你妈, 傻B, SB, CNM, NMSL, 贱人, 婊子, 烂货, 废物, 混蛋, 王八蛋, 龟孙, 屌, 几把, JB, 煞笔, 沙比, 孤儿, 二逼, 逗比, 憨批, 脑瘫, 狗东西, 狗杂种, 狗娘养的, 骚货, 变态, 色狼, 流氓, 无赖, 泼妇, 垃圾, 渣滓, 败类, 人渣, 禽兽, 没屁眼, 断子绝孙, 全家暴毙, 操你大爷, 干你娘, 顶你个肺, 丢你楼某, 扑街, 废柴, 衰仔, 娘希匹, 狗屁, 滚犊子, 找死, 弄死你, 砍死你, 恶心, 搅屎棍, 饭桶, 白痴, 笨蛋, 蠢猪, 猪头, 猪脑子, 脑子进水, 脑子有坑, 神经病, 疯子, 傻子, 呆子, 弱鸡, 辣鸡, 菜逼, 坑货, 妈卖批, MMP, WQNMLGB, 草泥马, 泥煤, 奶奶个腿, 鳖孙, 兔崽子, 龟儿子, 傻屌, 傻吊, 屌丝, 装逼, 撕逼, 二货, 蠢货, 呆瓜, 傻瓜, 傻缺, 脑缺, 杠精, 键盘侠, 喷子, 舔狗, 绿茶婊, 心机婊, 屁眼, 菊花, 爆菊, 死太监, 奴才, 走狗, 汉奸, 卖国贼, 瞎逼逼, 满嘴喷粪, 仙人板板, 瓜娃子, 瓜皮, 宝器, 方脑壳, 铲铲, 锤子, 瘪犊子, 王八羔子, 绝户, 灵车漂移, 骨灰拌饭, 棺材板, 肏你祖宗十八代, 祖宗十八代, 全家死光, 冚家铲, 咸家铲, 屌你老母, 屌你老母臭閪, 臭閪, 烂閪, 哈麻批, 日你妈, 日你先人, 吃屎, 去死, 烂人, 贱货, 烂逼, 卖批, 烂裤裆, 野种, 孽种, 破鞋, 小赤佬
+\ No newline at end of file
++卧槽, 他妈, 傻逼, 操, 逼的, 你妈, 死全家, 草, 尼马死了, 马没了, 尼玛, 畜生, 臭逼, 杂种, 鸡八, 阴道, 死母, 妈的, 靠, 滚, 滚蛋, 脑残, 智障, 弱智, 狗日的, 操你妈, 去你妈, 傻B, SB, CNM, NMSL, 贱人, 婊子, 烂货, 废物, 混蛋, 王八蛋, 龟孙, 屌, 几把, JB, 煞笔, 沙比, 孤儿, 二逼, 逗比, 憨批, 脑瘫, 狗东西, 狗杂种, 狗娘养的, 骚货, 变态, 色狼, 流氓, 无赖, 泼妇, 垃圾, 渣滓, 败类, 人渣, 禽兽, 没屁眼, 断子绝孙, 全家暴毙, 操你大爷, 干你娘, 顶你个肺, 丢你楼某, 扑街, 废柴, 衰仔, 娘希匹, 狗屁, 滚犊子, 找死, 弄死你, 砍死你, 恶心, 搅屎棍, 饭桶, 白痴, 笨蛋, 蠢猪, 猪头, 猪脑子, 脑子进水, 脑子有坑, 神经病, 疯子, 傻子, 呆子, 弱鸡, 辣鸡, 菜逼, 坑货, 妈卖批, MMP, WQNMLGB, 草泥马, 泥煤, 奶奶个腿, 鳖孙, 兔崽子, 龟儿子, 傻屌, 傻吊, 屌丝, 装逼, 撕逼, 二货, 蠢货, 呆瓜, 傻瓜, 傻缺, 脑缺, 杠精, 键盘侠, 喷子, 舔狗, 绿茶婊, 心机婊, 屁眼, 菊花, 爆菊, 死太监, 奴才, 走狗, 汉奸, 卖国贼, 瞎逼逼, 满嘴喷粪, 仙人板板, 瓜娃子, 瓜皮, 宝器, 方脑壳, 铲铲, 锤子, 瘪犊子, 王八羔子, 绝户, 灵车漂移, 骨灰拌饭, 棺材板, 肏你祖宗十八代, 祖宗十八代, 全家死光, 冚家铲, 咸家铲, 屌你老母, 屌你老母臭閪, 臭閪, 烂閪, 哈麻批, 日你妈, 日你先人, 吃屎, 去死, 烂人, 贱货, 烂逼, 卖批, 烂裤裆, 野种, 孽种, 破鞋, 小赤佬, 个[逼], 妈个逼
+\ No newline at end of file
+diff --git a/data/models.json b/data/models.json
+index 9b82b22..dd32745 100644
+--- a/data/models.json
++++ b/data/models.json
+@@ -1,5 +1,12 @@
+ {
+   "models": [
++    {
++      "name": "[130MB]推荐（随插件安装）",
++      "url": "",
++      "id": "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05",
++      "offset": 0,
++      "delay": 1000
++    },
+     {
+       "name": "[54M]轻量",
+       "url": "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.zip",
+diff --git a/src/asr-model.cpp b/src/asr-model.cpp
+index 54b512c..ab47cb1 100644
+--- a/src/asr-model.cpp
++++ b/src/asr-model.cpp
+@@ -13,49 +13,25 @@ ASRModel::ASRModel(const std::string& path, const std::string& prov, std::string
+     config.feat_config.feature_dim = 80;
+ 
+     std::string tokens = model_path + "/tokens.txt";
+-    std::string encoder = model_path + "/encoder-epoch-99-avg-1.onnx";
+-
+-    // Check files existence
+-    FILE *f = fopen(tokens.c_str(), "r");
+-    if (!f) {
+-            error_msg = "文件缺失: tokens.txt";
+-            return;
+-    }
+-    fclose(f);
+-
+-    f = fopen(encoder.c_str(), "r");
+-    if (f) { fclose(f); } else {
+-        encoder = model_path + "/encoder.onnx";
+-        f = fopen(encoder.c_str(), "r");
+-        if (!f) {
+-            error_msg = "文件缺失: encoder.onnx (或 epoch-99)";
+-            return;
++    std::string encoder, decoder, joiner;
++    // First existing name wins: upstream epoch-99 export, plain FP32, then the int8/fp16
++    // quantized releases (int8 ships decoder.onnx un-quantized next to the int8 encoder/joiner).
++    auto pick = [this](const char *part, std::string &out) {
++        for (const char *suffix : {"-epoch-99-avg-1.onnx", ".onnx", ".int8.onnx", ".fp16.onnx"}) {
++            std::string candidate = model_path + "/" + part + suffix;
++            if (FILE *file = fopen(candidate.c_str(), "r")) {
++                fclose(file);
++                out = candidate;
++                return true;
++            }
+         }
+-        fclose(f);
+-    }
+-
+-    std::string decoder = model_path + "/decoder-epoch-99-avg-1.onnx";
+-    f = fopen(decoder.c_str(), "r");
+-    if (f) { fclose(f); } else {
+-        decoder = model_path + "/decoder.onnx";
+-        f = fopen(decoder.c_str(), "r");
+-        if (!f) {
+-            error_msg = "文件缺失: decoder.onnx (或 epoch-99)";
+-            return;
+-        }
+-        fclose(f);
+-    }
+-
+-    std::string joiner = model_path + "/joiner-epoch-99-avg-1.onnx";
+-    f = fopen(joiner.c_str(), "r");
+-    if (f) { fclose(f); } else {
+-        joiner = model_path + "/joiner.onnx";
+-        f = fopen(joiner.c_str(), "r");
+-        if (!f) {
+-            error_msg = "文件缺失: joiner.onnx (或 epoch-99)";
++        return false;
++    };
++    for (auto [part, out] : {std::pair<const char *, std::string *>{"encoder", &encoder}, {"decoder", &decoder}, {"joiner", &joiner}}) {
++        if (!pick(part, *out)) {
++            error_msg = std::string("文件缺失: ") + part + ".onnx (或 epoch-99 / int8 / fp16)";
+             return;
+         }
+-        fclose(f);
+     }
+ 
+     config.model_config.transducer.encoder = encoder.c_str();
+diff --git a/src/model-manager.cpp b/src/model-manager.cpp
+index 76bba8d..3878e63 100644
+--- a/src/model-manager.cpp
++++ b/src/model-manager.cpp
+@@ -57,6 +57,13 @@ void PluginModelManager::LoadModels(const QString &jsonPath) {
+     if (models.empty()) {
+         BLOG(LOG_INFO, "No models loaded, using default fallback models");
+         models = {
++            {
++                "[130MB]推荐（随插件安装）",
++                "",
++                "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05",
++                0,
++                1000
++            },
+             {
+                 "[54M]轻量",
+                 "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.zip",
+@@ -88,7 +95,20 @@ const std::vector<ModelInfo>& PluginModelManager::GetModels() const {
+     return models;
+ }
+ 
++QString PluginModelManager::BundledModelPath(const QString &modelId) {
++    if (modelId.isEmpty()) return QString();
++    char *path = obs_find_module_file(obs_current_module(), ("models/" + modelId).toUtf8().constData());
++    if (!path) return QString();
++    QString result = QString::fromUtf8(path);
++    bfree(path);
++    // obs_find_module_file is relative to the OBS working directory in portable mode;
++    // the path is saved in the config, so store it absolute.
++    return QFileInfo::exists(QDir(result).filePath("tokens.txt")) ? QDir(result).absolutePath() : QString();
++}
++
+ QString PluginModelManager::GetModelPath(const QString &modelId) const {
++    QString bundled = BundledModelPath(modelId);
++    if (!bundled.isEmpty()) return bundled;
+     // We store models in the plugin config directory under "models" subdirectory
+     char *path = obs_module_get_config_path(obs_current_module(), "models");
+     if (!path) return QString();
+@@ -109,6 +129,7 @@ bool PluginModelManager::IsModelInstalled(const QString &modelId) const {
+ }
+ 
+ bool PluginModelManager::DeleteModel(const QString &modelId) {
++    if (IsBundled(modelId)) return false; // removed by the plugin uninstaller only
+     QString path = GetModelPath(modelId);
+     if (path.isEmpty()) return false;
+ 
+diff --git a/src/model-manager.hpp b/src/model-manager.hpp
+index 75a9527..c383445 100644
+--- a/src/model-manager.hpp
++++ b/src/model-manager.hpp
+@@ -30,6 +30,12 @@ public:
+ 
+     // Get the full path to the installed model directory
+     QString GetModelPath(const QString &modelId) const;
++    // Model shipped by the installer in the plugin data folder ("models/<id>"), or empty.
++    static QString BundledModelPath(const QString &modelId);
++    // Default for a new configuration: X-ASR zh-en 160ms int8 (2026-06-05, Apache-2.0), chosen
++    // in ASR_COMPARISON_RESULTS.md; the installer ships it under the plugin data folder.
++    static constexpr const char *kDefaultModelId = "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05";
++    bool IsBundled(const QString &modelId) const { return !BundledModelPath(modelId).isEmpty(); }
+ 
+     // Start downloading a model
+     void DownloadModel(const QString &modelId);
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 793d04e..321225a 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -13,6 +13,8 @@
+ #include <sstream>
+ #include <iomanip>
+ #include <QPointer>
++#include <QDesktopServices>
++#include <QUrl>
+ #include <QJsonDocument>
+ #include <QJsonObject>
+ #include <QJsonArray>
+@@ -276,9 +278,14 @@ void GlobalConfig::Load() {
+ 
+     // 3. Load JSON config
+     string json_path = get_config_path("global_config.json");
++    auto default_model = [this] {
++        if (model_path.empty())
++            model_path = PluginModelManager::BundledModelPath(PluginModelManager::kDefaultModelId).toStdString();
++    };
+     
+     if (json_path.empty() || !filesystem::exists(json_path)) {
+         is_first_run = true;
++        default_model();
+         NormalizeDelay();
+         ParsePatterns();
+         return;
+@@ -295,6 +302,7 @@ void GlobalConfig::Load() {
+ 
+         const char* s = obs_data_get_string(data, "model_path");
+         model_path = s ? s : "";
++        default_model();
+         
+         if (obs_data_has_user_value(data, "model_offset_ms")) {
+             model_offset_ms = obs_data_get_int(data, "model_offset_ms");
+@@ -565,12 +573,16 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         updateCompanionUI();
+     });
++    btnInstallCable = new QPushButton("下载安装VB-CABLE…");
++    btnInstallCable->setToolTip("打开VB-CABLE官网下载页（vb-cable.com）。直播伴侣模式需要它把过滤后的声音送进伴侣。");
++    connect(btnInstallCable, &QPushButton::clicked, this, [this] { openCableDownload(); });
+     QPushButton *btnChecklist = new QPushButton("伴侣端设置清单…");
+     connect(btnChecklist, &QPushButton::clicked, this, [this] {
+         showCompanionChecklist();
+         updateCompanionUI();
+     });
+     QHBoxLayout *companionButtons = new QHBoxLayout();
++    companionButtons->addWidget(btnInstallCable);
+     companionButtons->addWidget(btnFixDefaults);
+     companionButtons->addWidget(btnChecklist);
+     companionButtons->addStretch();
+@@ -922,6 +934,13 @@ void ConfigDialog::onModelComboChanged(int index) {
+         editModelPath->setText(path);
+         
+         bool installed = modelManager->IsModelInstalled(id);
++        if (modelManager->IsBundled(id)) {
++            btnDownloadModel->setVisible(false);
++            progressDownload->setVisible(false);
++            lblDownloadStatus->setText("✅ 已随插件安装 (Ready)");
++            lblDownloadStatus->setVisible(true);
++            return;
++        }
+         btnDownloadModel->setVisible(true);
+         btnDownloadModel->setEnabled(true);
+         progressDownload->setVisible(false);
+@@ -1158,6 +1177,7 @@ bool ConfigDialog::onApply() {
+             if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
+             else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         }
++        if (GetCableRenderState() == CableRenderState::NotInstalled) openCableDownload();
+         showCompanionChecklist();
+     }
+     if (old_cable_auto_disable && !cfg->cable_auto_disable && GetCableRenderState() == CableRenderState::Disabled)
+@@ -1168,6 +1188,24 @@ bool ConfigDialog::onApply() {
+     return true;
+ }
+ 
++// VB-CABLE may be redistributed only as is and not inside another installer (its
++// license), so the plugin links to the official download and explains the steps.
++void ConfigDialog::openCableDownload() {
++    QMessageBox box(this);
++    box.setWindowTitle("安装VB-CABLE");
++    box.setIcon(QMessageBox::Information);
++    box.setText("直播伴侣模式需要虚拟声卡VB-CABLE，把过滤后的声音送进伴侣。");
++    box.setInformativeText("1. 在打开的官网页面下载 VB-CABLE Driver（如果插件安装包旁边已有 VBCABLE_Driver_Pack*.zip，可直接用它）\n"
++                           "2. 解压后右键 VBCABLE_Setup_x64.exe →“以管理员身份运行”→ Install Driver\n"
++                           "3. 重启电脑，再打开OBS\n\n"
++                           "安装后插件会自动处理：只在直播伴侣模式下启用它，并防止它被设成Windows默认设备。\n"
++                           "VB-CABLE是VB-Audio的捐赠软件（www.vb-cable.com），与本插件无关。");
++    QPushButton *open = box.addButton("打开下载页", QMessageBox::AcceptRole);
++    box.addButton("取消", QMessageBox::RejectRole);
++    box.exec();
++    if (box.clickedButton() == open) QDesktopServices::openUrl(QUrl("https://vb-audio.com/Cable/"));
++}
++
+ // Checklist for the companion app side, which the plugin cannot configure. Confirming
+ // clears the status-bar reminder; settings it can read are still checked every few seconds.
+ bool ConfigDialog::showCompanionChecklist() {
+@@ -1194,6 +1232,8 @@ bool ConfigDialog::showCompanionChecklist() {
+ void ConfigDialog::updateCompanionUI() {
+     auto st = QueryCompanionAudio();
+     std::string text;
++    btnInstallCable->setVisible(comboBroadcastMode->currentData().toInt() == 1 && st.supported &&
++                                GetCableRenderState() == CableRenderState::NotInstalled);
+     if (comboBroadcastMode->currentData().toInt() != 1) {
+         lblCompanion->setText("OBS自己推流：不需要VB-CABLE，也不需要直播伴侣。");
+         return;
+@@ -1201,7 +1241,7 @@ void ConfigDialog::updateCompanionUI() {
+     if (!st.supported) text = "仅支持Windows。";
+     else if (!st.cable_found && GetCableRenderState() == CableRenderState::Disabled)
+         text = "VB-CABLE已安装，当前处于停用状态（不影响其他软件），开启本模式后插件会自动启用。";
+-    else if (!st.cable_found) text = "未检测到VB-CABLE：请从 vb-cable.com 下载安装（安装后重启电脑），再开启本模式。";
++    else if (!st.cable_found) text = "未检测到VB-CABLE：请点下方“下载安装VB-CABLE…”，安装后重启电脑。";
+     else {
+         text = "已检测到 " + st.cable_name + "。";
+         if (st.console_is_cable || st.communications_is_cable)
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index a011035..ce565e8 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -58,7 +58,7 @@ struct GlobalConfig {
+     int censor_padding_ms = 500;
+     std::string dirty_words_str;
+     std::string pinyin_words_str;
+-    int audio_effect = 0; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
++    int audio_effect = 1; // 0=Beep, 1=Silence (default, user choice), 2=Squeaky, 3=Robot
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
+     bool enable_agc = true; // Automatic Gain Control (Default: ON)
+@@ -156,6 +156,8 @@ private:
+     QLabel *lblCompanion;
+     QComboBox *comboVoiceSource;
+     QCheckBox *chkCableAutoDisable;
++    QPushButton *btnInstallCable;
++    void openCableDownload();
+     QLabel *lblAudioSetup;
+     void updateCompanionUI();
+     QCheckBox *chkDelayAuto;
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index c238016..e32a890 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -441,7 +441,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         return;
+     }
+     if (!st.cable_found) {
+-        append_sync_warning("直播伴侣模式：未找到VB-CABLE虚拟声卡，请从 vb-cable.com 安装并重启电脑，伴侣现在收不到声音");
++        append_sync_warning("直播伴侣模式：未安装VB-CABLE虚拟声卡，伴侣收不到声音，请在插件设置点“下载安装VB-CABLE”");
+         return;
+     }
+     const char *name = nullptr, *id = nullptr;
+diff --git a/src/utils.cpp b/src/utils.cpp
+index 7bebb4e..b65be1e 100644
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -66,15 +66,24 @@ void MergeByteTokens(const char *const *tokens, const float *timestamps, int cou
+                      std::vector<std::string> &out_tokens, std::vector<float> &out_times) {
+     out_tokens.clear();
+     out_times.clear();
++    // Word-piece models (X-ASR) return word-initial tokens with a leading space. Drop it before
++    // Chinese so tokens concatenate like single-character models; keep it before Latin text so
++    // English words stay separated ("this boss" must not become "thisboss" and match "SB").
++    auto token = [&](int i) {
++        const char *t = tokens[i] ? tokens[i] : "";
++        const char *p = t;
++        while (*p == ' ') ++p;
++        return (unsigned char)*p >= 0x80 ? p : t;
++    };
+     for (int i = 0; i < count; ++i) {
+-        int lead = byte_token_value(tokens[i]);
++        int lead = byte_token_value(token(i));
+         int need = lead < 0 ? 0 : utf8_length(lead);
+         bool merged = false;
+         if (need && i + need <= count) {
+             std::string ch(1, (char)lead);
+             int k = 1;
+             for (; k < need; ++k) {
+-                int b = byte_token_value(tokens[i + k]);
++                int b = byte_token_value(token(i + k));
+                 if (b < 0x80 || b > 0xBF) break;
+                 ch += (char)b;
+             }
+@@ -86,7 +95,7 @@ void MergeByteTokens(const char *const *tokens, const float *timestamps, int cou
+             }
+         }
+         if (!merged) {
+-            out_tokens.push_back(tokens[i] ? tokens[i] : "");
++            out_tokens.push_back(token(i));
+             out_times.push_back(timestamps[i]);
+         }
+     }
+-- 
+2.55.0.windows.5
+

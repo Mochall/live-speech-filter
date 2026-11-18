@@ -1,0 +1,138 @@
+From 0db0e53993fa56a321c643e232df0c51ec2671d9 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Mon, 9 Nov 2026 04:24:09 -0700
+Subject: [PATCH] =?UTF-8?q?display-capture-check:=20with=20only=20a=20disp?=
+ =?UTF-8?q?lay=20capture=20(no=20game/window=20capture),=20the=20checklist?=
+ =?UTF-8?q?=20asks=20for=20a=20game=20capture;=20for=20teammate=20voice=20?=
+ =?UTF-8?q?in=20a=20voice=20program=20it=20flags=20missing=20game=20sound?=
+ =?UTF-8?q?=20when=20desktop=20audio=20is=20muted=20and=20no=20non-voice?=
+ =?UTF-8?q?=20application=20capture=20exists;=20for=20in-game=20voice=20a?=
+ =?UTF-8?q?=20filtered=20non-voice=20application=20capture=20is=20taken=20?=
+ =?UTF-8?q?as=20the=20game's=20sound=20and=20needs=20picture=20sync=20"alw?=
+ =?UTF-8?q?ays";=20on=20OBS=2028/29=20(no=20"=E9=87=87=E9=9B=86=E9=9F=B3?=
+ =?UTF-8?q?=E9=A2=91"=20option=20on=20game=20capture)=20the=20fix=20text?=
+ =?UTF-8?q?=20says=20to=20add=20an=20application=20audio=20capture=20inste?=
+ =?UTF-8?q?ad?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugin-main.cpp | 53 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 45822a2..3072923 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -757,7 +757,7 @@ static void scan_mic_devices(const std::vector<obs_source_t *> &sources) {
+     }
+ }
+ 
+-static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode, bool companion) {
++static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode, bool companion, int sync_mode) {
+     if (voice_app_tick++ % 3 == 0) voice_apps = ActiveVoiceApps();
+     const std::string F = "“语音消音”";
+     std::vector<std::string> lines;
+@@ -768,7 +768,12 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+     };
+     auto name = [](obs_source_t *s) { return std::string("“") + obs_source_get_name(s) + "”"; };
+ 
+-    std::vector<obs_source_t *> mics, desktops, apps, games, media, others;
++    // "采集音频" on game/window capture exists from OBS 30; before that the game's sound
++    // needs its own application audio capture.
++    static const bool capture_audio_option = (obs_get_version() >> 24) >= 30;
++    const std::string add_game_audio = capture_audio_option ? "双击它，勾选“采集音频”"
++                                                            : "来源列表点“+” → “应用程序音频采集”，窗口选游戏";
++    std::vector<obs_source_t *> mics, desktops, apps, games, displays, media, others;
+     for (auto *s : sources) {
+         if (!obs_source_active(s) || obs_source_get_type(s) != OBS_SOURCE_TYPE_INPUT) continue;
+         const char *id = obs_source_get_id(s);
+@@ -777,6 +782,7 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         else if (id_is(id, {"wasapi_output_capture", "coreaudio_output_capture", "pulse_output_capture"})) desktops.push_back(s);
+         else if (id_is(id, {"wasapi_process_output_capture"})) apps.push_back(s);
+         else if (id_is(id, {"game_capture", "window_capture"})) games.push_back(s);
++        else if (id_is(id, {"monitor_capture", "display_capture", "screen_capture", "xshm_input"})) displays.push_back(s);
+         else if (!(flags & OBS_SOURCE_AUDIO) || (flags & OBS_SOURCE_COMPOSITE) || !obs_source_audio_active(s)) continue;
+         else if (id_is(id, {"ffmpeg_source", "vlc_source", "browser_source"})) media.push_back(s);
+         else others.push_back(s);
+@@ -840,10 +846,14 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+     // filtered whatever the choice above (e.g. a KOOK capture left over after switching
+     // to in-game voice); another program is only flagged as possibly being one.
+     bool voice_captured = false;
++    // In-game voice with only a display capture: a filtered non-voice application capture
++    // is reported below as the game's sound.
++    bool display_game = mode == 2 && games.empty() && !displays.empty();
+     for (auto *a : apps) {
+         if (is_game_app(a)) continue;
+         bool voice = IsVoiceAppExe(window_exe(a));
+         bool filtered = has_recognizing_filter(a);
++        if (display_game && !voice && filtered && audible(a)) continue;
+         voice_captured |= voice || filtered;
+         if (!audible(a)) lines.push_back("· 应用程序音频" + name(a) + "已静音");
+         else if (voice && filtered) lines.push_back("✓ 队友语音" + name(a) + "已消音");
+@@ -864,9 +874,18 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+             if (audio && has_recognizing_filter(audio))
+                 lines.push_back("· 游戏声音" + name(audio) + "也加了消音滤镜：队友语音在语音软件里时游戏声音不需要消音，删掉它的滤镜可让画面不延迟");
+             else if (audio) lines.push_back("✓ 游戏声音" + name(audio) + "已采集（不消音）");
+-            else bad("游戏采集" + name(g) + "没有采集声音，桌面音频静音后直播里没有游戏声音 → 双击它，勾选“采集音频”");
++            else bad("游戏采集" + name(g) + "没有采集声音，桌面音频静音后直播里没有游戏声音 → " + add_game_audio);
+         }
+-        if (games.empty()) lines.push_back("· 没有找到游戏采集或窗口采集");
++        // Display capture only: it carries no sound, and the plugin cannot tell which
++        // program is the game. Ask for a game capture; a separate application capture
++        // (not a voice program) is accepted as the game's sound.
++        bool other_app = false;
++        for (auto *a : apps) other_app |= !IsVoiceAppExe(window_exe(a)) && audible(a);
++        if (games.empty() && !displays.empty() && !desktop_on && !other_app)
++            bad("显示器采集" + name(displays.front()) + "不带声音，桌面音频静音后直播里没有游戏声音 → 改用“游戏采集”" +
++                (capture_audio_option ? "并勾选“采集音频”" : "") +
++                "；游戏采集黑屏时保留显示器采集，另加“应用程序音频采集”，窗口选游戏");
++        else if (games.empty()) lines.push_back("· 没有找到游戏采集或窗口采集");
+     } else {
+         obs_source_t *ok = nullptr, *no_filter = nullptr, *no_audio = nullptr;
+         for (auto *g : games) {
+@@ -877,8 +896,28 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         }
+         if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已消音，画面自动同步");
+         else if (no_filter) bad("游戏声音" + name(no_filter) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", no_filter));
+-        else if (no_audio) bad("游戏采集" + name(no_audio) + "没有采集声音 → 双击它，勾选“采集音频”，再右键它 → 滤镜 → 添加" + F);
+-        else bad("没有找到游戏采集 → 来源列表点“+” → “游戏采集”，勾选“采集音频”，再添加" + F);
++        else if (no_audio)
++            bad("游戏采集" + name(no_audio) + "没有采集声音 → " + add_game_audio + "，再右键" +
++                (capture_audio_option ? "它" : "这个音频采集") + " → 滤镜 → 添加" + F);
++        else if (!displays.empty()) {
++            // Display capture: a filtered application capture that is not a voice program
++            // is taken as the game's sound; the picture is delayed only when picture sync
++            // is set to always (automatic sync cannot tell it is the game).
++            obs_source_t *filtered = nullptr;
++            for (auto *a : apps)
++                if (!IsVoiceAppExe(window_exe(a)) && audible(a) && has_recognizing_filter(a)) filtered = a;
++            if (filtered && sync_mode == 1)
++                lines.push_back("✓ 游戏声音（含队友语音）" + name(filtered) + "已消音，画面同步为“总是”");
++            else if (filtered)
++                bad("游戏声音" + name(filtered) + "已消音，但用的是显示器采集，插件分不出这是游戏声音，画面不会延迟，直播里声音会比画面晚 → 下方“画面同步”改为“总是”，或改用“游戏采集”");
++            else
++                bad("显示器采集" + name(displays.front()) + "分不出游戏声音 → 改用“游戏采集”" +
++                    (capture_audio_option ? "，勾选“采集音频”" : "") + "并添加" + F +
++                    "；游戏采集黑屏时另加“应用程序音频采集”选游戏、添加" + F + "，再把“画面同步”改为“总是”");
++        } else
++            bad("没有找到游戏采集 → 来源列表点“+” → “游戏采集”，" +
++                (capture_audio_option ? std::string("勾选“采集音频”，再添加") + F
++                                      : "再点“+” → “应用程序音频采集”选游戏，给它添加" + F));
+     }
+ 
+     // Media and browser sources (alert sounds, music, danmaku text-to-speech): information
+@@ -1023,7 +1062,7 @@ void UpdateVideoDelayFiltersState() {
+         scan_mic_devices(sources);
+         maintain_cable(companion, cable_auto_disable);
+         maintain_companion(sources, companion);
+-        check_audio_setup(sources, voice_source, companion);
++        check_audio_setup(sources, voice_source, companion, sync_mode);
+         if (changed)
+             blog(LOG_INFO, "[Speech Sync] picture sync %s (%s)", enable ? "on" : "off",
+                  enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,45 @@
+From e872e4fe9c81d17f895284906ea04ce09c11a9cb Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 02:57:32 -0700
+Subject: [PATCH] censor-engine: the engine keeps the last 64 mutes (start and
+ end on the total_samples_written timeline, guarded by beep_mutex) in
+ mute_history so a host can draw where the audience heard silence or the
+ replacement sound; the plugin does not read it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/censor-engine.cpp | 2 ++
+ src/censor-engine.hpp | 4 ++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+index fee9383..096a57a 100644
+--- a/src/censor-engine.cpp
++++ b/src/censor-engine.cpp
+@@ -790,6 +790,8 @@ void CensorEngine::ASRLoop() {
+                         if (!covered) {
+                             lock_guard<mutex> b_lock(beep_mutex);
+                             pending_beeps.push_back({m.start_sample, m.end_sample, word_start});
++                            mute_history.emplace_back(m.start_sample, m.end_sample);
++                            if (mute_history.size() > kMuteHistory) mute_history.pop_front();
+                             if (!same_word) {
+                                 censored_count++;
+                                 CLOG(censor::kLogInfo, "%s", m.log_text.c_str());
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+index bba549e..7875b39 100644
+--- a/src/censor-engine.hpp
++++ b/src/censor-engine.hpp
+@@ -182,6 +182,10 @@ public:
+     };
+     std::mutex beep_mutex;
+     std::vector<BeepRange> pending_beeps;
++    // Mutes as added (start, end with padding, on the total_samples_written timeline), newest last,
++    // at most kMuteHistory, guarded by beep_mutex. Not used by the engine: for hosts that draw them.
++    static constexpr size_t kMuteHistory = 64;
++    std::deque<std::pair<uint64_t, uint64_t>> mute_history;
+ 
+     std::string initialization_error = "";
+     std::atomic<bool> is_loading{false};
+-- 
+2.55.0.windows.5
+

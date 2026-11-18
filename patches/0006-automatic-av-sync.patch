@@ -1,0 +1,576 @@
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -9,26 +9,76 @@
+ #include <QLabel>
+ #include <QTimer>
+ #include <QPointer>
++#include <cstring>
++#include <util/platform.h>
+ 
+ static QPointer<QLabel> filter_warning;
+ static QPointer<QTimer> filter_warning_timer;
++static std::string sync_warning;
++static uint64_t scene_settle_until = 0;
++static std::mutex sync_warning_mutex;
++
++static void append_sync_warning(const std::string &message) {
++    std::lock_guard<std::mutex> lock(sync_warning_mutex);
++    if (!sync_warning.empty()) sync_warning += "；";
++    sync_warning += message;
++}
++
++static std::string get_sync_warning() {
++    std::lock_guard<std::mutex> lock(sync_warning_mutex);
++    return sync_warning;
++}
+ 
+ static void start_filter_warning() {
+     if (filter_warning) return;
+     auto *window = static_cast<QMainWindow *>(obs_frontend_get_main_window());
+     if (!window) return;
++    UpdateVideoDelayFiltersState();
+     filter_warning = new QLabel(window);
++    filter_warning->setObjectName("speechFilterStatus");
+     filter_warning->setWordWrap(true);
+-    filter_warning->setStyleSheet("color: #ffcc66; font-weight: bold; padding: 3px;");
+-    filter_warning->setToolTip("仅提醒主播，不进入直播画面。引擎未就绪时继续输出声音，不自动静音。此提示不检测识别线程卡死或语音漏识别。");
++    filter_warning->setToolTip("自动维护最终画面及独立音源的同量延迟。提醒仅显示在OBS，不进入直播画面。不能检测采集设备或平台引入的偏差、语音漏识别。异常时继续出声。");
+     window->statusBar()->addPermanentWidget(filter_warning, 1);
+-    filter_warning->hide();
+     filter_warning_timer = new QTimer(filter_warning);
+     QObject::connect(filter_warning_timer, &QTimer::timeout, filter_warning, [] {
++        UpdateVideoDelayFiltersState();
+         auto status = ProfanityFilter::GetGlobalModelStatus();
+-        bool warning = status.second.find("过滤未生效") != std::string::npos;
+-        filter_warning->setText(QString::fromStdString(status.second));
+-        filter_warning->setVisible(warning);
++        std::string message = get_sync_warning();
++        GlobalConfig *cfg = GetGlobalConfig();
++        bool syncing = false;
++        {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            syncing = cfg->global_enable && cfg->video_delay_enabled;
++        }
++        auto audio = syncing ? ProfanityFilter::GetAudioSyncWarning() : "";
++        if (syncing && os_gettime_ns() < scene_settle_until) {
++            if (!message.empty()) message += "；";
++            message += "场景切换后同步缓冲过渡中";
++        }
++        if (!audio.empty()) {
++            if (!message.empty()) message += "；";
++            message += audio;
++        }
++        auto video = VideoDelayFilter::GetSyncWarning();
++        if (!video.empty()) {
++            if (!message.empty()) message += "；";
++            message += video;
++        }
++        if (status.second.find("过滤未生效") != std::string::npos) {
++            if (!message.empty()) message += "；";
++            message += status.second;
++        }
++        filter_warning->setStyleSheet(message.empty()
++            ? "color: #88cc88; padding: 3px;"
++            : "color: #ffcc66; font-weight: bold; padding: 3px;");
++        filter_warning->setText(QString::fromStdString(message.empty()
++            ? (syncing ? "音画同步：自动维护中（画面与各独立音源使用同一延迟）" : "语音过滤与自动同步已关闭") : message));
++        static std::string last_message;
++        std::string current = filter_warning->text().toStdString();
++        if (current != last_message) {
++            blog(LOG_INFO, "[Speech Sync] %s", current.c_str());
++            last_message = current;
++        }
+     });
+     filter_warning_timer->start(1000);
+ }
+@@ -42,10 +92,11 @@
+ 
+ static void *create(obs_data_t *settings, obs_source_t *context) {
+     ProfanityFilter *filter = new ProfanityFilter(context);
+-    filter->enabled = obs_data_get_bool(settings, "enabled");
++    filter->delay_only = obs_data_get_bool(settings, "sync_delay_only");
++    filter->enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
+     filter->settings = settings;
+     obs_data_addref(settings);
+-    filter->Start();
++    if (!filter->delay_only) filter->Start();
+     return filter;
+ }
+ 
+@@ -63,7 +114,7 @@
+     filter->settings = settings;
+     if (old) obs_data_release(old);
+ 
+-    filter->enabled = obs_data_get_bool(settings, "enabled");
++    filter->enabled = !filter->delay_only && obs_data_get_bool(settings, "enabled");
+ }
+ 
+ static obs_properties_t *get_properties(void *data) {
+@@ -75,7 +126,10 @@
+         "请在 OBS 顶部菜单 【工具】 -> 【语音脏话屏蔽设置】 中配置模型路径、屏蔽词和延迟时间。\n"
+         "本滤镜仅提供开关功能，但会始终应用配置的延迟以保持音画同步。");
+ 
+-    obs_properties_add_bool(props, "enabled", "启用脏话过滤 (关闭时仅保留延迟)");
++    auto *filter = static_cast<ProfanityFilter *>(data);
++    if (filter && filter->delay_only) {
++        obs_property_set_long_description(usage, "此滤镜由音画同步自动维护，仅延迟声音，不加载模型或识别。需要过滤的KOOK音源请另加普通语音屏蔽滤镜；自动同步随后会移除重复的仅同步滤镜。");
++    } else obs_properties_add_bool(props, "enabled", "启用脏话过滤 (关闭时仅保留延迟)");
+     
+     return props;
+ }
+@@ -181,10 +235,19 @@
+         start_filter_warning();
+         GlobalConfig *cfg = GetGlobalConfig();
+         if (cfg && cfg->loaded && cfg->is_first_run) {
+-            UpdateVideoDelayFiltersState();
+             cfg->is_first_run = false;
+             cfg->Save();
+         }
++    } else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED ||
++               event == OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED ||
++               event == OBS_FRONTEND_EVENT_TRANSITION_CHANGED ||
++               event == OBS_FRONTEND_EVENT_TRANSITION_LIST_CHANGED) {
++        auto *cfg = GetGlobalConfig();
++        {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            scene_settle_until = os_gettime_ns() + (uint64_t)(cfg->delay_seconds * 1000000000.0);
++        }
++        UpdateVideoDelayFiltersState();
+     }
+ }
+ 
+@@ -206,39 +269,132 @@
+     return true;
+ }
+ 
++// Retain references before changing filter lists; names are user editable.
++static std::vector<obs_source_t *> filters_of_type(obs_source_t *source, const char *id) {
++    struct Search { const char *id; std::vector<obs_source_t *> result; } search{id, {}};
++    obs_source_enum_filters(source, [](obs_source_t *, obs_source_t *filter, void *p) {
++        auto &s = *static_cast<Search *>(p);
++        if (strcmp(obs_source_get_id(filter), s.id) == 0)
++            s.result.push_back(obs_source_get_ref(filter));
++    }, &search);
++    return search.result;
++}
++
+ void UpdateVideoDelayFiltersState() {
+     GlobalConfig *cfg = GetGlobalConfig();
+-    bool enable = cfg->video_delay_enabled;
+-
+-    struct obs_frontend_source_list scenes = {};
++    if (!cfg) return;
++    bool enable;
++    bool global_enable;
++    {
++        std::lock_guard<std::mutex> lock(cfg->mutex);
++        global_enable = cfg->global_enable;
++        enable = cfg->video_delay_enabled && global_enable;
++    }
++    {
++        std::lock_guard<std::mutex> lock(sync_warning_mutex);
++        sync_warning.clear();
++    }
++    if (global_enable && !enable)
++        append_sync_warning("音画同步已关闭：语音仍有缓存延迟，请在插件设置启用自动音画同步");
++
++    // Delay after scene composition: nested scenes share a single video cache.
++    std::vector<obs_source_t *> sources;
++    obs_enum_sources([](void *p, obs_source_t *s) {
++        static_cast<std::vector<obs_source_t *> *>(p)->push_back(obs_source_get_ref(s));
++        return true;
++    }, &sources);
++    obs_frontend_source_list scenes = {};
+     obs_frontend_get_scenes(&scenes);
+-    
+-    for (size_t i = 0; i < scenes.sources.num; i++) {
+-        obs_source_t *scene_source = scenes.sources.array[i];
+-        obs_source_t *filter = obs_source_get_filter_by_name(scene_source, "语音屏蔽-音画同步");
+-        
+-        if (enable) {
+-            if (!filter) {
+-                obs_source_t *new_filter = obs_source_create_private("profanity_video_delay", "语音屏蔽-音画同步", NULL);
+-                obs_source_filter_add(scene_source, new_filter);
+-                obs_source_release(new_filter);
++    for (size_t i = 0; i < scenes.sources.num; ++i)
++        sources.push_back(obs_source_get_ref(scenes.sources.array[i]));
++    obs_frontend_source_list_free(&scenes);
++
++    for (auto *source : sources) {
++        auto video = filters_of_type(source, "profanity_video_delay");
++        for (auto *filter : video) {
++            if (obs_source_enabled(filter)) obs_source_set_enabled(filter, false);
++            obs_source_release(filter);
++        }
++        uint32_t flags = obs_source_get_output_flags(source);
++        if ((flags & OBS_SOURCE_AUDIO) && !(flags & OBS_SOURCE_COMPOSITE) &&
++            obs_source_get_type(source) == OBS_SOURCE_TYPE_INPUT) {
++            auto audio = filters_of_type(source, "profanity_filter");
++            if (enable && audio.empty()) {
++                obs_data_t *settings = obs_data_create();
++                obs_data_set_bool(settings, "sync_delay_only", true);
++                obs_data_set_bool(settings, "enabled", false);
++                auto *filter = obs_source_create_private("profanity_filter", "语音屏蔽-仅同步声音", settings);
++                obs_data_release(settings);
++                if (filter) {
++                    obs_source_filter_add(source, filter);
++                    audio.push_back(filter);
++                }
+             }
+-        } else {
+-            // Also remove old named filters for backward compatibility
+-            obs_source_t *old_filter = obs_source_get_filter_by_name(scene_source, "语音屏蔽-视频同步延迟");
+-            if (old_filter) {
+-                obs_source_filter_remove(scene_source, old_filter);
+-                obs_source_release(old_filter);
++            size_t count = 0;
++            bool user_filter = false;
++            for (auto *filter : audio) {
++                auto *settings = obs_source_get_settings(filter);
++                user_filter |= !obs_data_get_bool(settings, "sync_delay_only");
++                obs_data_release(settings);
+             }
+-
++            bool have_managed = false;
++            for (auto *filter : audio) {
++                obs_data_t *settings = obs_source_get_settings(filter);
++                bool managed = obs_data_get_bool(settings, "sync_delay_only");
++                obs_data_release(settings);
++                if (managed && (user_filter || have_managed)) {
++                    obs_source_filter_remove(source, filter);
++                    obs_source_release(filter);
++                    continue;
++                }
++                if (managed) have_managed = true;
++                if (managed && obs_source_enabled(filter) != enable)
++                    obs_source_set_enabled(filter, enable);
++                if (obs_source_enabled(filter)) ++count;
++                obs_source_release(filter);
++            }
++            if (enable && obs_source_active(source) && !obs_source_muted(source)) {
++                std::string name = obs_source_get_name(source);
++                if (count != 1)
++                    append_sync_warning("同步异常：" + name + "需要且只能启用一个语音屏蔽音频滤镜");
++                if (obs_source_get_sync_offset(source) != 0)
++                    append_sync_warning("同步异常：" + name + "另设了手动音频偏移，请在高级音频属性归零");
++                if (strcmp(obs_source_get_id(source), "wasapi_output_capture") == 0)
++                    append_sync_warning("原声重复捕获风险：" + name + "是桌面总声音，请使用独立应用捕获避免再次录入KOOK");
++            }
++        } else if (enable && (flags & OBS_SOURCE_COMPOSITE) && obs_source_active(source)) {
++            auto audio = filters_of_type(source, "profanity_filter");
++            for (auto *filter : audio) {
++                if (obs_source_enabled(filter))
++                    append_sync_warning("同步异常：场景或组合源“" + std::string(obs_source_get_name(source)) +
++                                    "”另有音频缓存滤镜，请把语音过滤放在独立输入源上");
++                obs_source_release(filter);
++            }
++        }
++        obs_source_release(source);
++    }
++
++    obs_frontend_source_list transitions = {};
++    obs_frontend_get_transitions(&transitions);
++    for (size_t i = 0; i < transitions.sources.num; ++i) {
++        auto *transition = transitions.sources.array[i];
++        auto filters = filters_of_type(transition, "profanity_video_delay");
++        if (enable && filters.empty()) {
++            auto *filter = obs_source_create_private("profanity_video_delay", "语音屏蔽-最终画面同步", nullptr);
+             if (filter) {
+-                obs_source_filter_remove(scene_source, filter);
+-            }
+-        }
+-        
+-        if (filter) obs_source_release(filter);
+-    }
+-    obs_frontend_source_list_free(&scenes);
++                obs_source_filter_add(transition, filter);
++                if (obs_filter_get_parent(filter) != transition)
++                    append_sync_warning("最终画面同步滤镜挂载失败");
++                filters.push_back(filter);
++            } else append_sync_warning("无法创建最终画面同步滤镜");
++        }
++        for (size_t n = 0; n < filters.size(); ++n) {
++            bool wanted = enable && n == 0;
++            if (obs_source_enabled(filters[n]) != wanted) obs_source_set_enabled(filters[n], wanted);
++            obs_source_release(filters[n]);
++        }
++    }
++    obs_frontend_source_list_free(&transitions);
+ }
+ 
+ MODULE_EXPORT void obs_module_unload(void)
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -78,6 +78,17 @@
+     if (!loading.empty()) return {true, loading};
+     if (!active) return {false, "无启用过滤的活跃来源"};
+     return {false, "模型运行中"};
++}
++
++std::string ProfanityFilter::GetAudioSyncWarning() {
++    lock_guard<mutex> lock(instances_mutex);
++    for (auto *filter : instances) {
++        auto *parent = obs_filter_get_parent(filter->context);
++        if (parent && obs_source_active(parent) && !obs_source_muted(parent) &&
++            obs_source_enabled(filter->context) && filter->audio_warming)
++            return "声音同步缓冲中：" + string(obs_source_get_name(parent));
++    }
++    return "";
+ }
+ 
+ void ProfanityFilter::LoadModel(const string& path) {
+@@ -726,10 +737,14 @@
+         global_freq = cfg->beep_frequency;
+         global_mix = cfg->beep_mix_percent;
+         global_enable = cfg->global_enable;
++        if (delay_only && !cfg->video_delay_enabled) global_enable = false;
+     }
+     
+     // If disabled globally, pass through and signal unload
+     if (!global_enable) {
++        previous_audio_end = 0;
++        buffered_samples = 0;
++        audio_warming = true;
+         {
+             lock_guard<mutex> lock(queue_mutex);
+             target_model_path = ""; // Signal unload
+@@ -761,6 +776,7 @@
+     
+     // Update state if changed
+     if (sample_rate != current_sr) {
++        previous_audio_end = 0;
+         sample_rate = current_sr;
+         sample_rate_ratio = (double)current_sr / 16000.0;
+         // Reset resampler
+@@ -806,6 +822,21 @@
+     // Ensure buffer size covers delay
+     size_t delay_samples = (size_t)(cached_delay * current_sr);
+     size_t current_buf_size = channels[0].buffer.size();
++
++    // A source restart must not replay samples left from an earlier activation.
++    uint64_t gap = audio->timestamp > previous_audio_end
++        ? audio->timestamp - previous_audio_end : previous_audio_end - audio->timestamp;
++    if (!previous_audio_end || gap > 100000000ULL || delay_samples != previous_delay_samples) {
++        for (auto &ch : channels) {
++            std::fill(ch.buffer.begin(), ch.buffer.end(), 0.0f);
++            std::fill(ch.clean_buffer.begin(), ch.clean_buffer.end(), 0.0f);
++        }
++        buffered_samples = 0;
++    }
++    previous_delay_samples = delay_samples;
++    previous_audio_end = audio->timestamp + (uint64_t)frames * 1000000000ULL / current_sr;
++    buffered_samples += frames;
++    audio_warming = buffered_samples < delay_samples;
+     
+     // Resize check (handle sample rate change or large delay)
+     if (delay_samples * 2 > current_buf_size || current_buf_size != current_sr * 12) {
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -17,6 +17,8 @@
+ public:
+     obs_source_t *context;
+     
++    bool delay_only = false;
++
+     // Local Properties
+     std::atomic<bool> enabled{true};
+     
+@@ -98,4 +100,11 @@
+     static std::set<ProfanityFilter*> instances;
+     static std::mutex instances_mutex;
+     static std::pair<bool, std::string> GetGlobalModelStatus();
++    static std::string GetAudioSyncWarning();
++
++private:
++    uint64_t previous_audio_end = 0;
++    size_t previous_delay_samples = 0;
++    uint64_t buffered_samples = 0;
++    std::atomic<bool> audio_warming{true};
+ };
+--- a/src/video-delay.cpp
++++ b/src/video-delay.cpp
+@@ -55,12 +55,20 @@
+ }
+ 
+ std::atomic<double> VideoDelayFilter::total_memory_mb{0.0};
++std::set<VideoDelayFilter *> VideoDelayFilter::instances;
++std::mutex VideoDelayFilter::instances_mutex;
+ 
+ VideoDelayFilter::VideoDelayFilter(obs_source_t *ctx) : context(ctx) {
++    std::lock_guard<std::mutex> lock(instances_mutex);
++    instances.insert(this);
+     last_render_ts = 0; // Start as inactive, wait for first render to allocate
+ }
+ 
+ VideoDelayFilter::~VideoDelayFilter() {
++    {
++        std::lock_guard<std::mutex> lock(instances_mutex);
++        instances.erase(this);
++    }
+     FreeTextures();
+     
+     // Cleanup global memory counter
+@@ -72,6 +80,7 @@
+ }
+ 
+ void VideoDelayFilter::FreeTextures() {
++    warming = true;
+     obs_enter_graphics();
+     for (auto &f : frames) {
+         if (f.render) gs_texrender_destroy(f.render);
+@@ -85,9 +94,10 @@
+ void VideoDelayFilter::UpdateDelayFromConfig() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     if (!cfg) return;
++    std::lock_guard<std::mutex> lock(cfg->mutex);
+     
+     // If global switch is off, force delay to 0 (this will free textures in UpdateInterval)
+-    if (!cfg->global_enable) {
++    if (!cfg->global_enable || !cfg->video_delay_enabled) {
+         if (delay_ns != 0) {
+             delay_ns = 0;
+             cx = 0;
+@@ -250,6 +260,12 @@
+     if (frames.empty()) return;
+     
+     FrameData &frame = frames.front(); // peek front
++    if (!frame.captured_at) {
++        warming = true;
++        return;
++    }
++    observed_delay_ns = os_gettime_ns() - frame.captured_at;
++    warming = false;
+ 
+     const enum gs_color_space current_space = gs_get_color_space();
+     float multiplier;
+@@ -269,7 +285,7 @@
+             gs_draw_sprite(tex, 0, cx, cy);
+ 
+         gs_enable_framebuffer_srgb(previous);
+-    }
++    } else render_failed = true;
+ }
+ 
+ void VideoDelayFilter::Render(gs_effect_t *effect) {
+@@ -279,7 +295,14 @@
+     obs_source_t *parent = obs_filter_get_parent(context);
+ 
+     if (!target_valid || !target || !parent || frames.empty()) {
+-        obs_source_skip_video_filter(context);
++        // Never expose an undelayed frame while the delay cache is starting.
++        GlobalConfig *cfg = GetGlobalConfig();
++        bool delaying = false;
++        if (cfg) {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            delaying = cfg->global_enable && cfg->video_delay_enabled && cfg->delay_seconds > 0;
++        }
++        if (!delaying) obs_source_skip_video_filter(context);
+         return;
+     }
+ 
+@@ -300,10 +323,17 @@
+     const enum gs_color_space space = obs_source_get_color_space(target, 3, preferred_spaces);
+     const enum gs_color_format format = gs_get_format_from_space(space);
+     
+-    if (gs_texrender_get_format(frame.render) != format) {
++    if (!frame.render || gs_texrender_get_format(frame.render) != format) {
+         gs_texrender_destroy(frame.render);
+         frame.render = gs_texrender_create(format, GS_ZS_NONE);
+         UpdateStatus(); // Format change might imply re-allocation considerations, updating status just in case
++    }
++
++    if (!frame.render) {
++        render_failed = true;
++        frame.captured_at = 0;
++        frames.push_back(frame);
++        return;
+     }
+ 
+     gs_texrender_reset(frame.render);
+@@ -329,6 +359,11 @@
+         gs_texrender_end(frame.render);
+ 
+         frame.space = space;
++        frame.captured_at = os_gettime_ns();
++        render_failed = false;
++    } else {
++        frame.captured_at = 0;
++        render_failed = true;
+     }
+ 
+     gs_blend_state_pop();
+@@ -338,6 +373,34 @@
+     processed_frame = true;
+ 
+     UNUSED_PARAMETER(effect);
++}
++
++std::string VideoDelayFilter::GetSyncWarning() {
++    GlobalConfig *cfg = GetGlobalConfig();
++    uint64_t expected;
++    {
++        std::lock_guard<std::mutex> lock(cfg->mutex);
++        if (!cfg->global_enable || !cfg->video_delay_enabled) return "";
++        expected = (uint64_t)(cfg->delay_seconds * 1000000000.0);
++    }
++    std::lock_guard<std::mutex> lock(instances_mutex);
++    bool found = false;
++    for (auto *filter : instances) {
++        auto *parent = obs_filter_get_parent(filter->context);
++        if (!parent || !obs_source_active(parent) || !obs_source_enabled(filter->context)) continue;
++        found = true;
++        if (filter->render_failed) return "画面同步异常：视频缓存渲染失败";
++        if (filter->warming) return "画面同步缓冲中，暂不输出未延迟画面";
++        if (os_gettime_ns() - filter->last_render_ts.load() > 2000000000ULL)
++            return "画面同步异常：最终画面超过2秒未更新（也可能关闭了预览且尚未输出）";
++        uint64_t actual = filter->observed_delay_ns;
++        obs_video_info info = {};
++        obs_get_video_info(&info);
++        uint64_t tolerance = info.fps_num ? 2000000000ULL * info.fps_den / info.fps_num : 100000000ULL;
++        uint64_t diff = actual > expected ? actual - expected : expected - actual;
++        if (diff > tolerance) return "画面同步异常：实际视频缓存时长偏离设定值";
++    }
++    return found ? "" : "画面同步异常：当前最终出口缺少活跃同步滤镜";
+ }
+ 
+ enum gs_color_space VideoDelayFilter::GetColorSpace(size_t count, const enum gs_color_space *preferred_spaces) {
+--- a/src/video-delay.hpp
++++ b/src/video-delay.hpp
+@@ -6,10 +6,13 @@
+ #include <deque>
+ #include <string>
+ #include <atomic>
++#include <set>
++#include <mutex>
+ 
+ struct FrameData {
+     gs_texrender_t *render = nullptr;
+     enum gs_color_space space = GS_CS_SRGB;
++    uint64_t captured_at = 0;
+ };
+ 
+ class VideoDelayFilter {
+@@ -21,7 +24,7 @@
+     
+     uint64_t delay_ns = 0;
+     uint64_t interval_ns = 0;
+-    uint64_t last_render_ts = 0;
++    std::atomic<uint64_t> last_render_ts{0};
+     
+     uint32_t cx = 0;
+     uint32_t cy = 0;
+@@ -44,8 +47,14 @@
+     enum gs_color_space GetColorSpace(size_t count, const enum gs_color_space *preferred_spaces);
+     
+     std::string GetStatusString();
++    static std::string GetSyncWarning();
+ 
+ private:
++    static std::set<VideoDelayFilter *> instances;
++    static std::mutex instances_mutex;
++    std::atomic<bool> warming{true};
++    std::atomic<bool> render_failed{false};
++    std::atomic<uint64_t> observed_delay_ns{0};
+     double last_reported_mb = 0.0;
+     
+     void FreeTextures();

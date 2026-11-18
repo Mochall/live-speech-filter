@@ -1,0 +1,43 @@
+From ae558d9ceeefd8fa02a7d4517b284ff4b2591de8 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 02:28:03 -0700
+Subject: [PATCH] build-compat: frontend-api fallback lib only with the default
+ .deps SDK; _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR for older VC redists (enables
+ building against the OBS 28 SDK)
+
+---
+ CMakeLists.txt | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e36d2fa..533dd5e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -59,9 +59,11 @@ if(ENABLE_FRONTEND_API)
+   find_package(obs-frontend-api REQUIRED)
+   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+   
+-  # Force link to the library we know exists (Fallback for local builds)
++  # Force link to the library we know exists (Fallback for local builds). Only for the
++  # default .deps SDK: a build against another OBS SDK (obs-frontend-api_DIR elsewhere,
++  # e.g. the OBS 28 SDK for older-OBS support) must not pick up the newer import library.
+   set(OBS_FRONTEND_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.deps/lib/obs-frontend-api.lib")
+-  if(EXISTS "${OBS_FRONTEND_LIB_PATH}")
++  if(EXISTS "${OBS_FRONTEND_LIB_PATH}" AND "${obs-frontend-api_DIR}" MATCHES "/[.]deps/")
+       target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "${OBS_FRONTEND_LIB_PATH}")
+   endif()
+ endif()
+@@ -119,6 +121,10 @@ set(CPP_PINYIN_INSTALL OFF CACHE BOOL "" FORCE)
+ add_subdirectory(thirdparty/cpp-pinyin)
+ if(MSVC)
+     target_compile_options(cpp-pinyin PRIVATE /wd4251 /wd4267)
++    # MSVC 14.40+ made std::mutex's constructor constexpr; such code crashes on first lock
++    # when OBS runs with an older msvcp140.dll (VC redist installed by older OBS versions).
++    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
++    target_compile_definitions(cpp-pinyin PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+ endif()
+ 
+ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${SHERPA_ONNX_ROOT}/include")
+-- 
+2.55.0.windows.5
+

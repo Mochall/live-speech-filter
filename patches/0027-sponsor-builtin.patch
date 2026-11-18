@@ -1,0 +1,129 @@
+From e38b21941ee91d4dc71405480c01defb5e0fb3ef Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 08:42:53 -0700
+Subject: [PATCH] =?UTF-8?q?sponsor-builtin:=20sponsor=20QR=20compiled=20in?=
+ =?UTF-8?q?to=20the=20DLL=20as=20a=20Qt=20resource=20when=20SPONSOR=5FIMAG?=
+ =?UTF-8?q?E=20is=20set=20(the=20image=20is=20not=20in=20the=20sources;=20?=
+ =?UTF-8?q?without=20it=20data/sponsor-qr.png=20is=20read);=20dialog=20?=
+ =?UTF-8?q?=E6=94=AF=E6=8C=81=E9=A1=B9=E7=9B=AE=20with=20author=20?=
+ =?UTF-8?q?=E6=BC=A0=E7=A7=8B,=20payee=20check=20on=20WeChat's=20payment?=
+ =?UTF-8?q?=20page,=20upstream=20credit?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ CMakeLists.txt        | 14 ++++++++++++++
+ src/plugin-config.cpp | 33 +++++++++++++++++++++++++--------
+ 2 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 533dd5e..60938bc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -164,6 +164,20 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+ 
+ set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+ 
++# Sponsor QR image compiled into the DLL (Qt resource :/sponsor/sponsor-qr.png), so it cannot be
++# swapped by replacing a file. The image is not part of the sources; without it the dialog falls
++# back to data/sponsor-qr.png. Added after set_target_properties_plugin, whose source_group
++# call only accepts .qrc files inside the source tree.
++set(SPONSOR_IMAGE "" CACHE FILEPATH "PNG shown by the sponsor dialog, embedded into the plugin")
++if(SPONSOR_IMAGE AND EXISTS "${SPONSOR_IMAGE}")
++  file(TO_CMAKE_PATH "${SPONSOR_IMAGE}" _sponsor_image)
++  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sponsor.qrc"
++       "<RCC><qresource prefix=\"/sponsor\"><file alias=\"sponsor-qr.png\">${_sponsor_image}</file></qresource></RCC>\n")
++  target_sources(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/sponsor.qrc")
++  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE EMBEDDED_SPONSOR_IMAGE=1)
++  message(STATUS "Sponsor image embedded: ${_sponsor_image}")
++endif()
++
+ # Copy the DLLs to the plugin directory so it can run
+ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+     COMMAND ${CMAKE_COMMAND} -E copy
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 4aaaab1..ac28c78 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -787,8 +787,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     connect(btnApply, &QPushButton::clicked, this, &ConfigDialog::onApply);
+     connect(btnCancel, &QPushButton::clicked, this, &ConfigDialog::reject);
+ 
+-    QPushButton *btnSponsor = new QPushButton("赞助支持…");
+-    btnSponsor->setToolTip("觉得好用可以扫码赞助，支持项目继续更新。赞助完全自愿，不影响任何功能。");
++    QPushButton *btnSponsor = new QPushButton("支持项目…");
++    btnSponsor->setToolTip("作者：漠秋。插件免费使用，有帮助的话可以扫码支持。");
+     connect(btnSponsor, &QPushButton::clicked, this, [this] { showSponsorDialog(); });
+     btnLayout->addWidget(btnSponsor);
+     btnLayout->addStretch();
+@@ -1343,18 +1343,25 @@ void ConfigDialog::updateCompanionUI() {
+     lblCompanion->setText(ColorCheckLines(QString::fromStdString(text).split('\n')));
+ }
+ 
+-// The QR image is data/sponsor-qr.png in the plugin folder; replacing that file changes it
+-// without rebuilding. When it is missing the dialog says so instead of showing nothing.
++// The QR image is compiled into the DLL when the build sets SPONSOR_IMAGE (see CMakeLists.txt),
++// so replacing a file cannot change it. Builds without it read data/sponsor-qr.png instead.
++// The payee name is shown so a viewer can check it on WeChat's payment page.
+ void ConfigDialog::showSponsorDialog() {
+     QDialog dlg(this);
+-    dlg.setWindowTitle("赞助支持");
++    dlg.setWindowTitle("支持项目");
+     QVBoxLayout *layout = new QVBoxLayout(&dlg);
+-    QLabel *intro = new QLabel("这个插件免费使用。觉得有帮助的话，可以扫码赞助，支持后续维护和更新。\n"
+-                               "赞助完全自愿，不赞助也能使用全部功能。");
++    QLabel *intro = new QLabel("作者：漠秋\n该插件免费使用，如果有帮助到你，可以选择支持项目。");
+     intro->setWordWrap(true);
++    QFont introFont = intro->font();
++    introFont.setPointSizeF(introFont.pointSizeF() * 1.1);
++    intro->setFont(introFont);
+     layout->addWidget(intro);
+ 
+     QPixmap qr;
++#ifdef EMBEDDED_SPONSOR_IMAGE
++    qr.load(":/sponsor/sponsor-qr.png");
++    blog(LOG_INFO, "[Speech Sync] sponsor image (built in): %s", qr.isNull() ? "not readable" : "loaded");
++#else
+     if (g_module) {
+         char *path = obs_find_module_file(g_module, "sponsor-qr.png");
+         if (path) {
+@@ -1365,6 +1372,7 @@ void ConfigDialog::showSponsorDialog() {
+             blog(LOG_INFO, "[Speech Sync] sponsor image sponsor-qr.png not found in the plugin data folder");
+         }
+     }
++#endif
+     QLabel *image = new QLabel();
+     image->setAlignment(Qt::AlignCenter);
+     if (!qr.isNull()) {
+@@ -1372,17 +1380,26 @@ void ConfigDialog::showSponsorDialog() {
+             qr = qr.scaled(360, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+         image->setPixmap(qr);
+     } else {
+-        image->setText("（赞助二维码还没有放进插件文件夹：data\\sponsor-qr.png）");
++        image->setText("（这个版本没有附带赞助二维码）");
+         image->setStyleSheet("color: #9a9cab; padding: 24px;");
+     }
+     layout->addWidget(image);
+ 
++    QLabel *check = new QLabel("微信扫码后，请确认付款页显示的收款人是“漠秋”；不是的话，你用的可能是被改过的版本。");
++    check->setWordWrap(true);
++    layout->addWidget(check);
++    QLabel *upstream = new QLabel("基于 Cloud370/obs-profanity-filter（GPL-2.0）修改，源代码与许可见插件文件夹里的 licenses。");
++    upstream->setWordWrap(true);
++    upstream->setStyleSheet("color: #9a9cab;");
++    layout->addWidget(upstream);
++
+     QHBoxLayout *buttons = new QHBoxLayout();
+     QPushButton *close = new QPushButton("关闭");
+     connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
+     buttons->addStretch();
+     buttons->addWidget(close);
+     layout->addLayout(buttons);
++    dlg.setMinimumWidth(420);
+     dlg.exec();
+ }
+ 
+-- 
+2.55.0.windows.5
+

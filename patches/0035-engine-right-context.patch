@@ -1,0 +1,300 @@
+From 74a6dc9319b926ab2d4e455f4f6e55b2a2b8b57c Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Fri, 13 Nov 2026 22:33:16 -0700
+Subject: [PATCH] =?UTF-8?q?censor-engine:=20a=20match=20at=20the=20very=20?=
+ =?UTF-8?q?end=20of=20the=20recognized=20text=20whose=20rule=20looks=20at?=
+ =?UTF-8?q?=20the=20next=20character=20("(=3F!",=20e.g.=20=E6=93=8D=20but?=
+ =?UTF-8?q?=20not=20=E6=93=8D=E4=BD=9C)=20waits=20until=20the=20next=20cha?=
+ =?UTF-8?q?racter=20is=20there,=20the=20segment=20ends,=20or=200.4=20s=20o?=
+ =?UTF-8?q?f=20audio=20after=20the=20match=20was=20first=20seen,=20instead?=
+ =?UTF-8?q?=20of=20muting=20"=E8=BF=99=E6=B3=A2=E6=93=8D"=20before=20"?=
+ =?UTF-8?q?=E4=BD=9C"=20arrives;=20rules=20starting=20"(=3F:^|...)"=20that?=
+ =?UTF-8?q?=20consume=20the=20character=20before=20the=20word=20are=20time?=
+ =?UTF-8?q?d=20and=20keyed=20on=20the=20word=20only=20(the=20consumed=20ch?=
+ =?UTF-8?q?aracter=20is=20no=20longer=20muted=20or=20reported=20late);=20w?=
+ =?UTF-8?q?ord=20list=20items=20starting=20with=20"!"=20are=20allowed=20ph?=
+ =?UTF-8?q?rases=20(none=20built=20in,=20a=20user=20can=20add=20one=20to?=
+ =?UTF-8?q?=20the=20custom=20words):=20a=20regex=20or=20pinyin=20match=20i?=
+ =?UTF-8?q?nside=20one=20in=20the=20text=20is=20ignored,=20and=20a=20match?=
+ =?UTF-8?q?=20that=20could=20still=20become=20one=20waits=20like=20a=20rig?=
+ =?UTF-8?q?ht-context=20match;=20rules=20are=20parsed=20once=20per=20word?=
+ =?UTF-8?q?=20list=20change;=20with=20debug=20logging=20each=20mute=20logs?=
+ =?UTF-8?q?=20the=20lane=20and=20its=20text?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/censor-engine.cpp | 113 +++++++++++++++++++++++++++++++++++++-----
+ src/censor-engine.hpp |  19 ++++++-
+ 2 files changed, 119 insertions(+), 13 deletions(-)
+
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+index 9da55e7..fee9383 100644
+--- a/src/censor-engine.cpp
++++ b/src/censor-engine.cpp
+@@ -59,7 +59,7 @@ vector<regex> CensorParsePatterns(const string &word_list) {
+         // Trim
+         item.erase(0, item.find_first_not_of(" \t\n\r"));
+         item.erase(item.find_last_not_of(" \t\n\r") + 1);
+-        if (!item.empty()) {
++        if (!item.empty() && item[0] != '!') {
+             try {
+                 patterns.emplace_back(item, regex::icase);
+             } catch(...) {}
+@@ -380,7 +380,12 @@ void CensorEngine::ASRLoop() {
+             const SherpaOnnxOnlineStream *stream = lane.stream;
+             uint64_t &last_reset_sample_16k = lane.reset_16k;
+             std::set<size_t> &processed_matches = lane.processed_matches;
++            std::map<size_t, uint64_t> &waiting_since = lane.waiting_since;
+             
++            // Endpoint or forced reset (segment > 600 s): this result is the last of its segment.
++            const bool force_reset = (total_samples_popped_16k - last_reset_sample_16k) > (16000 * 600);
++            const bool segment_final = force_reset || SherpaOnnxOnlineStreamIsEndpoint(asr_model->recognizer, stream);
++
+             const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(asr_model->recognizer, stream);
+             if (result) {
+                 // Token times are relative to the current segment. After an endpoint reset the
+@@ -399,10 +404,47 @@ void CensorEngine::ASRLoop() {
+                 // Get Patterns and Config from Global
+                 CensorLexicon lexicon;
+                 host->GetLexicon(lexicon);
+-                const vector<regex> &patterns = lexicon.patterns;
+                 const bool use_pinyin = lexicon.use_pinyin;
+                 const string &current_dirty_words = lexicon.dirty_words;
+                 const string &current_pinyin_words = lexicon.pinyin_words;
++                if (current_dirty_words != cached_rules_src) {
++                    cached_rules.clear();
++                    allowed_phrases.clear();
++                    stringstream ss(current_dirty_words);
++                    string item;
++                    while (getline(ss, item, ',')) {
++                        item.erase(0, item.find_first_not_of(" \t\n\r"));
++                        item.erase(item.find_last_not_of(" \t\n\r") + 1);
++                        if (item.empty()) continue;
++                        if (item[0] == '!') {
++                            if (item.size() > 1) allowed_phrases.push_back(item.substr(1));
++                            continue;
++                        }
++                        try {
++                            WordRule rule{regex(item, regex::icase), item.find("(?!") != string::npos, false, regex()};
++                            if (item.rfind("(?:^|", 0) == 0) {
++                                // End of the leading group: skip escapes and [...] classes.
++                                int depth = 0;
++                                bool in_class = false;
++                                size_t close = string::npos;
++                                for (size_t k = 0; k < item.size() && close == string::npos; k++) {
++                                    const char c = item[k];
++                                    if (c == '\\') k++;
++                                    else if (in_class) in_class = c != ']';
++                                    else if (c == '[') in_class = true;
++                                    else if (c == '(') depth++;
++                                    else if (c == ')' && --depth == 0) close = k;
++                                }
++                                if (close != string::npos && close + 1 < item.size()) {
++                                    rule.core = regex(item.substr(close + 1), regex::icase);
++                                    rule.has_core = true;
++                                }
++                            }
++                            cached_rules.push_back(std::move(rule));
++                        } catch (...) {}
++                    }
++                    cached_rules_src = current_dirty_words;
++                }
+                 
+                 // Byte-fallback tokens merged into characters; all matching below uses these.
+                 vector<string> tokens;
+@@ -447,17 +489,29 @@ void CensorEngine::ASRLoop() {
+                         string log_text;
+                         bool is_pinyin;
+                         uint64_t word_start;
++                        size_t end_char = 0;        // text bytes [start_char, end_char) of the match
++                        bool right_context = false; // the rule looks at the following character
+                     };
+                     vector<MatchCandidate> candidates;
+ 
+                     // 1. Regex Matching
+-                    for (const auto& pattern : patterns) {
+-                        sregex_iterator begin(full_text.begin(), full_text.end(), pattern);
++                    for (const auto& rule : cached_rules) {
++                        sregex_iterator begin(full_text.begin(), full_text.end(), rule.re);
+                         sregex_iterator end;
+                         
+                         for (auto i = begin; i != end; ++i) {
+                             smatch match = *i;
+                             size_t m_start_char = match.position();
++                            size_t m_length = match.length();
++                            if (rule.has_core) {
++                                // Time and key only the word, not the character consumed before it.
++                                const string s = match.str();
++                                smatch core;
++                                if (regex_search(s, core, rule.core) && core.position() > 0) {
++                                    m_start_char += core.position();
++                                    m_length -= core.position();
++                                }
++                            }
+                             
+                             // Find timestamps
+                             float m_start_time = -1.0f;
+@@ -471,7 +525,7 @@ void CensorEngine::ASRLoop() {
+                                 float tok_end = (t < token_count - 1) ? token_times[t+1] : (tok_start + 0.2f);
+                                 
+                                 // Check overlap
+-                                size_t m_end_char = m_start_char + match.length();
++                                size_t m_end_char = m_start_char + m_length;
+                                 if (current_char + tok_len > m_start_char && current_char < m_end_char) {
+                                     if (m_start_time < 0) m_start_time = tok_start;
+                                     m_end_time = tok_end;
+@@ -502,7 +556,9 @@ void CensorEngine::ASRLoop() {
+                                 start_abs = (start_abs > margin) ? start_abs - margin : 0; 
+                                 end_abs += margin; 
+                                 
+-                                candidates.push_back({m_start_char, start_abs, end_abs, match.str(), false, word_start});
++                                candidates.push_back({m_start_char, start_abs, end_abs, full_text.substr(m_start_char, m_length),
++                                                      false, word_start, m_start_char + m_length,
++                                                      rule.right_context});
+                             }
+                         }
+                     }
+@@ -540,7 +596,7 @@ void CensorEngine::ASRLoop() {
+                                 while (getline(ss, item, ',')) {
+                                     item.erase(0, item.find_first_not_of(" \t\n\r"));
+                                     item.erase(item.find_last_not_of(" \t\n\r") + 1);
+-                                    if (!item.empty()) {
++                                    if (!item.empty() && item[0] != '!') {
+                                         auto res = pinyin_converter->hanziToPinyin(item, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false);
+                                         vector<string> pat;
+                                         for(const auto& r : res) {
+@@ -623,6 +679,8 @@ void CensorEngine::ASRLoop() {
+                                         // Calculate char pos for processed_matches check
+                                         size_t char_pos = 0;
+                                         for(int k=0; k<start_token; k++) char_pos += tokens[k].length();
++                                        size_t end_pos = char_pos;
++                                        for (int k = start_token; k <= end_token; k++) end_pos += tokens[k].length();
+                                         
+                                         float start_time = token_times[start_token];
+                                         float end_time = (end_token < token_count - 1) ? token_times[end_token+1] : (token_times[end_token] + 0.2f);
+@@ -656,7 +714,8 @@ void CensorEngine::ASRLoop() {
+                                         for(int k=0; k<pat.size(); k++) ss << text_pinyins[i+k] << " ";
+                                         ss << "]";
+                                         
+-                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start});
++                                        candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start,
++                                                              end_pos, false});
+                                     }
+                                 }
+                             }
+@@ -672,6 +731,35 @@ void CensorEngine::ASRLoop() {
+                         // Skip if already processed in previous frames
+                         if (processed_matches.count(m.start_char)) continue;
+ 
++                        // Inside an allowed phrase in the text ("再打几把"): not a swear word.
++                        bool allowed = false;
++                        bool could_be_allowed = false; // an allowed phrase may still follow
++                        const string matched = full_text.substr(m.start_char, m.end_char - m.start_char);
++                        for (const auto &phrase : allowed_phrases) {
++                            for (size_t at = full_text.find(phrase); at != string::npos && !allowed;
++                                 at = full_text.find(phrase, at + 1)) {
++                                if (at <= m.start_char && at + phrase.size() >= m.end_char) allowed = true;
++                            }
++                            // The match is the beginning of what could still become this phrase.
++                            size_t in = phrase.find(matched);
++                            if (in != string::npos && in + matched.size() < phrase.size()) could_be_allowed = true;
++                        }
++                        if (allowed) {
++                            processed_matches.insert(m.start_char);
++                            continue;
++                        }
++                        // A match at the very end of the text whose rule depends on the next character
++                        // ("操" but not "操作") is decided once the next character is there, the sentence
++                        // ends, or 0.4 s more audio has been decoded since the match first showed up.
++                        // The audio delay leaves time for that; deciding at once muted "这波操" before
++                        // "作" was recognized. (The recognizer outputs a character some 0.3-0.4 s after
++                        // it starts, so the wait counts from when the match is first seen.)
++                        if ((m.right_context || could_be_allowed) && m.end_char >= full_text.size() &&
++                            !segment_final) {
++                            auto w = waiting_since.emplace(m.start_char, total_samples_popped_16k).first;
++                            if (total_samples_popped_16k - w->second < 16000 * 4 / 10) continue;
++                        }
++
+                         // Another lane may already have sent this word. Skip it when an earlier mute
+                         // covers it; when it only overlaps, the unmuted part starts at the earlier end.
+                         // The late check then only looks at the part of the word itself (without padding)
+@@ -708,6 +796,9 @@ void CensorEngine::ASRLoop() {
+                             } else if (asr_debug_logging) {
+                                 CLOG(censor::kLogInfo, "%s (extended by stream %zu)", m.log_text.c_str(), lane_index);
+                             }
++                            if (asr_debug_logging)
++                                CLOG(censor::kLogInfo, "[ASR Debug] stream %zu muted \"%s\" in \"%s\"", lane_index,
++                                     m.log_text.c_str(), full_text.c_str());
+                             recent_mutes.push_back({m.start_sample, m.end_sample});
+                             while (recent_mutes.size() > 64) recent_mutes.pop_front();
+                         }
+@@ -719,10 +810,7 @@ void CensorEngine::ASRLoop() {
+                 SherpaOnnxDestroyOnlineRecognizerResult(result);
+             }
+             
+-            // Check endpoint or force reset if segment is too long (> 600s = 10min)
+-            bool force_reset = (total_samples_popped_16k - last_reset_sample_16k) > (16000 * 600);
+-
+-            if (force_reset || SherpaOnnxOnlineStreamIsEndpoint(asr_model->recognizer, stream)) {
++            if (segment_final) {
+                 if (force_reset) {
+                     CLOG(censor::kLogInfo, "Info: Periodic reset of ASR stream (segment > 10min)");
+                 }
+@@ -733,6 +821,7 @@ void CensorEngine::ASRLoop() {
+                     current_partial_text = "";
+                 }
+                 processed_matches.clear();
++                waiting_since.clear();
+             }
+         }
+     }
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+index 974f45c..bba549e 100644
+--- a/src/censor-engine.hpp
++++ b/src/censor-engine.hpp
+@@ -63,7 +63,8 @@ struct CensorLexicon {
+ // Effective word list: the built-in list (regex syntax) plus the user's plain words, escaped
+ // so they match literally; comma separated.
+ std::string CensorBuildWordList(const std::string &builtin, const std::string &custom);
+-// One case-insensitive regex per comma-separated item; invalid items are skipped.
++// One case-insensitive regex per comma-separated item; invalid items and allowed phrases
++// (items starting with "!") are skipped.
+ std::vector<std::regex> CensorParsePatterns(const std::string &word_list);
+ 
+ // Planar float at the stream rate -> 16 kHz mono, the plain average of all channels.
+@@ -129,6 +130,7 @@ public:
+         uint64_t base_16k = 0;   // timeline position of the stream's first fed sample
+         uint64_t reset_16k = 0;  // start of the current recognizer segment (16 kHz samples)
+         std::set<size_t> processed_matches;
++        std::map<size_t, uint64_t> waiting_since; // deferred match start -> position when first seen
+     };
+     std::vector<Lane> lanes;
+     size_t lane_count = 1;
+@@ -196,6 +198,21 @@ public:
+     uint64_t created_ns = 0;
+     std::atomic<bool> audio_warming{true};
+ 
++    // Word list rules, rebuilt when the word list changes. An item starting with "!" is an
++    // allowed phrase: a match (regex or pinyin) lying inside it in the text is ignored. The
++    // built-in list has none; a user can add one to the custom words, e.g. "!打几把".
++    struct WordRule {
++        std::regex re;
++        bool right_context; // has a lookahead "(?!": the next character can still cancel a match
++        // Rules starting "(?:^|...)" consume the character before the word to exclude some (体操).
++        // core is the rest: the word itself, found inside a match to time only the word.
++        bool has_core;
++        std::regex core;
++    };
++    std::vector<WordRule> cached_rules;
++    std::vector<std::string> allowed_phrases;
++    std::string cached_rules_src;
++
+     // Pinyin Support
+     std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
+     std::vector<std::vector<std::string>> cached_pinyin_patterns;
+-- 
+2.55.0.windows.5
+

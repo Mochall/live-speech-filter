@@ -1,0 +1,30 @@
+{
+  "png_sizes": [
+    1024,
+    512,
+    256,
+    128,
+    64,
+    48,
+    32,
+    24,
+    20,
+    16
+  ],
+  "ico_sizes": [
+    16,
+    20,
+    24,
+    32,
+    48,
+    64,
+    128,
+    256
+  ],
+  "ico_frames_match_png": true,
+  "png_rgba_transparent_corners": true,
+  "svg_parse": true,
+  "small_badge_zone_clear": true,
+  "renderer": "PySide6.QtSvg.QSvgRenderer",
+  "preview": "Static mockup, not an OS screenshot"
+}

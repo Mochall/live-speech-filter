@@ -1,0 +1,214 @@
+From 73b30574beee97db772273505a051af422d7832a Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 15:06:50 -0700
+Subject: [PATCH] asr-input: anti-aliased 16 kHz mono model input via libobs
+ audio_resampler (all channels averaged), AGC off by default, quiet-level
+ warning independent of AGC
+
+---
+ src/plugin-config.cpp    |  4 +-
+ src/plugin-config.hpp    |  2 +-
+ src/profanity-filter.cpp | 80 ++++++++++++++++++++++++++++------------
+ src/profanity-filter.hpp | 14 ++++++-
+ 4 files changed, 71 insertions(+), 29 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index fd8e150..9b7f6f9 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -477,8 +477,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     spinDelay->setSingleStep(50);
+     spinDelay->setSuffix(" ms");
+     
+-    chkEnableAGC = new QCheckBox("启用自动增益 (Auto Gain Control)");
+-    chkEnableAGC->setToolTip("开启后，将自动调整音量以保持稳定的识别效果。\n(推荐开启，可解决声音过小导致识别不到的问题)");
++    chkEnableAGC = new QCheckBox("自动放大识别用的声音（声音很小时才开）");
++    chkEnableAGC->setToolTip("把送去识别的声音自动放大（不影响直播里的声音）。\n一般不要开：声音正常时放大过头会失真，反而识别得更差。只有麦克风声音很小、识别不到时才开。");
+ 
+     // Audio Effect Selection
+     comboEffect = new QComboBox();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index dfa8912..6a67255 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -64,7 +64,7 @@ struct GlobalConfig {
+     int audio_effect = 1; // 0=Beep, 1=Silence (default, user choice), 2=Squeaky, 3=Robot
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
+-    bool enable_agc = true; // Automatic Gain Control (Default: ON)
++    bool enable_agc = false; // Automatic Gain Control (Default: OFF since 0018: it clipped normal-level speech)
+     bool use_pinyin = true;
+     bool asr_debug_logging = false;
+     // Runtime state, decided every second by UpdateVideoDelayFiltersState from sync_mode;
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 010bb44..a96adc6 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -49,6 +49,23 @@ ProfanityFilter::~ProfanityFilter() {
+         stream = nullptr;
+     }
+     asr_model.reset();
++    if (asr_resampler) audio_resampler_destroy(asr_resampler);
++}
++
++// Called with queue_mutex held.
++void ProfanityFilter::FeedAsrResampler(const uint8_t *const *data, uint32_t frames, double ratio) {
++    if (!asr_resampler || !frames) return;
++    uint8_t *out[MAX_AV_PLANES] = {};
++    uint32_t out_frames = 0;
++    uint64_t ts_offset = 0;
++    if (!audio_resampler_resample(asr_resampler, out, &out_frames, &ts_offset, data, frames)) return;
++    // swresample's stereo-to-mono downmix is 0.707 * (L + R); scale to the plain average.
++    const float scale = asr_resampler_layout == SPEAKERS_MONO ? 1.0f : 0.70710678f;
++    const float *samples = (const float *)out[0];
++    for (uint32_t i = 0; i < out_frames; i++) asr_queue.push_back(samples[i] * scale);
++    asr_resampler_in += frames;
++    asr_resampler_out += out_frames;
++    asr_resampler_held = (int64_t)asr_resampler_in - (int64_t)llround(asr_resampler_out * ratio);
+ }
+ 
+ std::pair<bool, std::string> ProfanityFilter::GetGlobalModelStatus() {
+@@ -190,7 +207,11 @@ std::string ProfanityFilter::GetLevelReport(bool warnings_only) {
+         agc = cfg->enable_agc;
+     }
+     const uint64_t now = os_gettime_ns();
+-    const float max_gain = agc ? 31.6f : 1.0f; // AGC limit in ASRLoop
++    // Speech whose 10 s peak stays below about -40 dBFS is too quiet. The same threshold
++    // applies with the AGC off (default since 0018): X-ASR still recognised the test speech
++    // scaled down to a -37 dBFS overall peak (work/quiet-20261107), while a level-dependent
++    // threshold would flag normal speech and advise enabling the AGC, which clips it.
++    const float quiet_peak = 0.3f / 31.6f;
+     string out;
+     auto append = [&out, warnings_only](const string &text) {
+         if (!out.empty()) out += warnings_only ? "；" : "\n";
+@@ -232,13 +253,12 @@ std::string ProfanityFilter::GetLevelReport(bool warnings_only) {
+             if (!warnings_only) append(name + "：最近10秒几乎无声（说话时仍如此，请检查所选设备）");
+             continue;
+         }
+-        // Speech for at least 1 s in the window that the AGC still cannot lift near
+-        // its target peak: recognition will be unreliable.
++        // Speech for at least 1 s in the window below the threshold above.
+         // Peaks below -50 dBFS are background noise, not speech that is too quiet.
+-        if (speech >= 1.0f && peak >= 0.003f && peak * max_gain < 0.3f) {
++        if (speech >= 1.0f && peak >= 0.003f && peak < quiet_peak) {
+             snprintf(text, sizeof(text), "识别电平偏低：%s 峰值%.0f dBFS%s", name.c_str(),
+                      20.0 * log10(max(peak, 1e-6f)),
+-                     agc ? "，请调高麦克风音量" : "，建议开启自动增益或调高音量");
++                     agc ? "，请调高麦克风音量" : "，请调高麦克风音量（仍识别不到时再开启自动放大）");
+             append(text);
+             continue;
+         }
+@@ -490,7 +510,9 @@ void ProfanityFilter::ASRLoop() {
+                     // We assume since queue is empty, current_time == tw
+                     
+                     // Use signed math to handle potential small drift
+-                    int64_t diff = (int64_t)tw - (int64_t)(total_samples_popped_16k * current_ratio);
++                    // Input still inside the resampler has not reached the model yet.
++                    int64_t diff = (int64_t)tw - asr_resampler_held -
++                                   (int64_t)(total_samples_popped_16k * current_ratio);
+                     // start_offset_input is uint64, assuming positive result
+                     if (diff >= 0) {
+                         start_offset_input = (uint64_t)diff;
+@@ -967,14 +989,26 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+         current_sr = aoi.samples_per_sec;
+     }
+     if (current_sr == 0) current_sr = 48000; // Fallback
+-    
++    enum speaker_layout current_layout = SPEAKERS_STEREO;
++    if (obs_get_audio_info(&aoi) && aoi.speakers != SPEAKERS_UNKNOWN) current_layout = aoi.speakers;
++
+     // Update state if changed
+     if (sample_rate != current_sr) {
+         previous_audio_end = 0;
+         sample_rate = current_sr;
+         sample_rate_ratio = (double)current_sr / 16000.0;
+-        // Reset resampler
+-        resample_acc = 0.0f;
++    }
++    if (!asr_resampler || asr_resampler_rate != current_sr || asr_resampler_layout != current_layout) {
++        lock_guard<mutex> lock(queue_mutex);
++        if (asr_resampler) audio_resampler_destroy(asr_resampler);
++        struct resample_info src = {current_sr, AUDIO_FORMAT_FLOAT_PLANAR, current_layout};
++        struct resample_info dst = {16000, AUDIO_FORMAT_FLOAT, SPEAKERS_MONO};
++        asr_resampler = audio_resampler_create(&dst, &src);
++        if (!asr_resampler) BLOG(LOG_ERROR, "Unable to create the 16 kHz model input resampler");
++        asr_resampler_rate = current_sr;
++        asr_resampler_layout = current_layout;
++        asr_resampler_in = asr_resampler_out = 0;
++        asr_resampler_held = 0;
+     }
+     
+     double current_ratio = sample_rate_ratio.load();
+@@ -1030,24 +1064,22 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+             asr_dropped_16k += asr_queue.size();
+             asr_queue.clear();
+             asr_dropped_16k += (uint64_t)(gap_frames / current_ratio);
+-        } else {
+-            for (uint64_t i = 0; i < gap_frames; i++) {
+-                resample_acc += 1.0f;
+-                if (resample_acc >= current_ratio) {
+-                    resample_acc -= (float)current_ratio;
+-                    asr_queue.push_back(0.0f);
+-                }
++        } else if (gap_frames) {
++            // Short gap: feed silence so the model timeline and the resampler stay continuous.
++            static const vector<float> silence(1024, 0.0f);
++            const uint8_t *planes[MAX_AV_PLANES];
++            for (auto &plane : planes) plane = (const uint8_t *)silence.data();
++            for (uint64_t done = 0; done < gap_frames;) {
++                uint32_t n = (uint32_t)min<uint64_t>(silence.size(), gap_frames - done);
++                FeedAsrResampler(planes, n, current_ratio);
++                done += n;
+             }
+         }
+ 
+-        // Dynamic Downsampling (Nearest Neighbor / Accumulator)
+-        for (size_t i = 0; i < frames; i++) {
+-                resample_acc += 1.0f;
+-                if (resample_acc >= current_ratio) {
+-                    resample_acc -= (float)current_ratio;
+-                    asr_queue.push_back(input[i]);
+-                }
+-        }
++        // Model input: 16 kHz mono via libobs' resampler (anti-aliased, all channels).
++        // The plugin used to keep every 3rd sample of the first channel without a low-pass
++        // filter, which folded content above 8 kHz into the speech band (0018).
++        FeedAsrResampler((const uint8_t *const *)audio->data, frames, current_ratio);
+     }
+     
+     // 2. Buffer Logic
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index 9da6337..d5f5fd3 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <obs.h>
++#include <media-io/audio-resampler.h>
++#include <media-io/audio-resampler.h>
+ #include <string>
+ #include <vector>
+ #include <deque>
+@@ -51,8 +53,16 @@ public:
+     std::atomic<uint64_t> total_samples_written{0}; 
+     size_t channels_count = 0;
+     
+-    // Resampler state
+-    float resample_acc = 0.0f;
++    // Model input resampler (audio thread only): libobs/FFmpeg swresample, low-pass before
++    // decimation and all channels downmixed to mono. Output sample k corresponds exactly to
++    // input sample k * ratio; the resampler holds back ~1 ms of input (tools/resampler-align-check.cpp).
++    audio_resampler_t *asr_resampler = nullptr;
++    uint32_t asr_resampler_rate = 0;
++    enum speaker_layout asr_resampler_layout = SPEAKERS_UNKNOWN;
++    uint64_t asr_resampler_in = 0;   // input frames fed
++    uint64_t asr_resampler_out = 0;  // 16 kHz samples produced
++    int64_t asr_resampler_held = 0;  // input frames inside the resampler (queue_mutex)
++    void FeedAsrResampler(const uint8_t *const *data, uint32_t frames, double ratio);
+     
+     // ASR Thread
+     std::thread asr_thread;
+-- 
+2.55.0.windows.5
+

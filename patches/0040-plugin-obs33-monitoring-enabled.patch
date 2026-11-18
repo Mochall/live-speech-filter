@@ -1,0 +1,160 @@
+From 167785e5eb737aed15f21d0057cbac3c43115a02 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 08:33:46 -0700
+Subject: [PATCH] plugin-main: OBS 33 monitoring through
+ obs_source_get/set_monitoring_enabled, resolved in obs.dll at run time (OBS
+ 33 logs a deprecation warning on every obs_source_get/set_monitoring_type
+ call, ~100 lines a minute in companion mode); older OBS keep the type
+ functions
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugin-main.cpp | 71 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index fc5bae9..c24dbc6 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -23,6 +23,12 @@
+ #include <atomic>
+ #include <cmath>
+ #include <map>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ // Status bar items. The bar shows one line: the most serious item and how many more
+ // there are; the tooltip lists them all and a click opens the settings dialog. The log
+@@ -482,6 +488,45 @@ static void DisableCableOnExit() {
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled on exit%s", SetCableRenderEnabled(false) ? "" : " (failed)");
+ }
+ 
++// OBS 33 replaced the monitoring type by an on/off switch and logs a warning on every call of
++// obs_source_get/set_monitoring_type (several per second here). The plugin is built against the
++// OBS 28 SDK, so the new functions are looked up in obs.dll at run time; OBS 33 has no "monitor
++// only" any more and the old type there is exactly on = MONITOR_AND_OUTPUT, off = NONE.
++using get_monitoring_enabled_fn = bool (*)(const obs_source_t *);
++using set_monitoring_enabled_fn = void (*)(obs_source_t *, bool);
++static get_monitoring_enabled_fn monitoring_enabled_get = nullptr;
++static set_monitoring_enabled_fn monitoring_enabled_set = nullptr;
++
++static void resolve_monitoring_api() {
++    static bool done = false;
++    if (done) return;
++    done = true;
++#ifdef _WIN32
++    HMODULE obs = GetModuleHandleW(L"obs.dll");
++    if (!obs) return;
++    auto get = (get_monitoring_enabled_fn)(void *)GetProcAddress(obs, "obs_source_get_monitoring_enabled");
++    auto set = (set_monitoring_enabled_fn)(void *)GetProcAddress(obs, "obs_source_set_monitoring_enabled");
++    if (get && set) {
++        monitoring_enabled_get = get;
++        monitoring_enabled_set = set;
++        blog(LOG_INFO, "[Speech Sync] using obs_source_get/set_monitoring_enabled");
++    }
++#endif
++}
++
++static obs_monitoring_type get_monitoring(obs_source_t *s) {
++    resolve_monitoring_api();
++    if (monitoring_enabled_get)
++        return monitoring_enabled_get(s) ? OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT : OBS_MONITORING_TYPE_NONE;
++    return obs_source_get_monitoring_type(s);
++}
++
++static void set_monitoring(obs_source_t *s, obs_monitoring_type type) {
++    resolve_monitoring_api();
++    if (monitoring_enabled_set) monitoring_enabled_set(s, type != OBS_MONITORING_TYPE_NONE);
++    else obs_source_set_monitoring_type(s, type);
++}
++
+ // In companion mode the cable carries what OBS monitors, so a source is monitored exactly
+ // when it would be heard in an OBS output: active in the program, not muted, enabled.
+ // Muting has to switch monitoring off: since OBS 33.0 a muted source keeps playing to the
+@@ -491,7 +536,7 @@ static void DisableCableOnExit() {
+ // "companion_held" = the user's own monitoring type + 1, switched off while muted and
+ // put back when the source is unmuted or companion mode is turned off.
+ static void companion_apply_monitoring(obs_source_t *s) {
+-    auto type = obs_source_get_monitoring_type(s);
++    auto type = get_monitoring(s);
+     obs_data_t *priv = obs_source_get_private_settings(s);
+     bool ours = obs_data_get_bool(priv, "companion_monitor");
+     int held = (int)obs_data_get_int(priv, "companion_held");
+@@ -506,7 +551,7 @@ static void companion_apply_monitoring(obs_source_t *s) {
+     if (held && !muted) {
+         if (type == OBS_MONITORING_TYPE_NONE) {
+             type = (obs_monitoring_type)(held - 1);
+-            obs_source_set_monitoring_type(s, type);
++            set_monitoring(s, type);
+             blog(LOG_INFO, "[Speech Sync] companion: \"%s\" unmuted, own monitoring restored", name);
+         }
+         obs_data_erase(priv, "companion_held");
+@@ -515,16 +560,16 @@ static void companion_apply_monitoring(obs_source_t *s) {
+         if (type != OBS_MONITORING_TYPE_NONE) {
+             if (ours) obs_data_set_bool(priv, "companion_monitor", false);
+             else obs_data_set_int(priv, "companion_held", (int)type + 1);
+-            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++            set_monitoring(s, OBS_MONITORING_TYPE_NONE);
+             blog(LOG_INFO, "[Speech Sync] companion: \"%s\" muted, monitoring off", name);
+         }
+     } else if (active && type == OBS_MONITORING_TYPE_NONE) {
+-        obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
++        set_monitoring(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
+         obs_data_set_bool(priv, "companion_monitor", true);
+         blog(LOG_INFO, "[Speech Sync] companion: \"%s\" monitor and output", name);
+     } else if (!active && ours) {
+         if (type == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
+-            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++            set_monitoring(s, OBS_MONITORING_TYPE_NONE);
+         obs_data_set_bool(priv, "companion_monitor", false);
+         blog(LOG_INFO, "[Speech Sync] companion: \"%s\" inactive, monitoring off", name);
+     }
+@@ -588,14 +633,14 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+                 if (!is_audio_input(s)) continue;
+                 obs_data_t *priv = obs_source_get_private_settings(s);
+                 if (obs_data_get_bool(priv, "companion_monitor")) {
+-                    if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
+-                        obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
++                    if (get_monitoring(s) == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
++                        set_monitoring(s, OBS_MONITORING_TYPE_NONE);
+                     obs_data_set_bool(priv, "companion_monitor", false);
+                 }
+                 // The user's own monitoring, switched off while the source was muted.
+                 if (int held = (int)obs_data_get_int(priv, "companion_held")) {
+-                    if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_NONE)
+-                        obs_source_set_monitoring_type(s, (obs_monitoring_type)(held - 1));
++                    if (get_monitoring(s) == OBS_MONITORING_TYPE_NONE)
++                        set_monitoring(s, (obs_monitoring_type)(held - 1));
+                     obs_data_erase(priv, "companion_held");
+                 }
+                 obs_data_release(priv);
+@@ -657,10 +702,10 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         int count = 0;
+         for (auto *s : sources) {
+             if (!is_audio_input(s)) continue;
+-            auto type = obs_source_get_monitoring_type(s);
++            auto type = get_monitoring(s);
+             if (type == OBS_MONITORING_TYPE_NONE) continue;
+-            obs_source_set_monitoring_type(s, OBS_MONITORING_TYPE_NONE);
+-            obs_source_set_monitoring_type(s, type);
++            set_monitoring(s, OBS_MONITORING_TYPE_NONE);
++            set_monitoring(s, type);
+             ++count;
+         }
+         blog(LOG_INFO, "[Speech Sync] VB-CABLE enabled: reopened monitoring of %d sources", count);
+@@ -670,7 +715,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         if (!is_audio_input(s)) continue;
+         hook_mute_signal(s);
+         companion_apply_monitoring(s);
+-        if (obs_source_get_monitoring_type(s) == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) &&
++        if (get_monitoring(s) == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) &&
+             !obs_source_muted(s)) {
+             add_warning(WARN_LEAK, std::string("“") + obs_source_get_name(s) +
+                                 "”设为仅监听，伴侣模式下它也会进入直播");
+-- 
+2.55.0.windows.5
+

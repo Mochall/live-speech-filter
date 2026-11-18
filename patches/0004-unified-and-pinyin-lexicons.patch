@@ -1,0 +1,558 @@
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 9eb5024..8cf19b8 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -2,6 +2,7 @@
+ #include "video-delay.hpp"
+ #include "profanity-filter.hpp"
+ #include "logging-macros.hpp"
++#include "utils.hpp"
+ #include <obs-module.h>
+ #include <obs.h>
+ #include <filesystem>
+@@ -10,13 +11,10 @@
+ #include <iomanip>
+ #include <QPointer>
+ #include <QSaveFile>
++#include <QFile>
+ 
+ using namespace std;
+ 
+-// Unified default dirty words list definition removed.
+-// The system dirty words list is now loaded from data/builtin_dirty_words.txt at runtime.
+-
+-
+ static GlobalConfig* g_config = nullptr;
+ static obs_module_t* g_module = nullptr;
+ static QPointer<ConfigDialog> g_dialog;
+@@ -43,17 +41,7 @@ static QString BuiltinWordsPath() {
+ void GlobalConfig::ParsePatterns() {
+     dirty_patterns.clear();
+     
+-    // Combine system and user dirty words
+-    std::string combined = system_dirty_words_str;
+-    if (!combined.empty() && !user_dirty_words_str.empty()) {
+-        combined += ", ";
+-    }
+-    combined += user_dirty_words_str;
+-    
+-    // Update the legacy string just in case
+-    dirty_words_str = combined;
+-
+-    stringstream ss(combined);
++    stringstream ss(dirty_words_str);
+     string item;
+     while (getline(ss, item, ',')) {
+         // Trim
+@@ -70,7 +58,6 @@ void GlobalConfig::ParsePatterns() {
+ void GlobalConfig::Save() {
+     obs_data_t *data = obs_data_create();
+     string path_to_save;
+-    string custom_words_path;
+ 
+     {
+         lock_guard<std::mutex> lock(this->mutex);
+@@ -83,7 +70,6 @@ void GlobalConfig::Save() {
+         // dirty_words stored in external files now
+         obs_data_set_bool(data, "use_pinyin", use_pinyin);
+         obs_data_set_bool(data, "asr_debug_logging", asr_debug_logging);
+-        obs_data_set_bool(data, "comedy_mode", comedy_mode);
+         obs_data_set_int(data, "audio_effect", audio_effect);
+         obs_data_set_int(data, "beep_freq", beep_frequency);
+         obs_data_set_int(data, "beep_mix", beep_mix_percent);
+@@ -98,30 +84,6 @@ void GlobalConfig::Save() {
+         ParsePatterns();
+     }
+     
+-    // Save Custom Dirty Words to custom_dirty_words.txt
+-    if (g_module) {
+-        char *p = obs_module_get_config_path(g_module, "custom_dirty_words.txt");
+-        if (p) {
+-            filesystem::path txtPath(p);
+-            bfree(p);
+-            
+-            if (txtPath.has_parent_path()) {
+-                try {
+-                    filesystem::create_directories(txtPath.parent_path());
+-                } catch(...) {}
+-            }
+-            
+-            try {
+-                ofstream f(txtPath, ios::binary);
+-                if (f.is_open()) {
+-                    unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+-                    f.write((char*)bom, 3);
+-                    f << user_dirty_words_str;
+-                }
+-            } catch(...) {}
+-        }
+-    }
+-    
+     if (g_module) {
+         char *config_path = obs_module_get_config_path(g_module, "global_config.json");
+         if (config_path) {
+@@ -159,51 +121,31 @@ void GlobalConfig::Load() {
+         return res;
+     };
+     
+-    // Helper to read file
+-    auto read_file = [](const string& path) -> string {
+-        if (path.empty() || !filesystem::exists(path)) return "";
+-        try {
+-            ifstream f(path);
+-            if (f.is_open()) {
+-                stringstream buffer;
+-                buffer << f.rdbuf();
+-                return buffer.str();
+-            }
+-        } catch(...) {}
+-        return "";
++    auto read_file = [](const QString &path) -> string {
++        QFile file(path);
++        if (!file.open(QIODevice::ReadOnly)) return "";
++        QString text = QString::fromUtf8(file.readAll());
++        if (text.startsWith(QChar(0xfeff))) text.remove(0, 1);
++        return text.toStdString();
+     };
+-
+-    // Helper to write file
+-    auto write_file = [](const string& path, const string& content) {
+-        if (path.empty()) return;
+-        filesystem::path p(path);
+-        if (p.has_parent_path()) {
+-            try { filesystem::create_directories(p.parent_path()); } catch(...) {}
+-        }
+-        try {
+-            ofstream f(path, ios::binary);
+-            if (f.is_open()) {
+-                unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+-                f.write((char*)bom, 3);
+-                f << content;
+-                f.close();
+-            }
+-        } catch(...) {}
+-    };
+-
+-    // 1. Handle System Dirty Words (builtin_dirty_words.txt)
+-    system_dirty_words_str = read_file(BuiltinWordsPath().toStdString());
+-    
+-    // 2. Handle User/Custom Dirty Words
+-    string custom_path = get_config_path("custom_dirty_words.txt");
+-    
+-    if (filesystem::exists(custom_path)) {
+-        user_dirty_words_str = read_file(custom_path);
++    QString words_path = QString::fromStdString(get_config_path("words.txt"));
++    if (QFile::exists(words_path)) {
++        dirty_words_str = read_file(words_path);
+     } else {
+-        // First run, empty custom list
+-        user_dirty_words_str = "";
+-        write_file(custom_path, ""); 
++        // One-time import preserves the edited bundled list and former custom additions.
++        dirty_words_str = read_file(BuiltinWordsPath());
++        string legacy = read_file(QString::fromStdString(get_config_path("custom_dirty_words.txt")));
++        if (!legacy.empty()) {
++            if (!dirty_words_str.empty()) dirty_words_str += ", ";
++            dirty_words_str += legacy;
++        }
++        QDir().mkpath(QFileInfo(words_path).absolutePath());
++        QSaveFile file(words_path);
++        QByteArray bytes = QByteArray::fromStdString(dirty_words_str);
++        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
++            BLOG(LOG_ERROR, "Unable to persist merged lexicon: %s", file.errorString().toUtf8().constData());
+     }
++    pinyin_words_str = read_file(QString::fromStdString(get_config_path("pinyin_words.txt")));
+ 
+     // 3. Load JSON config
+     string json_path = get_config_path("global_config.json");
+@@ -240,9 +182,6 @@ void GlobalConfig::Load() {
+         use_pinyin = obs_data_get_bool(data, "use_pinyin");
+         asr_debug_logging = obs_data_get_bool(data, "asr_debug_logging");
+         
+-        if (obs_data_has_user_value(data, "comedy_mode")) {
+-            comedy_mode = obs_data_get_bool(data, "comedy_mode");
+-        }
+ 
+         if (obs_data_has_user_value(data, "audio_effect")) {
+             audio_effect = obs_data_get_int(data, "audio_effect");
+@@ -421,51 +360,21 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QGroupBox *grpWords = new QGroupBox("屏蔽词设置");
+     QVBoxLayout *layoutWords = new QVBoxLayout(grpWords);
+     
+-    // Header for Custom Words
+-    QHBoxLayout *headerLayout = new QHBoxLayout();
+-    headerLayout->addWidget(new QLabel("自定义屏蔽词 (逗号分隔):"));
+-    chkHideDirtyWords = new QCheckBox("隐藏内容 (密码模式)");
+-    chkHideDirtyWords->setToolTip("勾选后将隐藏下方自定义屏蔽词内容，防止直播时意外泄露。");
+-    headerLayout->addWidget(chkHideDirtyWords);
+-    headerLayout->addStretch();
+-    layoutWords->addLayout(headerLayout);
+-
+-    editDirtyWords = new QTextEdit();
+-    layoutWords->addWidget(editDirtyWords);
+-    
+-    connect(chkHideDirtyWords, &QCheckBox::toggled, this, [this](bool checked){
+-        if (checked) {
+-            // Hide User Words
+-            m_cachedUserWords = editDirtyWords->toPlainText();
+-            editDirtyWords->setText("****************** (Content Hidden / 内容已隐藏) ******************");
+-            editDirtyWords->setReadOnly(true);
+-            editDirtyWords->setStyleSheet("color: #888; font-style: italic; background-color: #f0f0f0;");
+-            
+-        } else {
+-            // Show User Words
+-            editDirtyWords->setText(m_cachedUserWords);
+-            editDirtyWords->setReadOnly(false);
+-            editDirtyWords->setStyleSheet("");
+-            
+-        }
+-    });
+-    
+-    QPushButton *btnEditBuiltin = new QPushButton("编辑内置词库...");
+-    connect(btnEditBuiltin, &QPushButton::clicked, this, &ConfigDialog::onEditBuiltinWords);
+-    layoutWords->addWidget(btnEditBuiltin);
+-    
+-    chkUsePinyin = new QCheckBox("启用拼音增强识别 (模糊匹配)");
+-    chkUsePinyin->setToolTip("开启后将使用拼音进行匹配，忽略声调和平卷舌差异，提高识别率。");
++    QPushButton *btnWords = new QPushButton("编辑中文屏蔽词库...");
++    connect(btnWords, &QPushButton::clicked, this, [this] { editLexicon(false); });
++    layoutWords->addWidget(btnWords);
++    QPushButton *btnPinyin = new QPushButton("编辑补充拼音词库...");
++    connect(btnPinyin, &QPushButton::clicked, this, [this] { editLexicon(true); });
++    layoutWords->addWidget(btnPinyin);
++
++    chkUsePinyin = new QCheckBox("启用拼音匹配 (中文自动转拼音 + 补充拼音词库)");
++    chkUsePinyin->setToolTip("识别文字转为拼音，与中文词库的拼音及补充拼音词库比较。忽略声调，保留现有平翘舌及前后鼻音归一化。关闭后两类拼音匹配均停止，不影响中文匹配。");
+     layoutWords->addWidget(chkUsePinyin);
+ 
+     chkAsrDebugLogging = new QCheckBox("记录识别调试日志 (默认关闭)");
+     chkAsrDebugLogging->setToolTip("开启后将音源、输入音频时间及变化中的识别文字写入本机 OBS 日志。\n识别文字可能修订；日志包含未消音的对话，请仅在测试时开启，分享日志前检查隐私。");
+     layoutWords->addWidget(chkAsrDebugLogging);
+ 
+-    chkComedyMode = new QCheckBox("精准变声模式 (优先匹配短词)");
+-    chkComedyMode->setToolTip("开启后，当匹配到多个词时（如'我爱你'和'爱你'），\n优先只屏蔽较短的词（'爱你'），从而保留'我'的原声。\n配合变音特效可实现更生动的喜剧效果。");
+-    layoutWords->addWidget(chkComedyMode);
+-
+     containerLayout->addWidget(grpWords);
+ 
+     // GPU Acceleration Group
+@@ -634,13 +543,8 @@ void ConfigDialog::LoadToUI() {
+     spinCensorPadding->setValue(cfg->censor_padding_ms);
+     chkEnableAGC->setChecked(cfg->enable_agc);
+     
+-    // Ensure we are in visible mode before setting text to avoid overwriting "Hidden" text
+-    chkHideDirtyWords->setChecked(false); 
+-    editDirtyWords->setText(QString::fromStdString(cfg->user_dirty_words_str));
+-    
+     chkUsePinyin->setChecked(cfg->use_pinyin);
+     chkAsrDebugLogging->setChecked(cfg->asr_debug_logging);
+-    chkComedyMode->setChecked(cfg->comedy_mode);
+     
+     // Map audio_effect to combo
+     int effect_idx = comboEffect->findData(cfg->audio_effect);
+@@ -819,19 +723,21 @@ void ConfigDialog::onDownloadError(const QString &msg) {
+     QMessageBox::critical(this, "下载失败", "错误信息: " + msg);
+ }
+ 
+-void ConfigDialog::onEditBuiltinWords() {
++void ConfigDialog::editLexicon(bool pinyin) {
+     QDialog dialog(this);
+-    dialog.setWindowTitle("编辑内置词库");
++    dialog.setWindowTitle(pinyin ? "编辑补充拼音词库" : "编辑中文屏蔽词库");
+     dialog.resize(640, 440);
+     QVBoxLayout *layout = new QVBoxLayout(&dialog);
+-    QLabel *help = new QLabel("多个词用英文逗号 , 分隔。保存后立即生效；主设置页的取消不会撤销此次保存。\n修改的是插件内置文件，更新插件可能覆盖它。");
++    QLabel *help = new QLabel(pinyin
++        ? "无声调小写拼音，音节用空格分隔，词条用英文逗号分隔，例如 ji ba, wo cao。\n中文词库已自动转拼音，此处仅作补充。保存立即生效；主设置取消不撤销。"
++        : "多个词用英文逗号 , 分隔。保存后立即生效；主设置页取消不撤销。\n词库存于用户配置目录，插件自带文件仅用于首次导入。原有词条正则语义保持不变。");
+     help->setWordWrap(true);
+     layout->addWidget(help);
+     QTextEdit *editor = new QTextEdit();
+     GlobalConfig *cfg = GetGlobalConfig();
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+-        editor->setPlainText(QString::fromStdString(cfg->system_dirty_words_str));
++        editor->setPlainText(QString::fromStdString(pinyin ? cfg->pinyin_words_str : cfg->dirty_words_str));
+     }
+     layout->addWidget(editor);
+     QHBoxLayout *buttons = new QHBoxLayout();
+@@ -844,33 +750,40 @@ void ConfigDialog::onEditBuiltinWords() {
+     connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+     connect(save, &QPushButton::clicked, &dialog, [&] {
+         QString text = editor->toPlainText();
+-        // Match the existing comma-separated regex format before replacing the file.
+-        stringstream words(text.toStdString());
+-        string word;
+-        while (getline(words, word, ',')) {
+-            word.erase(0, word.find_first_not_of(" \t\n\r"));
+-            word.erase(word.find_last_not_of(" \t\n\r") + 1);
+-            if (word.empty()) continue;
+-            try { regex pattern(word, regex::icase); }
+-            catch (const regex_error &) {
+-                QMessageBox::warning(&dialog, "无法保存", "词条格式无效: " + QString::fromStdString(word));
++        if (pinyin) {
++            vector<vector<string>> patterns;
++            string error;
++            if (!ParsePinyinWords(text.toStdString(), patterns, error)) {
++                QMessageBox::warning(&dialog, "无法保存", "请使用无声调小写拼音，音节用空格、词条用英文逗号分隔，例如 ji ba, wo cao。");
+                 return;
+             }
++        } else {
++            stringstream words(text.toStdString());
++            string word;
++            while (getline(words, word, ',')) {
++                word.erase(0, word.find_first_not_of(" \t\n\r"));
++                word.erase(word.find_last_not_of(" \t\n\r") + 1);
++                if (word.empty()) continue;
++                try { regex pattern(word, regex::icase); }
++                catch (const regex_error &) {
++                    QMessageBox::warning(&dialog, "无法保存", "词条格式无效: " + QString::fromStdString(word));
++                    return;
++                }
++            }
+         }
+-        QString path = BuiltinWordsPath();
+-        if (path.isEmpty()) {
+-            QMessageBox::warning(&dialog, "无法保存", "未找到插件内置词库文件。");
+-            return;
+-        }
++        char *config_path = obs_module_get_config_path(g_module, pinyin ? "pinyin_words.txt" : "words.txt");
++        QString path = config_path ? QString::fromUtf8(config_path) : QString();
++        bfree(config_path);
+         QSaveFile file(path);
+         QByteArray bytes = text.toUtf8();
+         if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+-            QMessageBox::warning(&dialog, "无法保存", "写入内置词库失败，原词库未替换。\n" + file.errorString());
++            QMessageBox::warning(&dialog, "无法保存", "写入词库失败，原词库未替换。\n" + file.errorString());
+             return;
+         }
+         {
+             lock_guard<mutex> lock(cfg->mutex);
+-            cfg->system_dirty_words_str = text.toStdString();
++            if (pinyin) cfg->pinyin_words_str = text.toStdString();
++            else cfg->dirty_words_str = text.toStdString();
+             cfg->ParsePatterns();
+         }
+         dialog.accept();
+@@ -932,15 +845,8 @@ bool ConfigDialog::onApply() {
+         cfg->censor_padding_ms = spinCensorPadding->value();
+         cfg->enable_agc = chkEnableAGC->isChecked();
+         
+-        if (chkHideDirtyWords->isChecked()) {
+-            cfg->user_dirty_words_str = m_cachedUserWords.toStdString();
+-        } else {
+-            cfg->user_dirty_words_str = editDirtyWords->toPlainText().toStdString();
+-        }
+-        
+         cfg->use_pinyin = chkUsePinyin->isChecked();
+         cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
+-        cfg->comedy_mode = chkComedyMode->isChecked();
+         
+         cfg->audio_effect = comboEffect->currentData().toInt();
+ 
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 7d2088b..271f9db 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -40,16 +40,14 @@ struct GlobalConfig {
+     int model_offset_ms = 0; // Model latency compensation
+     double delay_seconds = 0.5;
+     int censor_padding_ms = 1000;
+-    std::string dirty_words_str; // Combined (for internal use)
+-    std::string system_dirty_words_str; // Read-only built-in
+-    std::string user_dirty_words_str;   // User custom
++    std::string dirty_words_str;
++    std::string pinyin_words_str;
+     int audio_effect = 0; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
+     bool enable_agc = true; // Automatic Gain Control (Default: ON)
+     bool use_pinyin = true;
+     bool asr_debug_logging = false;
+-    bool comedy_mode = false;
+     bool video_delay_enabled = true;
+ 
+     // GPU Acceleration Settings
+@@ -79,7 +77,7 @@ public:
+     void LoadToUI();
+ 
+ private slots:
+-    void onEditBuiltinWords();
++    void editLexicon(bool pinyin);
+     void onBrowseModel();
+     void onSave();
+     bool onApply();
+@@ -113,15 +111,11 @@ private:
+     QSpinBox *spinDelay;
+     QSpinBox *spinCensorPadding;
+     QCheckBox *chkEnableAGC;
+-    QTextEdit *editDirtyWords; // User Custom Words
+-    QCheckBox *chkHideDirtyWords;
+-    QString m_cachedUserWords;
+ 
+     QCheckBox *chkMuteMode; // Deprecated UI, replaced by comboEffect
+     QComboBox *comboEffect;
+     QCheckBox *chkUsePinyin;
+     QCheckBox *chkAsrDebugLogging;
+-    QCheckBox *chkComedyMode;
+     QCheckBox *chkEnableVideoDelay;
+     QLabel *lblVideoMemory;
+     QLabel *lblPathTitle; // Added for dynamic label update
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 0c81a22..64688de 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -370,16 +370,16 @@ void ProfanityFilter::ASRLoop() {
+                 GlobalConfig *cfg = GetGlobalConfig();
+                 vector<regex> patterns;
+                 bool use_pinyin;
+-                bool comedy_mode;
+                 int model_offset_ms;
+                 string current_dirty_words;
++                string current_pinyin_words;
+                 {
+                     lock_guard<mutex> lock(cfg->mutex);
+                     patterns = cfg->dirty_patterns; // Copy
+                     use_pinyin = cfg->use_pinyin;
+-                    comedy_mode = cfg->comedy_mode;
+                     model_offset_ms = cfg->model_offset_ms;
+                     current_dirty_words = cfg->dirty_words_str;
++                    current_pinyin_words = cfg->pinyin_words_str;
+                 }
+                 
+                 if (result->count > 0) {
+@@ -536,7 +536,8 @@ void ProfanityFilter::ASRLoop() {
+ 
+                         if (pinyin_converter) {
+                             // Update patterns if changed
+-                            if (current_dirty_words != cached_dirty_words_str_for_pinyin) {
++                            if (current_dirty_words != cached_dirty_words_str_for_pinyin ||
++                                current_pinyin_words != cached_pinyin_words_str) {
+                                 cached_pinyin_patterns.clear();
+                                 stringstream ss(current_dirty_words);
+                                 string item;
+@@ -554,7 +555,16 @@ void ProfanityFilter::ASRLoop() {
+                                         if (!pat.empty()) cached_pinyin_patterns.push_back(pat);
+                                     }
+                                 }
++                                vector<vector<string>> supplemental_patterns;
++                                string parse_error;
++                                if (ParsePinyinWords(current_pinyin_words, supplemental_patterns, parse_error)) {
++                                    cached_pinyin_patterns.insert(cached_pinyin_patterns.end(),
++                                        supplemental_patterns.begin(), supplemental_patterns.end());
++                                } else {
++                                    BLOG(LOG_ERROR, "Supplemental pinyin lexicon ignored: %s", parse_error.c_str());
++                                }
+                                 cached_dirty_words_str_for_pinyin = current_dirty_words;
++                                cached_pinyin_words_str = current_pinyin_words;
+                             }
+ 
+                             // Prepare text pinyin
+@@ -657,40 +667,18 @@ void ProfanityFilter::ASRLoop() {
+                     }
+ 
+                     // 3. Sort and Apply Candidates
+-                    if (comedy_mode) {
+-                        // Comedy Mode: Shortest First
+-                        sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
+-                            return (a.end_sample - a.start_sample) < (b.end_sample - b.start_sample);
+-                        });
+-                    } else {
+-                        // Normal Mode: Longest First (Cover max area)
+-                        sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
+-                            return (a.end_sample - a.start_sample) > (b.end_sample - b.start_sample);
+-                        });
+-                    }
++                    sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
++                        return (a.end_sample - a.start_sample) > (b.end_sample - b.start_sample);
++                    });
+ 
+-                    vector<pair<uint64_t, uint64_t>> covered_intervals;
+                     for(const auto& m : candidates) {
+                         // Skip if already processed in previous frames
+                         if (processed_matches.count(m.start_char)) continue;
+                         
+-                        // Check overlap with currently selected candidates in this frame
+-                        bool overlap = false;
+-                        for(const auto& interval : covered_intervals) {
+-                            // Normal mode must retain the tail of adjacent padded matches.
+-                            if (!comedy_mode) break;
+-                            if (m.start_sample < interval.second && m.end_sample > interval.first) {
+-                                overlap = true;
+-                                break;
+-                            }
+-                        }
+-                        
+-                        if (!overlap) {
++                        {
+                             lock_guard<mutex> b_lock(beep_mutex);
+                             pending_beeps.push_back({m.start_sample, m.end_sample, m.start_sample});
+                             BLOG(LOG_INFO, "%s", m.log_text.c_str());
+-                            
+-                            covered_intervals.push_back({m.start_sample, m.end_sample});
+                         }
+                         
+                         // Always mark as processed to prevent re-evaluation or double-application
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index d0d7ed5..8e3162e 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -80,6 +80,7 @@ public:
+     std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
+     std::vector<std::vector<std::string>> cached_pinyin_patterns;
+     std::string cached_dirty_words_str_for_pinyin;
++    std::string cached_pinyin_words_str;
+     // Cache for single hanzi pinyin to avoid re-conversion
+     std::map<std::string, std::vector<std::string>> pinyin_cache;
+     
+diff --git a/src/utils.cpp b/src/utils.cpp
+index e0046eb..5205478 100644
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -1,4 +1,5 @@
+ #include "utils.hpp"
++#include <sstream>
+ 
+ std::string NormalizePinyin(const std::string& p) {
+     std::string s = p;
+@@ -14,3 +15,27 @@ std::string NormalizePinyin(const std::string& p) {
+     }
+     return s;
+ }
++
++bool ParsePinyinWords(const std::string& text, std::vector<std::vector<std::string>>& patterns,
++                      std::string& error) {
++    patterns.clear();
++    error.clear();
++    std::vector<std::vector<std::string>> parsed;
++    std::istringstream entries(text);
++    std::string entry;
++    while (std::getline(entries, entry, ',')) {
++        std::istringstream syllables(entry);
++        std::vector<std::string> pattern;
++        std::string syllable;
++        while (syllables >> syllable) {
++            if (syllable.find_first_not_of("abcdefghijklmnopqrstuvwxyz") != std::string::npos) {
++                error = "Use lowercase untoned pinyin with spaces between syllables and commas between entries: ji ba, wo cao";
++                return false;
++            }
++            pattern.push_back(NormalizePinyin(syllable));
++        }
++        if (!pattern.empty()) parsed.push_back(std::move(pattern));
++    }
++    patterns = std::move(parsed);
++    return true;
++}
+diff --git a/src/utils.hpp b/src/utils.hpp
+index ea1cb69..2add296 100644
+--- a/src/utils.hpp
++++ b/src/utils.hpp
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
+ #include <string>
++#include <vector>
+ 
+ std::string NormalizePinyin(const std::string& p);
++bool ParsePinyinWords(const std::string& text, std::vector<std::vector<std::string>>& patterns,
++                      std::string& error);

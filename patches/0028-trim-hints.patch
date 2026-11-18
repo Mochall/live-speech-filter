@@ -1,0 +1,57 @@
+From 6fe3c8ffef4f5ded23cadb0dad5b808eddc6c213 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 08:49:43 -0700
+Subject: [PATCH] =?UTF-8?q?trim-hints:=20drop=20the=20=E5=B7=B2=E9=81=BF?=
+ =?UTF-8?q?=E5=BC=80=20phrase=20on=20the=20built-in=20word=20count,=20the?=
+ =?UTF-8?q?=20homophone=20example=20hint,=20and=20the=20payee-check=20line?=
+ =?UTF-8?q?=20in=20the=20sponsor=20dialog=20(user=20request)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp | 7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index ac28c78..d5286a4 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -595,7 +595,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         lock_guard<mutex> lock(cfg->mutex);
+         builtin_count = (int)SplitWordList(cfg->builtin_words_str).size();
+     }
+-    layoutWords->addRow("内置词库：", hint(QString("%1 个词，随插件更新，不提供查看；已避开“操作”“草丛”这类正常说法。").arg(builtin_count)));
++    layoutWords->addRow("内置词库：", hint(QString("%1 个词，随插件更新，不提供查看。").arg(builtin_count)));
+     QHBoxLayout *wordButtons = new QHBoxLayout();
+     QPushButton *btnWords = new QPushButton("编辑自定义屏蔽词…");
+     btnWords->setToolTip("添加内置词库里没有的词，例如某个外号。写普通文字即可。");
+@@ -608,7 +608,6 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     chkUsePinyin = new QCheckBox("同音字也消音（推荐）");
+     chkUsePinyin->setToolTip("开启后按拼音比较，内置词库和自定义屏蔽词都适用。");
+     layoutWords->addRow("", chkUsePinyin);
+-    layoutWords->addRow("", hint("识别结果常有同音别字，例如“我曹”“几把”，开启后也能命中。"));
+     containerLayout->addWidget(grpWords);
+ 
+     // 4. How and when
+@@ -1345,7 +1344,6 @@ void ConfigDialog::updateCompanionUI() {
+ 
+ // The QR image is compiled into the DLL when the build sets SPONSOR_IMAGE (see CMakeLists.txt),
+ // so replacing a file cannot change it. Builds without it read data/sponsor-qr.png instead.
+-// The payee name is shown so a viewer can check it on WeChat's payment page.
+ void ConfigDialog::showSponsorDialog() {
+     QDialog dlg(this);
+     dlg.setWindowTitle("支持项目");
+@@ -1385,9 +1383,6 @@ void ConfigDialog::showSponsorDialog() {
+     }
+     layout->addWidget(image);
+ 
+-    QLabel *check = new QLabel("微信扫码后，请确认付款页显示的收款人是“漠秋”；不是的话，你用的可能是被改过的版本。");
+-    check->setWordWrap(true);
+-    layout->addWidget(check);
+     QLabel *upstream = new QLabel("基于 Cloud370/obs-profanity-filter（GPL-2.0）修改，源代码与许可见插件文件夹里的 licenses。");
+     upstream->setWordWrap(true);
+     upstream->setStyleSheet("color: #9a9cab;");
+-- 
+2.55.0.windows.5
+

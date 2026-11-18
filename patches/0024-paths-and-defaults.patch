@@ -1,0 +1,245 @@
+From 817916949c82ed67af2d05ffd0c161f9f890bccc Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 03:56:04 -0700
+Subject: [PATCH] paths-defaults: homophone default on when key missing;
+ relocate bundled/downloaded model after the OBS folder moved; model and dict
+ paths with Chinese/non-ANSI characters (ANSI code page, 8.3 fallback)
+
+---
+ src/asr-model.cpp        | 69 ++++++++++++++++++++++++++++++++++++++--
+ src/plugin-config.cpp    | 24 +++++++++++++-
+ src/profanity-filter.cpp | 68 ++++++++++++++++++---------------------
+ 3 files changed, 121 insertions(+), 40 deletions(-)
+
+diff --git a/src/asr-model.cpp b/src/asr-model.cpp
+index ab47cb1..6684a91 100644
+--- a/src/asr-model.cpp
++++ b/src/asr-model.cpp
+@@ -3,6 +3,64 @@
+ #include <cstring>
+ #include <cstdio>
+ #include "logging-macros.hpp"
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++namespace {
++#ifdef _WIN32
++std::wstring Widen(const std::string &utf8) {
++    int n = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
++    std::wstring w(n, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), w.data(), n);
++    return w;
++}
++// Wide string -> system ANSI code page, only if every character is representable.
++bool ToAnsi(const std::wstring &w, std::string &out) {
++    BOOL lossy = FALSE;
++    int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(), nullptr, 0, nullptr, &lossy);
++    if (n <= 0 || lossy) return false;
++    out.assign(n, '\0');
++    WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), (int)w.size(), out.data(), n, nullptr, &lossy);
++    return !lossy;
++}
++#endif
++
++bool FileExists(const std::string &utf8) {
++#ifdef _WIN32
++    DWORD attr = GetFileAttributesW(Widen(utf8).c_str());
++    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
++#else
++    if (FILE *file = fopen(utf8.c_str(), "r")) { fclose(file); return true; }
++    return false;
++#endif
++}
++
++// sherpa-onnx opens files with narrow (ANSI code page) paths on Windows, so a UTF-8 path
++// with Chinese characters is not found. Convert to the ANSI code page (Chinese Windows:
++// GBK, covers Chinese folder names); otherwise use the 8.3 short name; empty = impossible.
++std::string NativePath(const std::string &utf8) {
++#ifdef _WIN32
++    bool ascii = true;
++    for (unsigned char c : utf8) ascii = ascii && c < 0x80;
++    if (ascii) return utf8;
++    std::wstring w = Widen(utf8);
++    std::string out;
++    if (ToAnsi(w, out)) return out;
++    DWORD n = GetShortPathNameW(w.c_str(), nullptr, 0);
++    if (n) {
++        std::wstring s(n, L'\0');
++        n = GetShortPathNameW(w.c_str(), s.data(), n);
++        s.resize(n);
++        if (n && ToAnsi(s, out)) return out;
++    }
++    return std::string();
++#else
++    return utf8;
++#endif
++}
++} // namespace
+ 
+ ASRModel::ASRModel(const std::string& path, const std::string& prov, std::string& error_msg)
+     : model_path(path), provider(prov) {
+@@ -19,8 +77,7 @@ ASRModel::ASRModel(const std::string& path, const std::string& prov, std::string
+     auto pick = [this](const char *part, std::string &out) {
+         for (const char *suffix : {"-epoch-99-avg-1.onnx", ".onnx", ".int8.onnx", ".fp16.onnx"}) {
+             std::string candidate = model_path + "/" + part + suffix;
+-            if (FILE *file = fopen(candidate.c_str(), "r")) {
+-                fclose(file);
++            if (FileExists(candidate)) {
+                 out = candidate;
+                 return true;
+             }
+@@ -33,6 +90,14 @@ ASRModel::ASRModel(const std::string& path, const std::string& prov, std::string
+             return;
+         }
+     }
++    for (std::string *p : {&tokens, &encoder, &decoder, &joiner}) {
++        std::string native = NativePath(*p);
++        if (native.empty()) {
++            error_msg = "模型所在文件夹的路径含有系统无法识别的字符，请把 OBS 放到只含中文、英文和数字的文件夹";
++            return;
++        }
++        *p = native;
++    }
+ 
+     config.model_config.transducer.encoder = encoder.c_str();
+     config.model_config.transducer.decoder = decoder.c_str();
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index f5dc0e6..ccaa3b4 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -317,6 +317,25 @@ void GlobalConfig::Load() {
+         if (model_path.empty())
+             model_path = PluginModelManager::BundledModelPath(PluginModelManager::kDefaultModelId).toStdString();
+     };
++    // The model folder is saved as an absolute path. When the OBS folder was moved (portable
++    // install copied to another drive), bundled models and models downloaded into the plugin
++    // config folder move with it: find the same model folder name there. A folder the user
++    // picked elsewhere is left alone (the engine then reports the missing files).
++    auto relocate_model = [this, &get_config_path] {
++        if (model_path.empty()) return;
++        QString saved = QString::fromStdString(model_path);
++        if (QFileInfo::exists(QDir(saved).filePath("tokens.txt"))) return;
++        QString name = QDir(saved).dirName();
++        QString found = PluginModelManager::BundledModelPath(name);
++        if (found.isEmpty()) {
++            QString downloaded = QDir(QString::fromStdString(get_config_path("models"))).filePath(name);
++            if (!name.isEmpty() && QFileInfo::exists(QDir(downloaded).filePath("tokens.txt")))
++                found = QDir(downloaded).absolutePath();
++        }
++        if (found.isEmpty()) return;
++        blog(LOG_INFO, "[Profanity Filter] model folder moved: %s -> %s", model_path.c_str(), found.toUtf8().constData());
++        model_path = found.toStdString();
++    };
+     
+     if (json_path.empty() || !filesystem::exists(json_path)) {
+         is_first_run = true;
+@@ -337,6 +356,7 @@ void GlobalConfig::Load() {
+ 
+         const char* s = obs_data_get_string(data, "model_path");
+         model_path = s ? s : "";
++        relocate_model();
+         default_model();
+         
+         if (obs_data_has_user_value(data, "model_offset_ms")) {
+@@ -349,7 +369,9 @@ void GlobalConfig::Load() {
+             censor_padding_ms = (int)obs_data_get_int(data, "censor_padding_ms");
+         }
+         
+-        use_pinyin = obs_data_get_bool(data, "use_pinyin");
++        // Missing key keeps the default (on); a plain get_bool would read it as off.
++        if (obs_data_has_user_value(data, "use_pinyin"))
++            use_pinyin = obs_data_get_bool(data, "use_pinyin");
+         asr_debug_logging = obs_data_get_bool(data, "asr_debug_logging");
+         
+ 
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 30219cb..8d241df 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -573,50 +573,44 @@ void ProfanityFilter::ASRLoop() {
+                     // 2. Pinyin Matching
+                     if (use_pinyin) {
+                         if (!pinyin_converter) {
+-                            // Try to locate dict directory relative to the plugin DLL
+-                            string dict_path;
+-                            
+-                            // Method 1: Try OBS data path (Standard Install)
++                            // Locate the dict directory. Paths are kept as filesystem::path built
++                            // from UTF-8/wide strings: a narrow std::string is read in the ANSI
++                            // code page and misses folders with Chinese names (then homophone
++                            // matching was silently off).
++                            filesystem::path dict_dir;
++                            std::error_code ec;
++
++                            // Method 1: OBS data path (data/obs-plugins/<plugin>/dict), UTF-8
+                             char *obs_data_ptr = obs_module_file("dict");
+                             if (obs_data_ptr) {
+-                                if (filesystem::exists(obs_data_ptr)) {
+-                                    dict_path = obs_data_ptr;
+-                                }
++                                int wn = MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, nullptr, 0);
++                                std::wstring wide(wn > 0 ? wn - 1 : 0, L' ');
++                                if (wn > 1) MultiByteToWideChar(CP_UTF8, 0, obs_data_ptr, -1, wide.data(), wn);
++                                filesystem::path p(wide);
++                                if (filesystem::exists(p, ec)) dict_dir = p;
+                                 bfree(obs_data_ptr);
+                             }
+-                            
+-                            // Method 2: Try next to DLL (Portable / Dev) or Self-contained bundle
+-                                if (dict_path.empty()) {
+-                                    HMODULE hMod = nullptr;
+-                                    MEMORY_BASIC_INFORMATION mbi;
+-                                    if (VirtualQuery((LPCVOID)&ModuleLocator, &mbi, sizeof(mbi))) {
+-                                        hMod = (HMODULE)mbi.AllocationBase;
+-                                    }
+-                                    
+-                                    if (hMod) {
+-                                        char path[MAX_PATH];
+-                                        if (GetModuleFileNameA(hMod, path, MAX_PATH)) {
+-                                            filesystem::path p(path);
+-                                            
+-                                            // 1. Check next to DLL (e.g. local build: bin/64bit/dict)
+-                                            filesystem::path p_next = p.parent_path() / "dict";
+-                                            if (filesystem::exists(p_next)) {
+-                                                dict_path = p_next.string();
+-                                            } else {
+-                                                // 2. Check standard plugin structure (root/data/dict)
+-                                                filesystem::path p_bundle = p.parent_path().parent_path().parent_path() / "data" / "dict";
+-                                                if (filesystem::exists(p_bundle)) {
+-                                                    dict_path = p_bundle.string();
+-                                                }
+-                                            }
+-                                        }
+-                                    }
++
++                            // Method 2: next to the DLL (dev build) or <root>/data/dict
++                            if (dict_dir.empty()) {
++                                MEMORY_BASIC_INFORMATION mbi;
++                                HMODULE hMod = VirtualQuery((LPCVOID)&ModuleLocator, &mbi, sizeof(mbi))
++                                                   ? (HMODULE)mbi.AllocationBase : nullptr;
++                                wchar_t path[MAX_PATH];
++                                if (hMod && GetModuleFileNameW(hMod, path, MAX_PATH)) {
++                                    filesystem::path p(path);
++                                    filesystem::path p_next = p.parent_path() / "dict";
++                                    filesystem::path p_bundle = p.parent_path().parent_path().parent_path() / "data" / "dict";
++                                    if (filesystem::exists(p_next, ec)) dict_dir = p_next;
++                                    else if (filesystem::exists(p_bundle, ec)) dict_dir = p_bundle;
+                                 }
++                            }
+ 
+-                            if (!dict_path.empty()) {
+-                                Pinyin::setDictionaryPath(dict_path);
++                            if (!dict_dir.empty()) {
++                                Pinyin::setDictionaryPath(dict_dir);
+                                 pinyin_converter = make_shared<Pinyin::Pinyin>();
+-                                BLOG(LOG_INFO, "Pinyin Engine Initialized from: %s", dict_path.c_str());
++                                auto u8 = dict_dir.u8string();
++                                BLOG(LOG_INFO, "Pinyin Engine Initialized from: %s", std::string(u8.begin(), u8.end()).c_str());
+                             } else {
+                                 static bool logged_error = false;
+                                 if (!logged_error) {
+-- 
+2.55.0.windows.5
+

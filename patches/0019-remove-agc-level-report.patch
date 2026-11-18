@@ -1,0 +1,416 @@
+From 5ddd99939de7255deb909cda294550e38684e7f9 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 15:31:55 -0700
+Subject: [PATCH] no-agc-level: remove recognition AGC and the level report;
+ keep only the microphone no-data warning (levels are read from the OBS mixer)
+
+---
+ src/plugin-config.cpp    |  17 ----
+ src/plugin-config.hpp    |   3 -
+ src/plugin-main.cpp      |   2 +-
+ src/profanity-filter.cpp | 165 ++++-----------------------------------
+ src/profanity-filter.hpp |  19 +----
+ 5 files changed, 17 insertions(+), 189 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 9b7f6f9..824bd43 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -206,7 +206,6 @@ void GlobalConfig::Save() {
+         obs_data_set_int(data, "audio_effect", audio_effect);
+         obs_data_set_int(data, "beep_freq", beep_frequency);
+         obs_data_set_int(data, "beep_mix", beep_mix_percent);
+-        obs_data_set_bool(data, "enable_agc", enable_agc);
+         obs_data_set_int(data, "sync_mode", sync_mode);
+         obs_data_set_bool(data, "auto_filter_microphones", auto_filter_microphones);
+         obs_data_set_bool(data, "companion_mode", companion_mode);
+@@ -328,9 +327,6 @@ void GlobalConfig::Load() {
+             beep_mix_percent = obs_data_get_int(data, "beep_mix");
+         }
+         
+-        if (obs_data_has_user_value(data, "enable_agc")) {
+-            enable_agc = obs_data_get_bool(data, "enable_agc");
+-        }
+ 
+         if (obs_data_has_user_value(data, "sync_mode")) {
+             sync_mode = (int)obs_data_get_int(data, "sync_mode");
+@@ -477,8 +473,6 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     spinDelay->setSingleStep(50);
+     spinDelay->setSuffix(" ms");
+     
+-    chkEnableAGC = new QCheckBox("自动放大识别用的声音（声音很小时才开）");
+-    chkEnableAGC->setToolTip("把送去识别的声音自动放大（不影响直播里的声音）。\n一般不要开：声音正常时放大过头会失真，反而识别得更差。只有麦克风声音很小、识别不到时才开。");
+ 
+     // Audio Effect Selection
+     comboEffect = new QComboBox();
+@@ -503,14 +497,9 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutAudio->addRow("延迟说明:", lblLatency);
+     connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
+     connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
+-    layoutAudio->addRow("", chkEnableAGC);
+     chkAutoFilterMic = new QCheckBox("自动过滤主播麦克风");
+     chkAutoFilterMic->setToolTip("开启后，自动给场景中的麦克风音源（音频输入采集）加上识别过滤滤镜。\n麦克风设备选“默认”时跟随Windows默认录音设备。\n关闭后移除自动添加的麦克风滤镜（开启音画同步时改为仅同步延迟）；手动添加的滤镜不受影响。");
+     layoutAudio->addRow("", chkAutoFilterMic);
+-    lblRecognitionLevel = new QLabel("识别输入电平：无活跃来源");
+-    lblRecognitionLevel->setWordWrap(true);
+-    lblRecognitionLevel->setToolTip("各过滤来源最近10秒的原始输入峰值和识别用自动增益。\n自动增益只放大送去识别的副本，不改变直播输出音量。");
+-    layoutAudio->addRow("识别电平:", lblRecognitionLevel);
+     layoutAudio->addRow("屏蔽音效:", comboEffect);
+     
+     comboSyncMode = new QComboBox();
+@@ -788,7 +777,6 @@ void ConfigDialog::LoadToUI() {
+     spinModelOffset->setValue(cfg->model_offset_ms);
+     spinDelay->setValue((int)(cfg->delay_seconds * 1000));
+     spinCensorPadding->setValue(cfg->censor_padding_ms);
+-    chkEnableAGC->setChecked(cfg->enable_agc);
+     
+     chkUsePinyin->setChecked(cfg->use_pinyin);
+     chkAsrDebugLogging->setChecked(cfg->asr_debug_logging);
+@@ -865,10 +853,6 @@ void ConfigDialog::updateStatus() {
+         if (text.isEmpty()) text = "没有可检查的音源。";
+         if (lblAudioSetup->text() != text) lblAudioSetup->setText(text);
+     }
+-    {
+-        auto level = ProfanityFilter::GetLevelReport(false);
+-        lblRecognitionLevel->setText(QString::fromStdString(level.empty() ? "无活跃来源" : level));
+-    }
+     // Model Status Update
+     auto status = ProfanityFilter::GetGlobalModelStatus();
+     lblModelStatus->setText(QString::fromStdString(status.second));
+@@ -1134,7 +1118,6 @@ bool ConfigDialog::onApply() {
+         cfg->model_offset_ms = spinModelOffset->value();
+         cfg->delay_seconds = (double)spinDelay->value() / 1000.0;
+         cfg->censor_padding_ms = spinCensorPadding->value();
+-        cfg->enable_agc = chkEnableAGC->isChecked();
+         
+         cfg->use_pinyin = chkUsePinyin->isChecked();
+         cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 6a67255..d9cf71c 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -64,7 +64,6 @@ struct GlobalConfig {
+     int audio_effect = 1; // 0=Beep, 1=Silence (default, user choice), 2=Squeaky, 3=Robot
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
+-    bool enable_agc = false; // Automatic Gain Control (Default: OFF since 0018: it clipped normal-level speech)
+     bool use_pinyin = true;
+     bool asr_debug_logging = false;
+     // Runtime state, decided every second by UpdateVideoDelayFiltersState from sync_mode;
+@@ -146,13 +145,11 @@ private:
+     QProgressBar *progressDownload;
+     QLabel *lblDownloadStatus;
+     QLabel *lblModelStatus;
+-    QLabel *lblRecognitionLevel;
+ 
+     PluginModelManager *modelManager;
+ 
+     QSpinBox *spinDelay;
+     QSpinBox *spinCensorPadding;
+-    QCheckBox *chkEnableAGC;
+     QCheckBox *chkAutoFilterMic;
+     QComboBox *comboBroadcastMode; // 0 = OBS streams itself, 1 = companion app
+     bool showCompanionChecklist();
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index e32a890..6323c9e 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -77,7 +77,7 @@ static void start_filter_warning() {
+             if (!message.empty()) message += "；";
+             message += recognition;
+         }
+-        auto level = ProfanityFilter::GetLevelReport(true);
++        auto level = ProfanityFilter::GetMicDataWarning();
+         if (!level.empty()) {
+             if (!message.empty()) message += "；";
+             message += level;
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index a96adc6..7d23381 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -160,113 +160,28 @@ static bool is_microphone_source(obs_source_t *source) {
+                   !strcmp(id, "pulse_input_capture"));
+ }
+ 
+-// Called on the audio thread for every packet with the raw input (before AGC).
+-// A packet counts as speech when it is clearly (12 dB) above the quietest packet of
+-// the previous window and not near digital silence; that keeps a quiet room from
+-// looking like "quiet speech" while a turned-down microphone still shows up.
+-void ProfanityFilter::UpdateInputLevel(float rms, float peak, size_t frames) {
+-    const uint64_t now = os_gettime_ns();
+-    last_packet_ns = now;
+-    if (peak >= 0.999f) last_clip_ns = now;
+-    if (!level_window_start_ns) {
+-        level_window_start_ns = now;
+-        window_peak = 0.0f;
+-        window_min_rms = 1.0f;
+-        window_speech_frames = 0;
+-    }
+-    window_peak = max(window_peak, peak);
+-    // Some devices gate silence to exact zeros; those packets say nothing about the
+-    // noise floor (and an all-zero window is normal when nobody speaks).
+-    if (rms > 1e-6f) window_min_rms = min(window_min_rms, rms);
+-    // Absolute floor -60 dBFS RMS: KOOK carried phone-mic background noise at about
+-    // -60 dBFS peak (2026-11-07), which a -70 dBFS floor counted as speech.
+-    if (rms > max(noise_floor_rms * 4.0f, 0.001f)) window_speech_frames += frames;
+-    if (now - level_window_start_ns >= 10000000000ULL) {
+-        uint32_t sr = sample_rate.load(); if (!sr) sr = 48000;
+-        level_peak = window_peak;
+-        level_speech_s = (float)window_speech_frames / (float)sr;
+-        level_publish_ns = now;
+-        if (level_debug) {
+-            obs_source_t *parent = obs_filter_get_parent(context);
+-            BLOG(LOG_INFO, "[Level] source=\"%s\" peak=%.1f dBFS floor_rms=%.1f dBFS speech=%.1f s",
+-                 parent ? obs_source_get_name(parent) : "?", 20.0 * log10(max(window_peak, 1e-7f)),
+-                 window_min_rms < 1.0f ? 20.0 * log10(window_min_rms) : -140.0, level_speech_s.load());
+-        }
+-        if (window_min_rms < 1.0f) noise_floor_rms = window_min_rms;
+-        level_window_start_ns = 0;
+-    }
+-}
+-
+-std::string ProfanityFilter::GetLevelReport(bool warnings_only) {
++// A microphone capture delivers packets continuously, also in silence; no packets for a few
++// seconds means the device was unplugged or is held exclusively by another program. The
++// OBS mixer cannot show this (a dead device looks like silence). Level, clipping and
++// "too quiet" are left to the OBS mixer meters (0019).
++std::string ProfanityFilter::GetMicDataWarning() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     if (!cfg) return "";
+-    bool agc;
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+         if (!cfg->global_enable) return "";
+-        agc = cfg->enable_agc;
+     }
+     const uint64_t now = os_gettime_ns();
+-    // Speech whose 10 s peak stays below about -40 dBFS is too quiet. The same threshold
+-    // applies with the AGC off (default since 0018): X-ASR still recognised the test speech
+-    // scaled down to a -37 dBFS overall peak (work/quiet-20261107), while a level-dependent
+-    // threshold would flag normal speech and advise enabling the AGC, which clips it.
+-    const float quiet_peak = 0.3f / 31.6f;
+     string out;
+-    auto append = [&out, warnings_only](const string &text) {
+-        if (!out.empty()) out += warnings_only ? "；" : "\n";
+-        out += text;
+-    };
+     lock_guard<mutex> lock(instances_mutex);
+     for (auto *filter : instances) {
+         obs_source_t *parent = obs_filter_get_parent(filter->context);
+         if (filter->delay_only || !filter->enabled || !obs_source_enabled(filter->context) ||
+-            !parent || !obs_source_active(parent) || obs_source_muted(parent)) continue;
+-        string name = obs_source_get_name(parent);
+-        bool mic = is_microphone_source(parent);
+-        uint64_t last_packet = filter->last_packet_ns.load();
+-        uint64_t published = filter->level_publish_ns.load();
+-        uint64_t clip = filter->last_clip_ns.load();
+-        bool fresh = published && now - published < 15000000000ULL;
+-        float peak = filter->level_peak.load();
+-        float speech = filter->level_speech_s.load();
+-        char text[320];
+-        if (mic && now - max(last_packet, filter->created_ns) > 3000000000ULL) {
+-            // Microphone captures deliver packets continuously; application captures
+-            // go idle during silence by design, so only microphones are checked.
+-            append("麦克风无数据：" + name + "（设备断开或被占用？）");
+-            continue;
+-        }
+-        if (clip && now - clip < 10000000000ULL) {
+-            append("电平过载：" + name + " 输入削波，请调低麦克风/音源音量");
+-            continue;
+-        }
+-        if (!fresh) {
+-            if (!warnings_only) append(name + "：电平统计中");
+-            continue;
+-        }
+-        // Not a status-bar warning: gated microphones deliver exact zeros whenever
+-        // nobody speaks, and a quiet room on a good mic peaks near -70 dBFS (measured
+-        // 2026-11-07 on Realtek array/jack inputs), so silence cannot be told apart from
+-        // a wrong or dead device. Shown in the dialog for the user to judge while talking.
+-        if (peak < 0.0005f) {
+-            if (!warnings_only) append(name + "：最近10秒几乎无声（说话时仍如此，请检查所选设备）");
+-            continue;
+-        }
+-        // Speech for at least 1 s in the window below the threshold above.
+-        // Peaks below -50 dBFS are background noise, not speech that is too quiet.
+-        if (speech >= 1.0f && peak >= 0.003f && peak < quiet_peak) {
+-            snprintf(text, sizeof(text), "识别电平偏低：%s 峰值%.0f dBFS%s", name.c_str(),
+-                     20.0 * log10(max(peak, 1e-6f)),
+-                     agc ? "，请调高麦克风音量" : "，请调高麦克风音量（仍识别不到时再开启自动放大）");
+-            append(text);
++            !parent || !obs_source_active(parent) || obs_source_muted(parent) || !is_microphone_source(parent))
+             continue;
+-        }
+-        if (!warnings_only) {
+-            float gain = filter->agc_gain.load();
+-            snprintf(text, sizeof(text), "%s：峰值 %.0f dBFS，有声约%.0f秒/10秒，识别增益 %+.0f dB",
+-                     name.c_str(), 20.0 * log10(max(peak, 1e-6f)), speech, 20.0 * log10(max(gain, 1e-6f)));
+-            append(text);
++        if (now - max(filter->last_packet_ns.load(), filter->created_ns) > 3000000000ULL) {
++            if (!out.empty()) out += "；";
++            out += string("麦克风无数据：") + obs_source_get_name(parent) + "（设备断开或被占用？）";
+         }
+     }
+     return out;
+@@ -370,8 +285,6 @@ void ProfanityFilter::ASRLoop() {
+     uint64_t start_offset_input = 0;
+     uint64_t last_feed_offset = 0;
+     
+-    // AGC State
+-    float current_agc_gain = 1.0f;
+     
+     uint64_t tw = total_samples_written.load();
+     if (tw > 0) {
+@@ -392,7 +305,6 @@ void ProfanityFilter::ASRLoop() {
+     uint64_t last_debug_segment = 0;
+     while (running) {
+         // Poll Global Config for model path changes and Gain settings
+-        bool enable_agc = true;
+         int censor_padding_ms;
+         bool asr_debug_logging;
+         string target_provider = "cpu";
+@@ -402,7 +314,6 @@ void ProfanityFilter::ASRLoop() {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+ 
+             std::string desired_path = cfg->global_enable ? cfg->model_path : "";
+-            enable_agc = cfg->enable_agc;
+             censor_padding_ms = cfg->censor_padding_ms;
+             asr_debug_logging = cfg->asr_debug_logging;
+ 
+@@ -528,46 +439,9 @@ void ProfanityFilter::ASRLoop() {
+         
+         total_samples_popped_16k += chunk.size();
+         
+-        // --- Gain Processing (AGC) ---
+-        // Create a copy for model processing so output audio remains original
+-        vector<float> model_chunk = chunk;
+-        
+-        if (enable_agc) {
+-            // Automatic Gain Control
+-            float peak = 0.0001f;
+-            for (float s : model_chunk) {
+-                float abs_s = fabsf(s);
+-                if (abs_s > peak) peak = abs_s;
+-            }
+-            
+-            // Target Peak: 0.6 (-4.4 dB)
+-            float target_peak = 0.6f;
+-            float desired_gain = target_peak / peak;
+-            
+-            // Constraints
+-            if (desired_gain > 31.6f) desired_gain = 31.6f; // Max +30dB
+-            if (desired_gain < 0.1f) desired_gain = 0.1f;   // Min -20dB
+-            
+-            // Smooth Update
+-            if (desired_gain < current_agc_gain) {
+-                // Attack (fast reduction)
+-                current_agc_gain = current_agc_gain * 0.9f + desired_gain * 0.1f;
+-            } else {
+-                // Release (slow increase)
+-                current_agc_gain = current_agc_gain * 0.99f + desired_gain * 0.01f;
+-            }
+-            
+-            // Apply to model_chunk ONLY
+-            for (float &s : model_chunk) {
+-                s *= current_agc_gain;
+-                if (s > 1.0f) s = 1.0f;
+-                if (s < -1.0f) s = -1.0f;
+-            }
+-        } else {
+-             current_agc_gain = 1.0f; // Reset if disabled
+-        }
+-        agc_gain = current_agc_gain;
+-        // ---------------------------------------
++        // The model gets the resampled input unchanged. The former AGC (removed in 0019) lifted
++        // normal-level speech up to 31.6x and clipped it at +-1, which cost recognitions.
++        const vector<float> &model_chunk = chunk;
+ 
+         if (asr_model && asr_model->recognizer && stream) {
+             SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, model_chunk.data(), (int32_t)model_chunk.size());
+@@ -946,7 +820,6 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+         global_effect = cfg->audio_effect;
+         global_freq = cfg->beep_frequency;
+         global_mix = cfg->beep_mix_percent;
+-        level_debug = cfg->asr_debug_logging;
+         global_enable = cfg->global_enable;
+         if (delay_only && !cfg->video_delay_enabled) global_enable = false;
+     }
+@@ -970,18 +843,8 @@ struct obs_audio_data *ProfanityFilter::ProcessAudio(struct obs_audio_data *audi
+     }
+     cached_delay = global_delay;
+     
+-    // 1. Push to ASR (Only if enabled and model loaded)
+-    // But we always calculate RMS for status
+-    const float *input = (const float *)audio->data[0];
+-    double sum_sq = 0.0;
+-    float packet_peak = 0.0f;
+-    for (size_t i = 0; i < frames; i++) {
+-        sum_sq += input[i] * input[i];
+-        packet_peak = max(packet_peak, fabsf(input[i]));
+-    }
+-    current_rms = (float)sqrt(sum_sq / frames);
+-    UpdateInputLevel(current_rms, packet_peak, frames);
+-    
++    last_packet_ns = os_gettime_ns();
++
+     // Update Sample Rate (Dynamic)
+     uint32_t current_sr = 0;
+     struct obs_audio_info aoi;
+diff --git a/src/profanity-filter.hpp b/src/profanity-filter.hpp
+index d5f5fd3..bb162ed 100644
+--- a/src/profanity-filter.hpp
++++ b/src/profanity-filter.hpp
+@@ -84,7 +84,6 @@ public:
+     
+     std::string initialization_error = "";
+     std::atomic<bool> is_loading{false};
+-    float current_rms = 0.0f;
+     
+     obs_data_t *settings = nullptr;
+     uint64_t last_reset_sample_16k = 0;
+@@ -95,15 +94,8 @@ public:
+     std::atomic<uint64_t> last_late_beep_ns{0};
+     std::atomic<size_t> audio_gap_count{0};
+ 
+-    // Recognition input level of the raw (pre-AGC) input, published every 10 s by the
+-    // audio thread and read by the UI thread.
+-    std::atomic<float> level_peak{0.0f};       // max sample peak in the last window
+-    std::atomic<float> level_speech_s{0.0f};   // seconds clearly above the noise floor
+-    std::atomic<uint64_t> level_publish_ns{0};
+-    std::atomic<uint64_t> last_clip_ns{0};
+-    std::atomic<uint64_t> last_packet_ns{0};
++    std::atomic<uint64_t> last_packet_ns{0}; // for GetMicDataWarning
+     uint64_t created_ns = 0;
+-    std::atomic<float> agc_gain{1.0f};         // gain applied to the ASR copy only
+     
+     // Pinyin Support
+     std::shared_ptr<Pinyin::Pinyin> pinyin_converter;
+@@ -122,7 +114,6 @@ public:
+     void ASRLoop();
+     
+     struct obs_audio_data *ProcessAudio(struct obs_audio_data *audio);
+-    void UpdateInputLevel(float rms, float peak, size_t frames);
+ 
+     // Static Global Status Access
+     static std::set<ProfanityFilter*> instances;
+@@ -131,17 +122,11 @@ public:
+     static std::string GetAudioSyncWarning();
+     static std::string GetRecognitionWarning();
+     // Per-source level lines (dialog) or level warnings only (status bar).
+-    static std::string GetLevelReport(bool warnings_only);
++    static std::string GetMicDataWarning();
+ 
+ private:
+     uint64_t previous_audio_end = 0;
+     size_t previous_delay_samples = 0;
+     uint64_t buffered_samples = 0;
+     std::atomic<bool> audio_warming{true};
+-    uint64_t level_window_start_ns = 0;
+-    float window_peak = 0.0f;
+-    float window_min_rms = 0.0f;
+-    uint64_t window_speech_frames = 0;
+-    float noise_floor_rms = 0.0f;
+-    bool level_debug = false;
+ };
+-- 
+2.55.0.windows.5
+

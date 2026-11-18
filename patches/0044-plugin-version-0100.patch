@@ -1,0 +1,59 @@
+From 8e990b00d8a067e73ad5607ab6e4edad3edc7211 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Wed, 18 Nov 2026 03:40:08 -0700
+Subject: [PATCH] Plugin version 0.10.0 (same number as the standalone
+ program), author/website in buildspec point to the project repository,
+ version logged when the module loads
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt      | 2 ++
+ buildspec.json      | 6 +++---
+ src/plugin-main.cpp | 2 ++
+ 3 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index aabc991..2922a0e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,6 +51,8 @@ endif()
+ 
+ 
+ add_library(${CMAKE_PROJECT_NAME} MODULE)
++# Same version number as the standalone program (one release for both, from buildspec.json).
++target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE LSF_PLUGIN_VERSION="${PROJECT_VERSION}")
+ 
+ find_package(libobs REQUIRED)
+ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+diff --git a/buildspec.json b/buildspec.json
+index aadde7f..8343c35 100644
+--- a/buildspec.json
++++ b/buildspec.json
+@@ -38,8 +38,8 @@
+     },
+     "name": "obs-profanity-filter",
+     "displayName": "OBS Profanity Filter",
+-    "version": "0.3.0",
+-    "author": "Developer",
+-    "website": "https://github.com/your-repo/obs-profanity-filter",
++    "version": "0.10.0",
++    "author": "Mochall (based on Cloud370/obs-profanity-filter)",
++    "website": "https://github.com/Mochall/live-speech-filter",
+     "email": "y@7z.ee"
+ }
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 025e585..25b6c6b 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -348,6 +348,8 @@ static void frontend_event(enum obs_frontend_event event, void *) {
+ MODULE_EXPORT bool obs_module_load(void)
+ {
+     InstallCensorLogHandler();
++    blog(LOG_INFO, "[Speech Sync] live-speech-filter plugin %s (https://github.com/Mochall/live-speech-filter)",
++         LSF_PLUGIN_VERSION);
+     obs_register_source(&profanity_filter_info);
+     obs_register_source(&profanity_video_delay_info);
+     
+-- 
+2.55.0.windows.5
+

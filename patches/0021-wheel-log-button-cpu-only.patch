@@ -1,0 +1,422 @@
+From 7a34e09e66a8d26a729179b426c483ff84424908 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 01:04:53 -0700
+Subject: [PATCH] ui-wheel-gpu: number/list fields take the wheel only after a
+ click, open-current-log button, GPU acceleration removed (CPU only)
+
+---
+ src/plugin-config.cpp | 287 ++++++++++--------------------------------
+ src/plugin-config.hpp |  19 ---
+ 2 files changed, 63 insertions(+), 243 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 0f16b69..bafcb54 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -24,6 +24,9 @@
+ #include <QGuiApplication>
+ #include <QSaveFile>
+ #include <QFile>
++#include <QScrollBar>
++#include <QCoreApplication>
++#include <QWheelEvent>
+ 
+ using namespace std;
+ 
+@@ -31,6 +34,40 @@ static GlobalConfig* g_config = nullptr;
+ static obs_module_t* g_module = nullptr;
+ static QPointer<ConfigDialog> g_dialog;
+ 
++// Number and list fields take the mouse wheel only after they are clicked (focused);
++// otherwise the wheel scrolls the settings page, so moving the pointer across the
++// page cannot change a delay or a choice by accident.
++class WheelGuard : public QObject {
++public:
++    WheelGuard(QScrollArea *scroll, QObject *parent) : QObject(parent), scroll(scroll) {}
++
++protected:
++    bool eventFilter(QObject *obj, QEvent *event) override {
++        if (event->type() == QEvent::Wheel) {
++            auto *w = qobject_cast<QWidget *>(obj);
++            if (w && !w->hasFocus()) {
++                QCoreApplication::sendEvent(scroll->verticalScrollBar(), event);
++                return true;
++            }
++        }
++        return QObject::eventFilter(obj, event);
++    }
++
++private:
++    QScrollArea *scroll;
++};
++
++// Newest OBS log file. Module config is <obs config>/plugin_config/<module>/, logs are
++// <obs config>/logs/ (both follow OBS portable mode).
++static QString LatestObsLogPath() {
++    char *p = obs_module_get_config_path(g_module, "");
++    if (!p) return QString();
++    QDir dir(QDir::cleanPath(QString::fromUtf8(p) + "/../../logs"));
++    bfree(p);
++    QFileInfoList files = dir.entryInfoList({"*.txt"}, QDir::Files, QDir::Time);
++    return files.isEmpty() ? dir.absolutePath() : files.first().absoluteFilePath();
++}
++
+ GlobalConfig* GetGlobalConfig() {
+     if (!g_config) {
+         g_config = new GlobalConfig();
+@@ -349,10 +386,9 @@ void GlobalConfig::Load() {
+             delay_follows_padding = obs_data_get_bool(data, "delay_follows_padding");
+         }
+ 
+-        // GPU Settings
+-        if (obs_data_has_user_value(data, "enable_gpu")) {
+-            enable_gpu = obs_data_get_bool(data, "enable_gpu");
+-        }
++        // GPU acceleration was removed (0020): recognition always runs on the CPU and an
++        // enable_gpu left in an older config is ignored (provider/device kept but unused).
++        enable_gpu = false;
+         if (obs_data_has_user_value(data, "onnx_provider")) {
+             const char* provider = obs_data_get_string(data, "onnx_provider");
+             onnx_provider = provider ? provider : "cpu";
+@@ -569,7 +605,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+ 
+     // 5. Advanced: rarely touched once installed
+     btnAdvanced = new QToolButton();
+-    btnAdvanced->setText("高级：识别模型、GPU 加速、排查漏词");
++    btnAdvanced->setText("高级：识别模型、排查漏词");
+     btnAdvanced->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+     btnAdvanced->setArrowType(Qt::RightArrow);
+     btnAdvanced->setCheckable(true);
+@@ -633,88 +669,24 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutModel->addRow("消音位置校准：", spinModelOffset);
+     layoutAdvanced->addWidget(grpModel);
+ 
+-    // GPU Acceleration Group
+-    QGroupBox *grpGpu = new QGroupBox("GPU 加速（实验性）");
+-    QFormLayout *layoutGpu = new QFormLayout(grpGpu);
+-
+-    // Init Runtime Manager
+-    runtimeManager = RuntimeManager::Get();
+-    if (!runtimeManager) {
+-        RuntimeManager::Initialize();
+-        runtimeManager = RuntimeManager::Get();
+-    }
+-    QString runtimeJsonPath;
+-    if (g_module) {
+-        char *runtimePath = obs_find_module_file(g_module, "runtime.json");
+-        if (runtimePath) {
+-            runtimeJsonPath = QString::fromUtf8(runtimePath);
+-            bfree(runtimePath);
+-        }
+-    }
+-    if (runtimeManager) {
+-        runtimeManager->LoadConfig(runtimeJsonPath);
+-        connect(runtimeManager, &RuntimeManager::downloadProgress, this, &ConfigDialog::onRuntimeDownloadProgress);
+-        connect(runtimeManager, &RuntimeManager::downloadFinished, this, &ConfigDialog::onRuntimeDownloadFinished);
+-        connect(runtimeManager, &RuntimeManager::downloadError, this, &ConfigDialog::onRuntimeDownloadError);
+-    }
+-
+-    chkEnableGpu = new QCheckBox("启用 GPU 加速");
+-    chkEnableGpu->setToolTip("用显卡做语音识别。需要下载对应的运行库。");
+-    layoutGpu->addRow(chkEnableGpu);
+-
+-    // GPU settings, shown only while the checkbox is on
+-    gpuSettingsContainer = new QWidget();
+-    QFormLayout *layoutGpuSettings = new QFormLayout(gpuSettingsContainer);
+-    layoutGpuSettings->setContentsMargins(0, 0, 0, 0);
+-
+-    comboProvider = new QComboBox();
+-    comboProvider->addItem("CPU（默认）", "cpu");
+-    comboProvider->addItem("CUDA（NVIDIA 显卡）", "cuda");
+-    connect(comboProvider, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+-        updateGpuStatus();
+-    });
+-    layoutGpuSettings->addRow("运行方式：", comboProvider);
+-
+-    comboGpuDevice = new QComboBox();
+-    QStringList gpuNames = RuntimeManager::GetGpuNames();
+-    if (gpuNames.isEmpty()) {
+-        comboGpuDevice->addItem("未检测到 NVIDIA 显卡", 0);
+-        comboGpuDevice->setEnabled(false);
+-    } else {
+-        for (int i = 0; i < gpuNames.size(); i++) {
+-            comboGpuDevice->addItem(QString("GPU %1：%2").arg(i).arg(gpuNames[i]), i);
+-        }
+-    }
+-    layoutGpuSettings->addRow("显卡：", comboGpuDevice);
+-
+-    lblGpuStatus = new QLabel("检查中…");
+-    layoutGpuSettings->addRow("运行库：", lblGpuStatus);
+-
+-    QHBoxLayout *boxRuntime = new QHBoxLayout();
+-    btnRuntimeAction = new QPushButton("下载 CUDA 运行库");
+-    connect(btnRuntimeAction, &QPushButton::clicked, this, &ConfigDialog::onRuntimeAction);
+-    progressRuntime = new QProgressBar();
+-    progressRuntime->setRange(0, 100);
+-    progressRuntime->setValue(0);
+-    progressRuntime->setVisible(false);
+-    lblRuntimeStatus = new QLabel("");
+-    boxRuntime->addWidget(btnRuntimeAction);
+-    boxRuntime->addWidget(progressRuntime);
+-    boxRuntime->addWidget(lblRuntimeStatus);
+-    boxRuntime->addStretch();
+-    layoutGpuSettings->addRow("", boxRuntime);
+-
+-    layoutGpu->addRow(gpuSettingsContainer);
+-    connect(chkEnableGpu, &QCheckBox::toggled, this, &ConfigDialog::onGpuEnableChanged);
+-    gpuSettingsContainer->setVisible(false);
+-    layoutAdvanced->addWidget(grpGpu);
+-
+     QGroupBox *grpDebug = new QGroupBox("排查漏词");
+     QVBoxLayout *layoutDebug = new QVBoxLayout(grpDebug);
+     chkAsrDebugLogging = new QCheckBox("把识别出的文字写进 OBS 日志");
+     chkAsrDebugLogging->setToolTip("记录音源、输入音频时间及变化中的识别文字。识别文字可能修订。");
+     layoutDebug->addWidget(chkAsrDebugLogging);
+     layoutDebug->addWidget(hint("日志里会有未消音的对话原文，测完请关闭，分享日志前检查。"));
++    QPushButton *btnOpenLog = new QPushButton("打开当前日志");
++    btnOpenLog->setToolTip("用系统默认程序打开 OBS 正在写的日志文件（与 OBS“帮助 → 日志文件 → 查看当前日志”相同）。\n"
++                           "识别文字所在行带 [ASR Debug] 标记。日志持续写入，看最新内容请重新打开。");
++    connect(btnOpenLog, &QPushButton::clicked, this, [this] {
++        QString path = LatestObsLogPath();
++        if (path.isEmpty() || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
++            QMessageBox::warning(this, "打开日志", "没有找到 OBS 日志文件。\n可在 OBS“帮助 → 日志文件”里查看。");
++    });
++    QHBoxLayout *logButtons = new QHBoxLayout();
++    logButtons->addWidget(btnOpenLog);
++    logButtons->addStretch();
++    layoutDebug->addLayout(logButtons);
+     layoutAdvanced->addWidget(grpDebug);
+ 
+     containerLayout->addWidget(advancedContainer);
+@@ -728,6 +700,14 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     scroll->setWidget(settingsContainer);
+     mainLayout->addWidget(scroll, 1);
+ 
++    WheelGuard *wheelGuard = new WheelGuard(scroll, this);
++    for (QWidget *w : settingsContainer->findChildren<QWidget *>()) {
++        if (qobject_cast<QAbstractSpinBox *>(w) || qobject_cast<QComboBox *>(w)) {
++            w->setFocusPolicy(Qt::StrongFocus);
++            w->installEventFilter(wheelGuard);
++        }
++    }
++
+     connect(chkGlobalEnable, &QCheckBox::toggled, settingsContainer, &QWidget::setVisible);
+ 
+     if (QScreen *screen = QGuiApplication::primaryScreen()) {
+@@ -824,28 +804,13 @@ void ConfigDialog::LoadToUI() {
+     chkDelayAuto->setChecked(cfg->delay_follows_padding);
+     updateDelayUI();
+ 
+-    // GPU Settings
+-    chkEnableGpu->setChecked(cfg->enable_gpu);
+-    gpuSettingsContainer->setVisible(cfg->enable_gpu);
+-
+-    int providerIdx = comboProvider->findData(QString::fromStdString(cfg->onnx_provider));
+-    if (providerIdx != -1) comboProvider->setCurrentIndex(providerIdx);
+-    else comboProvider->setCurrentIndex(0); // Default to CPU
+-
+-    if (cfg->cuda_device_id < comboGpuDevice->count()) {
+-        comboGpuDevice->setCurrentIndex(cfg->cuda_device_id);
+-    }
+-
+-    // Update GPU status
+-    updateGpuStatus();
+-
+     // Trigger update of download button state
+     onModelComboChanged(comboModel->currentIndex());
+ 
+     updateWordCounts((int)SplitWordList(cfg->custom_words_str).size());
+     // Open the advanced section when something in it is not at its default, so a
+-    // running debug log (private conversation in the OBS log) or GPU mode stays visible.
+-    bool advanced = cfg->enable_gpu || cfg->asr_debug_logging || comboModel->currentData().toString() == "custom";
++    // running debug log (private conversation in the OBS log) stays visible.
++    bool advanced = cfg->asr_debug_logging || comboModel->currentData().toString() == "custom";
+     btnAdvanced->setChecked(advanced);
+ }
+ 
+@@ -1187,11 +1152,6 @@ bool ConfigDialog::onApply() {
+         cfg->cable_auto_disable = chkCableAutoDisable->isChecked();
+         cfg->delay_follows_padding = chkDelayAuto->isChecked();
+         cfg->NormalizeDelay();
+-
+-        // GPU Settings
+-        cfg->enable_gpu = chkEnableGpu->isChecked();
+-        cfg->onnx_provider = comboProvider->currentData().toString().toStdString();
+-        cfg->cuda_device_id = comboGpuDevice->currentData().toInt();
+     }
+ 
+     cfg->Save();
+@@ -1301,127 +1261,6 @@ void ConfigDialog::onSave() {
+     if (onApply()) accept();
+ }
+ 
+-// --- GPU Runtime Slots ---
+-
+-void ConfigDialog::onGpuEnableChanged(bool enabled) {
+-    gpuSettingsContainer->setVisible(enabled);
+-    updateGpuStatus();
+-}
+-
+-void ConfigDialog::updateGpuStatus() {
+-    if (!runtimeManager) {
+-        lblGpuStatus->setText("运行库管理器没有初始化");
+-        lblGpuStatus->setStyleSheet("color: #E6A23C;");
+-        btnRuntimeAction->setEnabled(false);
+-        return;
+-    }
+-
+-    QString provider = comboProvider->currentData().toString();
+-
+-    if (provider == "cpu") {
+-        lblGpuStatus->setText("CPU 模式不需要额外组件");
+-        lblGpuStatus->setStyleSheet("color: #67C23A;");
+-        btnRuntimeAction->setVisible(false);
+-        progressRuntime->setVisible(false);
+-        lblRuntimeStatus->setVisible(false);
+-        return;
+-    }
+-
+-    // CUDA mode
+-    btnRuntimeAction->setVisible(true);
+-    lblRuntimeStatus->setVisible(true);
+-
+-    if (runtimeManager->IsRuntimeInstalled("cuda")) {
+-        lblGpuStatus->setText("CUDA 运行库已就绪");
+-        lblGpuStatus->setStyleSheet("color: #67C23A;");
+-        btnRuntimeAction->setText("删除 CUDA 运行库");
+-        btnRuntimeAction->setEnabled(true);
+-        lblRuntimeStatus->setText("已安装");
+-    } else {
+-        // 检查是否配置了下载 URL
+-        const auto &runtimes = runtimeManager->GetRuntimes();
+-        bool hasUrl = false;
+-        for (const auto &r : runtimes) {
+-            if (r.id == "cuda" && !r.url.isEmpty()) {
+-                hasUrl = true;
+-                break;
+-            }
+-        }
+-
+-        if (hasUrl) {
+-            lblGpuStatus->setText("需要下载 CUDA 运行库");
+-            lblGpuStatus->setStyleSheet("color: #E6A23C;");
+-            btnRuntimeAction->setText("下载 CUDA 运行库");
+-            btnRuntimeAction->setEnabled(true);
+-            lblRuntimeStatus->setText("未安装");
+-        } else {
+-            lblGpuStatus->setText("没有配置 CUDA 运行库的下载地址");
+-            lblGpuStatus->setStyleSheet("color: #F56C6C;");
+-            btnRuntimeAction->setText("下载 CUDA 运行库");
+-            btnRuntimeAction->setEnabled(false);
+-            lblRuntimeStatus->setText("请在 runtime.json 里配置下载地址");
+-        }
+-    }
+-}
+-
+-void ConfigDialog::onRuntimeAction() {
+-    if (!runtimeManager) return;
+-
+-    QString provider = comboProvider->currentData().toString();
+-    if (provider != "cuda") return;
+-
+-    if (runtimeManager->IsRuntimeInstalled("cuda")) {
+-        // Delete
+-        QMessageBox::StandardButton reply = QMessageBox::question(this, "确认删除",
+-            "删除 CUDA 运行库？\n删除后要重新下载才能使用 GPU 加速。",
+-            QMessageBox::Yes | QMessageBox::No);
+-
+-        if (reply == QMessageBox::Yes) {
+-            if (runtimeManager->DeleteRuntime("cuda")) {
+-                updateGpuStatus();
+-            } else {
+-                QMessageBox::critical(this, "删除失败", "无法删除 CUDA 运行库，文件可能正在使用。");
+-            }
+-        }
+-    } else {
+-        // Download
+-        btnRuntimeAction->setEnabled(false);
+-        progressRuntime->setValue(0);
+-        progressRuntime->setVisible(true);
+-        lblRuntimeStatus->setText("准备下载…");
+-
+-        runtimeManager->DownloadRuntime("cuda");
+-    }
+-}
+-
+-void ConfigDialog::onRuntimeDownloadProgress(qint64 received, qint64 total) {
+-    if (total > 0) {
+-        int percent = (int)((received * 100) / total);
+-        progressRuntime->setValue(percent);
+-        double mbReceived = received / (1024.0 * 1024.0);
+-        double mbTotal = total / (1024.0 * 1024.0);
+-        lblRuntimeStatus->setText(QString("正在下载：%1 MB / %2 MB").arg(mbReceived, 0, 'f', 1).arg(mbTotal, 0, 'f', 1));
+-    } else {
+-        progressRuntime->setValue(0);
+-        lblRuntimeStatus->setText("正在下载…");
+-    }
+-}
+-
+-void ConfigDialog::onRuntimeDownloadFinished(const QString &runtimeId) {
+-    (void)runtimeId;
+-    progressRuntime->setVisible(false);
+-    lblRuntimeStatus->setText("下载并解压完成");
+-    updateGpuStatus();
+-    QMessageBox::information(this, "下载完成", "CUDA 运行库已下载并安装。");
+-}
+-
+-void ConfigDialog::onRuntimeDownloadError(const QString &msg) {
+-    progressRuntime->setVisible(false);
+-    lblRuntimeStatus->setText("下载失败");
+-    btnRuntimeAction->setEnabled(true);
+-    QMessageBox::critical(this, "下载失败", "错误信息：" + msg);
+-}
+-
+ void InitGlobalConfig() {
+     GetGlobalConfig()->Load();
+ }
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 7a6d931..946e942 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -123,20 +123,12 @@ private slots:
+     void onSave();
+     bool onApply();
+     void updateStatus();
+-    void updateGpuStatus();
+     void onModelComboChanged(int index);
+     void onModelAction();
+     void onDownloadProgress(qint64 received, qint64 total);
+     void onDownloadFinished(const QString &modelId);
+     void onDownloadError(const QString &msg);
+ 
+-    // GPU Runtime slots
+-    void onGpuEnableChanged(bool enabled);
+-    void onRuntimeAction();
+-    void onRuntimeDownloadProgress(qint64 received, qint64 total);
+-    void onRuntimeDownloadFinished(const QString &runtimeId);
+-    void onRuntimeDownloadError(const QString &msg);
+-
+ private:
+     QCheckBox *chkGlobalEnable;
+     QComboBox *comboModel; // Replaces editModelPath for main selection
+@@ -184,17 +176,6 @@ private:
+ 
+     // Container for all settings below global switch
+     QWidget *settingsContainer;
+-
+-    // GPU Acceleration UI
+-    RuntimeManager *runtimeManager;
+-    QCheckBox *chkEnableGpu;
+-    QComboBox *comboProvider;
+-    QComboBox *comboGpuDevice;
+-    QLabel *lblGpuStatus;
+-    QPushButton *btnRuntimeAction;
+-    QProgressBar *progressRuntime;
+-    QLabel *lblRuntimeStatus;
+-    QWidget *gpuSettingsContainer; // GPU 设置子容器
+ };
+ 
+ void InitGlobalConfig();
+-- 
+2.55.0.windows.5
+

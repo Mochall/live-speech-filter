@@ -1,0 +1,136 @@
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 55eb76c..5aca602 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -48,6 +48,7 @@ struct GlobalConfig {
+     int beep_mix_percent = 100;
+     bool enable_agc = true; // Automatic Gain Control (Default: ON)
+     bool use_pinyin = true;
++    bool asr_debug_logging = false;
+     bool comedy_mode = false;
+     bool video_delay_enabled = true;
+ 
+@@ -120,6 +121,7 @@ private:
+     QCheckBox *chkMuteMode; // Deprecated UI, replaced by comboEffect
+     QComboBox *comboEffect;
+     QCheckBox *chkUsePinyin;
++    QCheckBox *chkAsrDebugLogging;
+     QCheckBox *chkComedyMode;
+     QCheckBox *chkEnableVideoDelay;
+     QLabel *lblVideoMemory;
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index f48c1ca..bff6c28 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -73,6 +73,7 @@ void GlobalConfig::Save() {
+         obs_data_set_int(data, "censor_padding_ms", censor_padding_ms);
+         // dirty_words stored in external files now
+         obs_data_set_bool(data, "use_pinyin", use_pinyin);
++        obs_data_set_bool(data, "asr_debug_logging", asr_debug_logging);
+         obs_data_set_bool(data, "comedy_mode", comedy_mode);
+         obs_data_set_int(data, "audio_effect", audio_effect);
+         obs_data_set_int(data, "beep_freq", beep_frequency);
+@@ -239,6 +240,7 @@ void GlobalConfig::Load() {
+         }
+         
+         use_pinyin = obs_data_get_bool(data, "use_pinyin");
++        asr_debug_logging = obs_data_get_bool(data, "asr_debug_logging");
+         
+         if (obs_data_has_user_value(data, "comedy_mode")) {
+             comedy_mode = obs_data_get_bool(data, "comedy_mode");
+@@ -467,6 +469,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     chkUsePinyin->setToolTip("开启后将使用拼音进行匹配，忽略声调和平卷舌差异，提高识别率。");
+     layoutWords->addWidget(chkUsePinyin);
+ 
++    chkAsrDebugLogging = new QCheckBox("记录识别调试日志 (默认关闭)");
++    chkAsrDebugLogging->setToolTip("开启后将音源、输入音频时间及变化中的识别文字写入本机 OBS 日志。\n识别文字可能修订；日志包含未消音的对话，请仅在测试时开启，分享日志前检查隐私。");
++    layoutWords->addWidget(chkAsrDebugLogging);
++
+     chkComedyMode = new QCheckBox("精准变声模式 (优先匹配短词)");
+     chkComedyMode->setToolTip("开启后，当匹配到多个词时（如'我爱你'和'爱你'），\n优先只屏蔽较短的词（'爱你'），从而保留'我'的原声。\n配合变音特效可实现更生动的喜剧效果。");
+     layoutWords->addWidget(chkComedyMode);
+@@ -645,6 +651,7 @@ void ConfigDialog::LoadToUI() {
+     editSystemDirtyWords->setText(QString::fromStdString(cfg->system_dirty_words_str));
+     
+     chkUsePinyin->setChecked(cfg->use_pinyin);
++    chkAsrDebugLogging->setChecked(cfg->asr_debug_logging);
+     chkComedyMode->setChecked(cfg->comedy_mode);
+     
+     // Map audio_effect to combo
+@@ -885,6 +892,7 @@ bool ConfigDialog::onApply() {
+         }
+         
+         cfg->use_pinyin = chkUsePinyin->isChecked();
++        cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
+         cfg->comedy_mode = chkComedyMode->isChecked();
+         
+         cfg->audio_effect = comboEffect->currentData().toInt();
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index df4992d..0c81a22 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -198,10 +198,13 @@ void ProfanityFilter::ASRLoop() {
+         last_feed_offset = start_offset_input;
+     }
+ 
++    string last_debug_text;
++    uint64_t last_debug_segment = 0;
+     while (running) {
+         // Poll Global Config for model path changes and Gain settings
+         bool enable_agc = true;
+         int censor_padding_ms;
++        bool asr_debug_logging;
+         string target_provider = "cpu";
+ 
+         {
+@@ -211,6 +214,7 @@ void ProfanityFilter::ASRLoop() {
+             std::string desired_path = cfg->global_enable ? cfg->model_path : "";
+             enable_agc = cfg->enable_agc;
+             censor_padding_ms = cfg->censor_padding_ms;
++            asr_debug_logging = cfg->asr_debug_logging;
+ 
+             // 获取 provider 设置
+             if (cfg->enable_gpu) {
+@@ -223,6 +227,8 @@ void ProfanityFilter::ASRLoop() {
+             }
+         }
+ 
++        if (!asr_debug_logging) last_debug_text.clear();
++
+         // 1. Check for Model Change or Provider Change
+         {
+             string target;
+@@ -380,6 +386,24 @@ void ProfanityFilter::ASRLoop() {
+                     string full_text = "";
+                     // Reconstruct text
+                     for(int i=0; i<result->count; i++) full_text += result->tokens_arr[i];
++
++                    // Stream results are revisable partials, not a final transcript.
++                    if (asr_debug_logging && !full_text.empty() &&
++                        (full_text != last_debug_text || last_reset_sample_16k != last_debug_segment)) {
++                        obs_source_t *parent = obs_filter_get_parent(context);
++                        double segment_seconds = last_reset_sample_16k / 16000.0 +
++                                                 (double)start_offset_input / current_sr;
++                        string log_text = full_text;
++                        for (char &c : log_text) {
++                            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
++                        }
++                        BLOG(LOG_INFO, "[ASR Debug] source=\"%s\" input=%.3f..%.3f partial=\"%s\"",
++                             parent ? obs_source_get_name(parent) : obs_source_get_name(context),
++                             segment_seconds + result->timestamps[0],
++                             segment_seconds + result->timestamps[result->count - 1], log_text.c_str());
++                        last_debug_text = full_text;
++                        last_debug_segment = last_reset_sample_16k;
++                    }
+                     
+                     if (!full_text.empty()) {
+                         {
+@@ -566,7 +590,7 @@ void ProfanityFilter::ASRLoop() {
+                             
+                             // Debug Log Pinyin (First 3s only to avoid spam)
+                             static int debug_log_count = 0;
+-                            if (debug_log_count < 3 && !text_pinyins.empty()) {
++                            if (asr_debug_logging && debug_log_count < 3 && !text_pinyins.empty()) {
+                                 stringstream ss;
+                                 ss << "DEBUG Pinyin: ";
+                                 for(auto& p : text_pinyins) ss << p << " ";

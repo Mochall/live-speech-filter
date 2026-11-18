@@ -1,0 +1,190 @@
+From a6501ebe08e249912e9a56cb156842b1bb93fe27 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 10:44:23 -0700
+Subject: [PATCH] =?UTF-8?q?plugin-config:=20=E5=AE=89=E8=A3=85=20VB-CABLE?=
+ =?UTF-8?q?=20uses=20VB-Audio's=20original=20Pack46=20installed=20with=20t?=
+ =?UTF-8?q?he=20plugin=20in=20data/vbcable=20(SHA256=20checked,=20unpacked?=
+ =?UTF-8?q?=20with=20tar.exe,=20VB-Audio's=20own=20setup=20opened=20as=20a?=
+ =?UTF-8?q?dministrator;=20distribution=20as=20is=20with=20attribution=20a?=
+ =?UTF-8?q?llowed=20by=20https://vb-audio.com/Services/licensing.htm);=20f?=
+ =?UTF-8?q?alls=20back=20to=20the=20official=20download=20page=20when=20th?=
+ =?UTF-8?q?e=20pack=20is=20missing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugin-config.cpp | 109 +++++++++++++++++++++++++++++++++++++-----
+ src/plugin-main.cpp   |   2 +-
+ 2 files changed, 98 insertions(+), 13 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 43e23b5..9a1c8a4 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -32,11 +32,23 @@
+ #include <QWheelEvent>
+ #include <QPixmap>
+ #include <QMap>
++#include <QCryptographicHash>
++#include <QDir>
++#include <QFileInfo>
++#include <QProcess>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <shellapi.h>
++#endif
+ 
+ using namespace std;
+ 
+ static GlobalConfig* g_config = nullptr;
+ static obs_module_t* g_module = nullptr;
++static QString BundledCablePack(); // data/vbcable pack installed with the plugin, "" when missing
+ static QPointer<ConfigDialog> g_dialog;
+ 
+ // Number and list fields take the mouse wheel only after they are clicked (focused);
+@@ -529,8 +541,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         updateCompanionUI();
+     });
+-    btnInstallCable = new QPushButton("下载安装 VB-CABLE…");
+-    btnInstallCable->setToolTip("打开 VB-CABLE 官网下载页。直播伴侣模式需要它把消音后的声音送进推流软件。");
++    btnInstallCable = new QPushButton(BundledCablePack().isEmpty() ? "下载安装 VB-CABLE…" : "安装 VB-CABLE…");
++    btnInstallCable->setToolTip("用插件自带的 VB-Audio 原版安装包安装（没有时打开官网下载页）。直播伴侣模式需要它把消音后的声音送进推流软件。");
+     connect(btnInstallCable, &QPushButton::clicked, this, [this] { openCableDownload(); });
+     QPushButton *btnChecklist = new QPushButton("推流软件设置清单…");
+     btnChecklist->setToolTip("推流软件里需要手动完成的三项设置。");
+@@ -1257,22 +1269,95 @@ bool ConfigDialog::onApply() {
+     return true;
+ }
+ 
+-// VB-CABLE may be redistributed only as is and not inside another installer (its
+-// license), so the plugin links to the official download and explains the steps.
++// VB-CABLE: the installer puts VB-Audio's original VBCABLE_Driver_Pack46.zip, unmodified, into
++// data/vbcable (distribution as is with attribution is allowed: https://vb-audio.com/Services/licensing.htm,
++// checked 2026-11-14). The button unpacks it with tar.exe (Windows 10 1803+) into a temporary folder
++// and opens VB-Audio's own setup as administrator; the user clicks "Install Driver" there. Nothing is
++// installed silently. Without the pack (copied plugin, older layout) it links to the official page.
++static const char *kCablePack = "vbcable/VBCABLE_Driver_Pack46.zip";
++static const char *kCablePackSha256 = "bc44e8974191a5a2427d6c979e2dab08dbb09925f3f435dfa2f0ba3e45b6eb90";
++
++static QString BundledCablePack() {
++    QString path;
++    if (g_module) {
++        if (char *p = obs_find_module_file(g_module, kCablePack)) {
++            path = QString::fromUtf8(p);
++            bfree(p);
++        }
++    }
++    return path;
++}
++
++#ifdef _WIN32
++// Empty on success, else a sentence for the user.
++static QString RunBundledCableSetup(const QString &zip) {
++    QFile f(zip);
++    if (!f.open(QIODevice::ReadOnly)) return "读不到插件自带的 VB-CABLE 安装包。";
++    const QByteArray hash = QCryptographicHash::hash(f.readAll(), QCryptographicHash::Sha256).toHex();
++    f.close();
++    if (hash != kCablePackSha256) return "插件自带的 VB-CABLE 安装包和 VB-Audio 发布的原包不一致，没有打开。";
++    QDir dir(QDir::tempPath() + "/obs-profanity-filter-vbcable");
++    dir.removeRecursively();
++    if (!QDir().mkpath(dir.path())) return "没能创建临时文件夹。";
++    QProcess tar;
++    tar.setWorkingDirectory(dir.path());
++    tar.start(qEnvironmentVariable("SystemRoot", "C:\\Windows") + "\\System32\\tar.exe",
++              {"-xf", QDir::toNativeSeparators(zip)});
++    if (!tar.waitForFinished(60000) || tar.exitStatus() != QProcess::NormalExit || tar.exitCode() != 0)
++        return "VB-CABLE 安装包没能解压（需要 Windows 10 1803 或更新版本）。";
++    const QString exe = QDir::toNativeSeparators(dir.filePath("VBCABLE_Setup_x64.exe"));
++    if (!QFileInfo::exists(exe)) return "解压后没找到 VBCABLE_Setup_x64.exe。";
++    const std::wstring file = exe.toStdWString(), folder = QDir::toNativeSeparators(dir.path()).toStdWString();
++    SHELLEXECUTEINFOW info{sizeof(info)};
++    info.lpVerb = L"runas";
++    info.lpFile = file.c_str();
++    info.lpDirectory = folder.c_str();
++    info.nShow = SW_SHOWNORMAL;
++    if (!ShellExecuteExW(&info)) {
++        const DWORD error = GetLastError();
++        blog(LOG_INFO, "[Speech Sync] VB-CABLE setup not started (%lu)", error);
++        return error == ERROR_CANCELLED ? QString() : "没能打开 VB-CABLE 安装程序。";
++    }
++    blog(LOG_INFO, "[Speech Sync] VB-CABLE setup opened from the bundled pack");
++    return {};
++}
++#endif
++
+ void ConfigDialog::openCableDownload() {
++    const QString bundled = BundledCablePack();
+     QMessageBox box(this);
+     box.setWindowTitle("安装 VB-CABLE");
+     box.setIcon(QMessageBox::Information);
+     box.setText("直播伴侣模式需要虚拟声卡 VB-CABLE，把消音后的声音送进推流软件。");
+-    box.setInformativeText("1. 在打开的官网页面下载 VB-CABLE Driver（如果插件安装包旁边已有 VBCABLE_Driver_Pack*.zip，可直接用它）\n"
+-                           "2. 解压后右键 VBCABLE_Setup_x64.exe →“以管理员身份运行”→ Install Driver\n"
+-                           "3. 重启电脑，再打开 OBS\n\n"
+-                           "安装后插件会自动处理：只在直播伴侣模式下启用它，并防止它被设成 Windows 默认设备。\n"
+-                           "VB-CABLE 是 VB-Audio 的捐赠软件（www.vb-cable.com），与本插件无关。");
+-    QPushButton *open = box.addButton("打开下载页", QMessageBox::AcceptRole);
++    const QString after = "安装后插件会自动处理：只在直播伴侣模式下启用它，并防止它被设成 Windows 默认设备。\n"
++                          "VB-CABLE 是 VB-Audio 的捐赠软件（www.vb-cable.com），不属于本插件。VB-CABLE is a donationware, all participations are welcome.";
++    QPushButton *install = nullptr, *open = nullptr;
++    if (!bundled.isEmpty()) {
++        box.setInformativeText("插件自带 VB-Audio 的原版安装包。\n"
++                               "1. 点“安装”，Windows 询问时点“是”\n"
++                               "2. 在 VB-CABLE 的窗口里点“Install Driver”\n"
++                               "3. 重启电脑，再打开 OBS\n\n" + after);
++        install = box.addButton("安装", QMessageBox::AcceptRole);
++        open = box.addButton("打开官网", QMessageBox::ActionRole);
++    } else {
++        box.setInformativeText("1. 在打开的官网页面下载 VB-CABLE Driver\n"
++                               "2. 解压后右键 VBCABLE_Setup_x64.exe →“以管理员身份运行”→ Install Driver\n"
++                               "3. 重启电脑，再打开 OBS\n\n" + after);
++        open = box.addButton("打开下载页", QMessageBox::AcceptRole);
++    }
+     box.addButton("取消", QMessageBox::RejectRole);
+     box.exec();
+-    if (box.clickedButton() == open) QDesktopServices::openUrl(QUrl("https://vb-audio.com/Cable/"));
++    if (install && box.clickedButton() == install) {
++#ifdef _WIN32
++        const QString error = RunBundledCableSetup(bundled);
++        if (!error.isEmpty()) {
++            QMessageBox::warning(this, "安装 VB-CABLE", error + "\n点“确定”打开 VB-CABLE 官网，可以从那里下载安装。");
++            QDesktopServices::openUrl(QUrl("https://vb-audio.com/Cable/"));
++        }
++#endif
++    } else if (box.clickedButton() == open) {
++        QDesktopServices::openUrl(QUrl("https://vb-audio.com/Cable/"));
++    }
+ }
+ 
+ // Checklist for the companion app side, which the plugin cannot configure. Confirming
+@@ -1348,7 +1433,7 @@ void ConfigDialog::updateCompanionUI() {
+     else if (!st.cable_found && GetCableRenderState() == CableRenderState::Disabled)
+         text = "· VB-CABLE 已安装，目前停用（不影响其他软件），应用本模式后插件会自动启用。";
+     else if (!st.cable_found) {
+-        text = "✗ 没有检测到 VB-CABLE → 点下方“下载安装 VB-CABLE…”，安装后重启电脑。";
++        text = "✗ 没有检测到 VB-CABLE → 点下方“安装 VB-CABLE…”（没有自带安装包时叫“下载安装 VB-CABLE…”），装完重启电脑。";
+         ++problem_count;
+     } else {
+         text = "✓ 已检测到 " + st.cable_name + "。";
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index a1e8cfb..025e585 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -694,7 +694,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         return;
+     }
+     if (!st.cable_found) {
+-        add_warning(WARN_BROKEN, "直播伴侣模式：未安装VB-CABLE虚拟声卡，推流软件收不到声音，请在插件设置点“下载安装VB-CABLE”");
++        add_warning(WARN_BROKEN, "直播伴侣模式：未安装VB-CABLE虚拟声卡，推流软件收不到声音，请在插件设置点“安装 VB-CABLE”");
+         return;
+     }
+     const char *name = nullptr, *id = nullptr;
+-- 
+2.55.0.windows.5
+

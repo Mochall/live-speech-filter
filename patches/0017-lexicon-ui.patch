@@ -1,0 +1,268 @@
+From 6d609750b149e2a6dbc559cfee216286464ff019 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 14:29:41 -0700
+Subject: [PATCH] lexicon-ui: built-in lexicon read-only and not viewable
+ (count only), plain-text custom words (custom_words.txt), pinyin supplement
+ UI removed
+
+---
+ src/plugin-config.cpp | 112 ++++++++++++++++++++----------------------
+ src/plugin-config.hpp |   7 ++-
+ src/utils.cpp         |  30 +++++++++++
+ src/utils.hpp         |   5 ++
+ 4 files changed, 92 insertions(+), 62 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 321225a..fd8e150 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -50,6 +50,16 @@ static QString BuiltinWordsPath() {
+     return result;
+ }
+ 
++// The built-in list is read from the plugin each start (so it updates with the plugin) and
++// is not user-editable; users add plain words, matched literally (plus pinyin if enabled).
++void GlobalConfig::RebuildWords() {
++    dirty_words_str = builtin_words_str;
++    for (const auto &word : SplitWordList(custom_words_str)) {
++        if (!dirty_words_str.empty()) dirty_words_str += ", ";
++        dirty_words_str += EscapeRegexLiteral(word);
++    }
++}
++
+ void GlobalConfig::ParsePatterns() {
+     dirty_patterns.clear();
+     
+@@ -257,23 +267,11 @@ void GlobalConfig::Load() {
+         if (text.startsWith(QChar(0xfeff))) text.remove(0, 1);
+         return text.toStdString();
+     };
+-    QString words_path = QString::fromStdString(get_config_path("words.txt"));
+-    if (QFile::exists(words_path)) {
+-        dirty_words_str = read_file(words_path);
+-    } else {
+-        // One-time import preserves the edited bundled list and former custom additions.
+-        dirty_words_str = read_file(BuiltinWordsPath());
+-        string legacy = read_file(QString::fromStdString(get_config_path("custom_dirty_words.txt")));
+-        if (!legacy.empty()) {
+-            if (!dirty_words_str.empty()) dirty_words_str += ", ";
+-            dirty_words_str += legacy;
+-        }
+-        QDir().mkpath(QFileInfo(words_path).absolutePath());
+-        QSaveFile file(words_path);
+-        QByteArray bytes = QByteArray::fromStdString(dirty_words_str);
+-        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+-            BLOG(LOG_ERROR, "Unable to persist merged lexicon: %s", file.errorString().toUtf8().constData());
+-    }
++    builtin_words_str = read_file(BuiltinWordsPath());
++    custom_words_str = read_file(QString::fromStdString(get_config_path("custom_words.txt")));
++    RebuildWords();
++    // Supplemental pinyin list: no UI any more (custom words get pinyin automatically); the
++    // file is still honoured if present.
+     pinyin_words_str = read_file(QString::fromStdString(get_config_path("pinyin_words.txt")));
+ 
+     // 3. Load JSON config
+@@ -594,15 +592,25 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QGroupBox *grpWords = new QGroupBox("屏蔽词设置");
+     QVBoxLayout *layoutWords = new QVBoxLayout(grpWords);
+     
+-    QPushButton *btnWords = new QPushButton("编辑中文屏蔽词库...");
+-    connect(btnWords, &QPushButton::clicked, this, [this] { editLexicon(false); });
+-    layoutWords->addWidget(btnWords);
+-    QPushButton *btnPinyin = new QPushButton("编辑补充拼音词库...");
+-    connect(btnPinyin, &QPushButton::clicked, this, [this] { editLexicon(true); });
+-    layoutWords->addWidget(btnPinyin);
+-
+-    chkUsePinyin = new QCheckBox("启用拼音匹配 (中文自动转拼音 + 补充拼音词库)");
+-    chkUsePinyin->setToolTip("识别文字转为拼音，与中文词库的拼音及补充拼音词库比较。忽略声调，保留现有平翘舌及前后鼻音归一化。关闭后两类拼音匹配均停止，不影响中文匹配。");
++    int builtin_count = 0;
++    {
++        GlobalConfig *cfg = GetGlobalConfig();
++        lock_guard<mutex> lock(cfg->mutex);
++        builtin_count = (int)SplitWordList(cfg->builtin_words_str).size();
++    }
++    QLabel *lblBuiltin = new QLabel(QString("内置词库：已启用 %1 个词，随插件更新，不提供查看。会同时屏蔽同音的写法，并避开“操作”“草丛”这类正常说法。").arg(builtin_count));
++    lblBuiltin->setWordWrap(true);
++    layoutWords->addWidget(lblBuiltin);
++    QHBoxLayout *wordButtons = new QHBoxLayout();
++    QPushButton *btnWords = new QPushButton("自定义屏蔽词…");
++    btnWords->setToolTip("添加内置词库里没有的词，例如某个外号。写普通文字即可。");
++    connect(btnWords, &QPushButton::clicked, this, [this] { editCustomWords(); });
++    wordButtons->addWidget(btnWords);
++    wordButtons->addStretch();
++    layoutWords->addLayout(wordButtons);
++
++    chkUsePinyin = new QCheckBox("同音的写法也屏蔽（推荐）");
++    chkUsePinyin->setToolTip("识别出的字常有同音别字（如“我曹”“几把”）。开启后按拼音比较，内置词库和自定义屏蔽词都适用。");
+     layoutWords->addWidget(chkUsePinyin);
+ 
+     chkAsrDebugLogging = new QCheckBox("记录识别调试日志 (默认关闭)");
+@@ -1019,21 +1027,23 @@ void ConfigDialog::onDownloadError(const QString &msg) {
+     QMessageBox::critical(this, "下载失败", "错误信息: " + msg);
+ }
+ 
+-void ConfigDialog::editLexicon(bool pinyin) {
++void ConfigDialog::editCustomWords() {
+     QDialog dialog(this);
+-    dialog.setWindowTitle(pinyin ? "编辑补充拼音词库" : "编辑中文屏蔽词库");
+-    dialog.resize(640, 440);
++    dialog.setWindowTitle("自定义屏蔽词");
++    dialog.resize(480, 400);
+     QVBoxLayout *layout = new QVBoxLayout(&dialog);
+-    QLabel *help = new QLabel(pinyin
+-        ? "无声调小写拼音，音节用空格分隔，词条用英文逗号分隔，例如 ji ba, wo cao。\n中文词库已自动转拼音，此处仅作补充。保存立即生效；主设置取消不撤销。"
+-        : "多个词用英文逗号 , 分隔。保存后立即生效；主设置页取消不撤销。\n词库存于用户配置目录，插件自带文件仅用于首次导入。原有词条正则语义保持不变。");
++    QLabel *help = new QLabel("每行写一个要屏蔽的词，写普通文字即可（例如某个外号）。\n"
++                              "内置词库已有的词不用再写。开启“同音的写法也屏蔽”时，同音的写法也会屏蔽。保存后立即生效。");
+     help->setWordWrap(true);
+     layout->addWidget(help);
+     QTextEdit *editor = new QTextEdit();
++    editor->setAcceptRichText(false);
+     GlobalConfig *cfg = GetGlobalConfig();
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+-        editor->setPlainText(QString::fromStdString(pinyin ? cfg->pinyin_words_str : cfg->dirty_words_str));
++        QStringList lines;
++        for (const auto &word : SplitWordList(cfg->custom_words_str)) lines << QString::fromStdString(word);
++        editor->setPlainText(lines.join("\n"));
+     }
+     layout->addWidget(editor);
+     QHBoxLayout *buttons = new QHBoxLayout();
+@@ -1045,41 +1055,23 @@ void ConfigDialog::editLexicon(bool pinyin) {
+     layout->addLayout(buttons);
+     connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+     connect(save, &QPushButton::clicked, &dialog, [&] {
+-        QString text = editor->toPlainText();
+-        if (pinyin) {
+-            vector<vector<string>> patterns;
+-            string error;
+-            if (!ParsePinyinWords(text.toStdString(), patterns, error)) {
+-                QMessageBox::warning(&dialog, "无法保存", "请使用无声调小写拼音，音节用空格、词条用英文逗号分隔，例如 ji ba, wo cao。");
+-                return;
+-            }
+-        } else {
+-            stringstream words(text.toStdString());
+-            string word;
+-            while (getline(words, word, ',')) {
+-                word.erase(0, word.find_first_not_of(" \t\n\r"));
+-                word.erase(word.find_last_not_of(" \t\n\r") + 1);
+-                if (word.empty()) continue;
+-                try { regex pattern(word, regex::icase); }
+-                catch (const regex_error &) {
+-                    QMessageBox::warning(&dialog, "无法保存", "词条格式无效: " + QString::fromStdString(word));
+-                    return;
+-                }
+-            }
+-        }
+-        char *config_path = obs_module_get_config_path(g_module, pinyin ? "pinyin_words.txt" : "words.txt");
++        QStringList lines;
++        for (const auto &word : SplitWordList(editor->toPlainText().toStdString())) lines << QString::fromStdString(word);
++        QString text = lines.join("\n");
++        char *config_path = obs_module_get_config_path(g_module, "custom_words.txt");
+         QString path = config_path ? QString::fromUtf8(config_path) : QString();
+         bfree(config_path);
++        QDir().mkpath(QFileInfo(path).absolutePath());
+         QSaveFile file(path);
+         QByteArray bytes = text.toUtf8();
+-        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+-            QMessageBox::warning(&dialog, "无法保存", "写入词库失败，原词库未替换。\n" + file.errorString());
++        if (path.isEmpty() || !file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
++            QMessageBox::warning(&dialog, "无法保存", "写入失败，原来的自定义屏蔽词未改变。\n" + file.errorString());
+             return;
+         }
+         {
+             lock_guard<mutex> lock(cfg->mutex);
+-            if (pinyin) cfg->pinyin_words_str = text.toStdString();
+-            else cfg->dirty_words_str = text.toStdString();
++            cfg->custom_words_str = text.toStdString();
++            cfg->RebuildWords();
+             cfg->ParsePatterns();
+         }
+         dialog.accept();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index ce565e8..dfa8912 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -56,7 +56,10 @@ struct GlobalConfig {
+     int model_offset_ms = 0; // Model latency compensation
+     double delay_seconds = 0.5;
+     int censor_padding_ms = 500;
+-    std::string dirty_words_str;
++    std::string dirty_words_str;     // effective list: built-in + escaped custom words
++    std::string builtin_words_str;   // plugin data file, updated with the plugin
++    std::string custom_words_str;    // user's plain words (custom_words.txt)
++    void RebuildWords();
+     std::string pinyin_words_str;
+     int audio_effect = 1; // 0=Beep, 1=Silence (default, user choice), 2=Squeaky, 3=Robot
+     int beep_frequency = 1000;
+@@ -115,7 +118,7 @@ public:
+     void LoadToUI();
+ 
+ private slots:
+-    void editLexicon(bool pinyin);
++    void editCustomWords();
+     void onBrowseModel();
+     void onSave();
+     bool onApply();
+diff --git a/src/utils.cpp b/src/utils.cpp
+index b65be1e..e39c5b5 100644
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -1,4 +1,5 @@
+ #include "utils.hpp"
++#include <cstring>
+ #include <sstream>
+ 
+ std::string NormalizePinyin(const std::string& p) {
+@@ -62,6 +63,35 @@ static int utf8_length(int lead) {
+     return 0; // ASCII is never byte-encoded by these models; continuation/invalid lead
+ }
+ 
++std::vector<std::string> SplitWordList(const std::string &text) {
++    std::string s = text;
++    for (const char *sep : {"\xEF\xBC\x8C", "\xE3\x80\x81", "\r", "\n"}) { // ， 、 CR LF
++        size_t pos;
++        while ((pos = s.find(sep)) != std::string::npos) s.replace(pos, strlen(sep), ",");
++    }
++    std::vector<std::string> out;
++    size_t start = 0;
++    while (start <= s.size()) {
++        size_t end = s.find(',', start);
++        if (end == std::string::npos) end = s.size();
++        std::string item = s.substr(start, end - start);
++        item.erase(0, item.find_first_not_of(" \t"));
++        item.erase(item.find_last_not_of(" \t") + 1);
++        if (!item.empty()) out.push_back(item);
++        start = end + 1;
++    }
++    return out;
++}
++
++std::string EscapeRegexLiteral(const std::string &word) {
++    std::string out;
++    for (char c : word) {
++        if (strchr("\\^$.|?*+()[]{}", c) && c) out += '\\';
++        out += c;
++    }
++    return out;
++}
++
+ void MergeByteTokens(const char *const *tokens, const float *timestamps, int count,
+                      std::vector<std::string> &out_tokens, std::vector<float> &out_times) {
+     out_tokens.clear();
+diff --git a/src/utils.hpp b/src/utils.hpp
+index dbf3d01..a1163cd 100644
+--- a/src/utils.hpp
++++ b/src/utils.hpp
+@@ -13,3 +13,8 @@ bool ParsePinyinWords(const std::string& text, std::vector<std::vector<std::stri
+ // real character. Incomplete or invalid sequences are kept as the original tokens.
+ void MergeByteTokens(const char *const *tokens, const float *timestamps, int count,
+                      std::vector<std::string> &out_tokens, std::vector<float> &out_times);
++
++// User word lists: split on newlines, ASCII/Chinese commas and 、; entries are trimmed.
++std::vector<std::string> SplitWordList(const std::string &text);
++// Custom words are plain text: escape regex syntax so any input matches literally.
++std::string EscapeRegexLiteral(const std::string &word);
+-- 
+2.55.0.windows.5
+

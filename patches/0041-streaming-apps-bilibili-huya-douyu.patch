@@ -1,0 +1,770 @@
+From a2a85cc94ccdf856372df2a8f3ffb04f2385a9cd Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 14 Nov 2026 10:34:28 -0700
+Subject: [PATCH] =?UTF-8?q?streaming-apps:=20companion=20mode=20checks=20?=
+ =?UTF-8?q?=E7=9B=B4=E6=92=AD=E5=A7=AC,=20=E8=99=8E=E7=89=99=20and=20?=
+ =?UTF-8?q?=E6=96=97=E9=B1=BC=20besides=20=E6=8A=96=E9=9F=B3=E7=9B=B4?=
+ =?UTF-8?q?=E6=92=AD=E4=BC=B4=E4=BE=A3=20(recording=20sessions=20by=20proc?=
+ =?UTF-8?q?ess=20name/parent,=20saved=20OBS=20scene=20collections=20under?=
+ =?UTF-8?q?=20the=20user=20profile,=20never=20the=20install=20folder),=20s?=
+ =?UTF-8?q?hared=20with=20the=20standalone=20program;=20wording=20?=
+ =?UTF-8?q?=E6=8E=A8=E6=B5=81=E8=BD=AF=E4=BB=B6=20where=20any=20streaming?=
+ =?UTF-8?q?=20program=20is=20meant?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt         |   1 +
+ src/plugin-config.cpp  |  85 +++------
+ src/plugin-config.hpp  |   5 -
+ src/plugin-main.cpp    |  27 ++-
+ src/streaming-apps.cpp | 413 +++++++++++++++++++++++++++++++++++++++++
+ src/streaming-apps.hpp |  52 ++++++
+ 6 files changed, 512 insertions(+), 71 deletions(-)
+ create mode 100644 src/streaming-apps.cpp
+ create mode 100644 src/streaming-apps.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8374e7b..aabc991 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -152,6 +152,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+     src/plugin-main.cpp
+     src/plugin-config.cpp
+     src/companion-audio.cpp
++    src/streaming-apps.cpp
+     src/model-manager.cpp
+     src/asr-model.cpp
+     src/utils.cpp
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 270287d..43e23b5 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -5,6 +5,7 @@
+ #include "logging-macros.hpp"
+ #include "utils.hpp"
+ #include "companion-audio.hpp"
++#include "streaming-apps.hpp"
+ #include <obs-module.h>
+ #include <obs.h>
+ #include <obs-frontend-api.h>
+@@ -118,45 +119,6 @@ static int obs_stream_delay_seconds() {
+     return (int)config_get_uint(profile, "Output", "DelaySec");
+ }
+ 
+-std::vector<std::string> CheckCompanionAppAudio(bool &readable) {
+-    std::vector<std::string> problems;
+-    readable = false;
+-    char path[512];
+-    if (os_get_config_path(path, sizeof(path), "webcast_mate/WBStore/audioStore.json") <= 0) return problems;
+-    QFile file(QString::fromUtf8(path));
+-    if (!file.open(QIODevice::ReadOnly)) return problems;
+-    QJsonObject store = QJsonDocument::fromJson(file.readAll()).object().value("audioStore").toObject();
+-    QJsonObject states = store.value("audioState").toObject();
+-    QJsonObject mixing = store.value("mixingAudio").toObject();
+-    if (states.isEmpty() || !mixing.value("inputs").isArray()) return problems;
+-    readable = true;
+-    auto volume = [](const QJsonObject &state) {
+-        QJsonValue v = state.value("filter").toObject().value("setting").toObject().value("volume");
+-        return v.isDouble() ? v.toDouble() : 1.0;
+-    };
+-    bool cable = false;
+-    for (const char *group : {"inputs", "outputs", "process"}) {
+-        for (const QJsonValue &id : mixing.value(group).toArray()) {
+-            QJsonObject state = states.value(id.toString()).toObject();
+-            std::string name = state.value("name").toString().toStdString();
+-            if (state.value("deviceId").toString() == "DefaultID") name = "默认设备";
+-            if (volume(state) <= 0.0) continue;
+-            if (!strcmp(group, "inputs") && (name.find("CABLE Output") != std::string::npos || IsCableEndpointName(name))) {
+-                cable = true;
+-                continue;
+-            }
+-            if (!strcmp(group, "outputs"))
+-                problems.push_back("伴侣正在采集系统声音（" + name + "），原声会绕过消音进入直播，请在伴侣里关闭系统声音");
+-            else if (!strcmp(group, "inputs"))
+-                problems.push_back("伴侣正在采集麦克风“" + name + "”，原声会绕过消音进入直播，伴侣里只保留 CABLE Output");
+-            else
+-                problems.push_back("伴侣正在采集程序声音“" + name + "”，原声会绕过消音进入直播，请在伴侣里移除");
+-        }
+-    }
+-    if (!cable) problems.push_back("伴侣没有采集 CABLE Output，直播会没有消音后的声音，请在伴侣里把麦克风选为 CABLE Output");
+-    return problems;
+-}
+-
+ static std::mutex audio_setup_mutex;
+ static std::vector<std::string> audio_setup_lines;
+ 
+@@ -534,10 +496,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QVBoxLayout *layoutCompanion = new QVBoxLayout(grpCompanion);
+     comboBroadcastMode = new QComboBox();
+     comboBroadcastMode->addItem("OBS 直接推流（B站、虎牙、斗鱼等有推流码的平台）", 0);
+-    comboBroadcastMode->addItem("抖音直播伴侣（画面走虚拟摄像头，声音走 VB-CABLE）", 1);
+-    comboBroadcastMode->setToolTip("选直播伴侣时插件会：启动虚拟摄像头；把 OBS 监听设备设为 CABLE Input；把参与直播的音源设为“监听并输出”；\n"
++    comboBroadcastMode->addItem("直播伴侣类推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼；画面走虚拟摄像头，声音走 VB-CABLE）", 1);
++    comboBroadcastMode->setToolTip("选这一项时插件会：启动虚拟摄像头；把 OBS 监听设备设为 CABLE Input；把参与直播的音源设为“监听并输出”；\n"
+                                    "持续检查 Windows 默认播放设备，如果是 CABLE（其他程序的原声会绕过消音进入直播）就在状态栏提醒；\n"
+-                                   "读取伴侣的声音设置，发现伴侣采集了系统声音、真实麦克风或程序声音时提醒。\n"
++                                   "检查推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼）实际在录的麦克风和保存的声音设置，发现它采集了系统声音、真实麦克风或程序声音时提醒。\n"
+                                    "改回 OBS 直接推流时恢复插件改过的监听设置。需要先安装 VB-CABLE。");
+     {
+         QFormLayout *form = new QFormLayout();
+@@ -552,10 +514,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     companionDetails = new QWidget();
+     QVBoxLayout *layoutCompanionDetails = new QVBoxLayout(companionDetails);
+     layoutCompanionDetails->setContentsMargins(0, 0, 0, 0);
+-    chkCableAutoDisable = new QCheckBox("不用直播伴侣时停用 VB-CABLE（推荐，避免影响其他软件）");
++    chkCableAutoDisable = new QCheckBox("不用直播伴侣模式时停用 VB-CABLE（推荐，避免影响其他软件）");
+     chkCableAutoDisable->setToolTip("开启直播伴侣模式时插件启用 VB-CABLE，改回 OBS 直接推流或退出 OBS 时停用它的播放端（CABLE Input），\n"
+                                     "效果同 Windows 声音设置里的“禁用”，这样 Windows 不会在拔耳机等情况下把 CABLE 设成默认设备。\n"
+-                                    "伴侣里选的麦克风 CABLE Output 不受影响。自己另有用途需要 VB-CABLE 时取消勾选。");
++                                    "推流软件里选的麦克风 CABLE Output 不受影响。自己另有用途需要 VB-CABLE 时取消勾选。");
+     layoutCompanionDetails->addWidget(chkCableAutoDisable);
+     QPushButton *btnFixDefaults = new QPushButton("修复 Windows 默认播放设备");
+     btnFixDefaults->setToolTip("如果 Windows 默认播放设备或默认通信设备被设成了 CABLE，改回真实的扬声器或耳机。");
+@@ -568,10 +530,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+         updateCompanionUI();
+     });
+     btnInstallCable = new QPushButton("下载安装 VB-CABLE…");
+-    btnInstallCable->setToolTip("打开 VB-CABLE 官网下载页。直播伴侣模式需要它把消音后的声音送进伴侣。");
++    btnInstallCable->setToolTip("打开 VB-CABLE 官网下载页。直播伴侣模式需要它把消音后的声音送进推流软件。");
+     connect(btnInstallCable, &QPushButton::clicked, this, [this] { openCableDownload(); });
+-    QPushButton *btnChecklist = new QPushButton("伴侣端设置清单…");
+-    btnChecklist->setToolTip("直播伴侣里需要手动完成的三项设置。");
++    QPushButton *btnChecklist = new QPushButton("推流软件设置清单…");
++    btnChecklist->setToolTip("推流软件里需要手动完成的三项设置。");
+     connect(btnChecklist, &QPushButton::clicked, this, [this] {
+         showCompanionChecklist();
+         updateCompanionUI();
+@@ -1301,7 +1263,7 @@ void ConfigDialog::openCableDownload() {
+     QMessageBox box(this);
+     box.setWindowTitle("安装 VB-CABLE");
+     box.setIcon(QMessageBox::Information);
+-    box.setText("直播伴侣模式需要虚拟声卡 VB-CABLE，把消音后的声音送进伴侣。");
++    box.setText("直播伴侣模式需要虚拟声卡 VB-CABLE，把消音后的声音送进推流软件。");
+     box.setInformativeText("1. 在打开的官网页面下载 VB-CABLE Driver（如果插件安装包旁边已有 VBCABLE_Driver_Pack*.zip，可直接用它）\n"
+                            "2. 解压后右键 VBCABLE_Setup_x64.exe →“以管理员身份运行”→ Install Driver\n"
+                            "3. 重启电脑，再打开 OBS\n\n"
+@@ -1317,10 +1279,10 @@ void ConfigDialog::openCableDownload() {
+ // clears the status-bar reminder; settings it can read are still checked every few seconds.
+ bool ConfigDialog::showCompanionChecklist() {
+     QMessageBox box(this);
+-    box.setWindowTitle("直播伴侣端设置清单");
++    box.setWindowTitle("推流软件设置清单");
+     box.setIcon(QMessageBox::Information);
+-    box.setText("请在抖音直播伴侣里完成以下设置（插件无法替你修改伴侣）：");
+-    box.setInformativeText("① 添加“摄像头”素材，设备选 OBS Virtual Camera\n② 麦克风选 CABLE Output (VB-Audio Virtual Cable)\n③ 关闭伴侣的“系统声音/扬声器”，不要再添加真实麦克风或程序声音\n\n否则 KOOK、麦克风等原声会绕过消音直接进入直播。\n插件能读到伴侣的声音设置时，也会自动检查第②③项。");
++    box.setText("请在推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼等）里完成以下设置（插件无法替你修改）：");
++    box.setInformativeText("① 添加“摄像头”素材，设备选 OBS Virtual Camera\n② 麦克风选 CABLE Output (VB-Audio Virtual Cable)\n③ 关闭“系统声音/桌面音频/扬声器”，不要再添加真实麦克风或程序声音\n\n否则 KOOK、麦克风等原声会绕过消音直接进入直播。\n用抖音直播伴侣、直播姬、虎牙、斗鱼时插件也会自动检查第②③项（系统声音按它上次保存的设置，虎牙和斗鱼退出时才保存）。");
+     QPushButton *done = box.addButton("我已完成", QMessageBox::AcceptRole);
+     box.addButton("稍后", QMessageBox::RejectRole);
+     box.exec();
+@@ -1375,7 +1337,7 @@ void ConfigDialog::updateCompanionUI() {
+     btnInstallCable->setVisible(comboBroadcastMode->currentData().toInt() == 1 && st.supported &&
+                                 GetCableRenderState() == CableRenderState::NotInstalled);
+     if (comboBroadcastMode->currentData().toInt() != 1) {
+-        lblCompanion->setText(ColorCheckLines({"· OBS 自己推流，不需要 VB-CABLE，也不需要直播伴侣。"}));
++        lblCompanion->setText(ColorCheckLines({"· OBS 自己推流，不需要 VB-CABLE，也不需要其他推流软件。"}));
+         companionDetails->setVisible(false);
+         companionProblems = 0;
+         return;
+@@ -1401,15 +1363,20 @@ void ConfigDialog::updateCompanionUI() {
+             const char *prev_id = config_get_string(profile, "SpeechFilter", "PrevMonitoringDeviceId");
+             if (prev && *prev && prev_id && strcmp(prev_id, "default") != 0)
+                 text += std::string("\n· OBS 监听设备已改为 CABLE（原来是“") + prev +
+-                        "”，改回 OBS 直接推流时恢复）；在 OBS 里监听的声音会改送进伴侣。";
++                        "”，改回 OBS 直接推流时恢复）；在 OBS 里监听的声音会改送进推流软件。";
++        }
++    }
++    // The streaming program's side (streaming-apps.cpp, shared with the standalone program).
++    for (const StreamingFinding &f : CheckStreamingApps("CABLE Output", true).items) {
++        if (f.level == StreamingFinding::Bad) {
++            text += "\n✗ " + f.title + " → " + f.detail + f.basis;
++            ++problem_count;
++        } else if (f.level == StreamingFinding::Ok) {
++            text += "\n✓ " + f.title + "。" + f.detail + f.basis;
++        } else {
++            text += "\n· " + f.title + "：" + f.detail + "也可以按“推流软件设置清单…”确认。";
+         }
+     }
+-    bool readable = false;
+-    auto problems = CheckCompanionAppAudio(readable);
+-    if (!readable) text += "\n· 读不到直播伴侣的声音设置，请按“伴侣端设置清单…”自行确认。";
+-    else if (problems.empty()) text += "\n✓ 伴侣只采集 CABLE Output，声音设置正确。";
+-    else for (auto &p : problems) text += "\n✗ " + p;
+-    problem_count += (int)problems.size();
+     companionProblems = problem_count;
+     lblCompanion->setText(ColorCheckLines(QString::fromStdString(text).split('\n')));
+ }
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 0b3b9b0..52b3da1 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -36,11 +36,6 @@ std::string GetViewerLatencyText();
+ // Set by UpdateVideoDelayFiltersState: why the picture is (not) delayed and which
+ // filtered voice sources lag the picture when it is not.
+ void SetSyncSummary(const std::string &reason, const std::string &voices);
+-// Reads the Douyin companion app's own audio mix settings (webcast_mate audioStore.json,
+-// an internal format seen in 直播伴侣 13.2.x) and returns problems: an enabled source other
+-// than CABLE Output (system sound, a real microphone, a program's sound) bypasses the
+-// filter. readable=false when the file is missing or not understood (then no warnings).
+-std::vector<std::string> CheckCompanionAppAudio(bool &readable);
+ // Audio source checklist for the chosen teammate voice source, one line per item
+ // prefixed with ✓ (ok), ✗ (needs a change) or · (information). Set every second by
+ // UpdateVideoDelayFiltersState, shown in the settings dialog.
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index c24dbc6..a1e8cfb 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -7,6 +7,7 @@
+ #include "plugin-config.hpp"
+ #include "video-delay.hpp"
+ #include "companion-audio.hpp"
++#include "streaming-apps.hpp"
+ #include <util/config-file.h>
+ #include <QMainWindow>
+ #include <QStatusBar>
+@@ -428,8 +429,10 @@ static void set_monitoring_device(const char *name, const char *id) {
+ static bool companion_was_on = false;
+ static int companion_tick = 0;
+ static CompanionAudioState companion_state;
++// The streaming program's settings (streaming-apps.cpp): whether they were read, and the
++// problems as status-bar lines (broken = the stream has no filtered voice).
+ static bool companion_app_readable = false;
+-static std::vector<std::string> companion_app_problems;
++static std::vector<std::pair<bool, std::string>> companion_app_problems;
+ 
+ static int cable_tick = 0;
+ // Monitors opened while the cable was disabled (e.g. OBS started with it disabled) fail
+@@ -661,9 +664,19 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+     }
+     if (!companion_was_on || companion_tick++ % 3 == 0) {
+         companion_state = QueryCompanionAudio();
+-        auto problems = CheckCompanionAppAudio(companion_app_readable);
++        StreamingReport report = CheckStreamingApps("CABLE Output", true);
++        companion_app_readable = report.settings_read;
++        std::vector<std::pair<bool, std::string>> problems;
++        for (const StreamingFinding &f : report.items) {
++            if (f.level != StreamingFinding::Bad) continue;
++            std::string detail = f.detail;
++            const std::string stop = "。";
++            if (detail.size() >= stop.size() && detail.compare(detail.size() - stop.size(), stop.size(), stop) == 0)
++                detail.resize(detail.size() - stop.size());
++            problems.push_back({f.kind == StreamingFinding::NoCable, f.title + "，" + detail});
++        }
+         if (problems != companion_app_problems)
+-            for (auto &p : problems) blog(LOG_INFO, "[Speech Sync] companion app: %s", p.c_str());
++            for (auto &p : problems) blog(LOG_INFO, "[Speech Sync] streaming app: %s", p.second.c_str());
+         companion_app_problems = problems;
+     }
+     if (!companion_was_on) {
+@@ -681,7 +694,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         return;
+     }
+     if (!st.cable_found) {
+-        add_warning(WARN_BROKEN, "直播伴侣模式：未安装VB-CABLE虚拟声卡，伴侣收不到声音，请在插件设置点“下载安装VB-CABLE”");
++        add_warning(WARN_BROKEN, "直播伴侣模式：未安装VB-CABLE虚拟声卡，推流软件收不到声音，请在插件设置点“下载安装VB-CABLE”");
+         return;
+     }
+     const char *name = nullptr, *id = nullptr;
+@@ -747,16 +760,16 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         --cable_notice_ticks;
+         add_warning(WARN_NOTICE, cable_notice);
+     }
+-    for (auto &p : companion_app_problems) add_warning(p.find("没有采集 CABLE Output") != std::string::npos ? WARN_BROKEN : WARN_LEAK, p);
++    for (auto &p : companion_app_problems) add_warning(p.first ? WARN_BROKEN : WARN_LEAK, p.second);
+     bool confirmed = false;
+     if (GlobalConfig *cfg = GetGlobalConfig()) {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         confirmed = cfg->companion_confirmed;
+     }
+     if (!confirmed && !companion_app_readable)
+-        add_warning(WARN_BROKEN, "直播伴侣模式：请在插件设置点“伴侣端设置清单”，确认已关闭伴侣的系统声音");
++        add_warning(WARN_BROKEN, "直播伴侣模式：请在插件设置点“推流软件设置清单”，确认推流软件已关闭系统声音");
+     if (!obs_frontend_virtualcam_active()) {
+-        add_warning(WARN_BROKEN, "直播伴侣模式：虚拟摄像头未启动，伴侣收不到画面");
++        add_warning(WARN_BROKEN, "直播伴侣模式：虚拟摄像头未启动，推流软件收不到画面");
+     } else if (obs_output_t *vcam = obs_frontend_get_virtualcam_output()) {
+         // "Program" output renders the main mix, which carries the picture-sync delay on
+         // the transition; a single scene/source output bypasses it and freezes the view
+diff --git a/src/streaming-apps.cpp b/src/streaming-apps.cpp
+new file mode 100644
+index 0000000..49d5ab5
+--- /dev/null
++++ b/src/streaming-apps.cpp
+@@ -0,0 +1,413 @@
++#include "streaming-apps.hpp"
++
++#include "companion-audio.hpp"
++
++#ifdef _WIN32
++
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
++
++#include <windows.h>
++#include <mmdeviceapi.h>
++#include <audiopolicy.h>
++#include <tlhelp32.h>
++
++#include <algorithm>
++#include <map>
++
++namespace {
++
++// ---- Windows: processes and recording sessions ----
++
++// PKEY_Device_FriendlyName, defined here to avoid INITGUID/propkey linking.
++const PROPERTYKEY kFriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
++
++struct ComScope {
++    bool uninit = false;
++    ComScope() { uninit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)); }
++    ~ComScope() { if (uninit) CoUninitialize(); }
++};
++
++template <typename T> struct Com {
++    T *p = nullptr;
++    ~Com() { if (p) p->Release(); }
++    T **operator&() { return &p; }
++    T *operator->() const { return p; }
++    explicit operator bool() const { return p != nullptr; }
++};
++
++QString FriendlyName(IMMDevice *d) {
++    QString name;
++    Com<IPropertyStore> ps;
++    PROPVARIANT v;
++    PropVariantInit(&v);
++    if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps)) && SUCCEEDED(ps->GetValue(kFriendlyName, &v)) &&
++        v.vt == VT_LPWSTR && v.pwszVal)
++        name = QString::fromWCharArray(v.pwszVal);
++    PropVariantClear(&v);
++    return name;
++}
++
++// pid -> (lower-case exe, parent pid) of every running process.
++std::map<DWORD, std::pair<QString, DWORD>> ProcessTable() {
++    std::map<DWORD, std::pair<QString, DWORD>> table;
++    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++    if (snap == INVALID_HANDLE_VALUE) return table;
++    PROCESSENTRY32W pe{};
++    pe.dwSize = sizeof(pe);
++    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
++        table[pe.th32ProcessID] = {QString::fromWCharArray(pe.szExeFile).toLower(), pe.th32ParentProcessID};
++    CloseHandle(snap);
++    return table;
++}
++
++struct Proc {
++    QString exe, parent; // lower-case executable names
++};
++
++Proc ProcOf(const std::map<DWORD, std::pair<QString, DWORD>> &table, DWORD pid) {
++    Proc p;
++    auto it = table.find(pid);
++    if (it == table.end()) return p;
++    p.exe = it->second.first;
++    auto parent = table.find(it->second.second);
++    if (parent != table.end()) p.parent = parent->second.first;
++    return p;
++}
++
++struct Recording {
++    Proc proc;
++    QString device;
++};
++
++// Active sessions on active recording devices (works for elevated processes too: the pid
++// comes from the audio service, the names from the process snapshot).
++std::vector<Recording> ActiveRecordings(const std::map<DWORD, std::pair<QString, DWORD>> &table) {
++    std::vector<Recording> out;
++    Com<IMMDeviceEnumerator> en;
++    Com<IMMDeviceCollection> list;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
++                                (void **)&en)) ||
++        FAILED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &list)))
++        return out;
++    const DWORD self = GetCurrentProcessId();
++    UINT count = 0;
++    list->GetCount(&count);
++    for (UINT i = 0; i < count; i++) {
++        Com<IMMDevice> d;
++        Com<IAudioSessionManager2> mgr;
++        Com<IAudioSessionEnumerator> sessions;
++        if (FAILED(list->Item(i, &d)) ||
++            FAILED(d->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void **)&mgr)) ||
++            FAILED(mgr->GetSessionEnumerator(&sessions)))
++            continue;
++        const QString device = FriendlyName(d.p);
++        int n = 0;
++        sessions->GetCount(&n);
++        for (int k = 0; k < n; k++) {
++            Com<IAudioSessionControl> ctl;
++            Com<IAudioSessionControl2> ctl2;
++            AudioSessionState state;
++            DWORD pid = 0;
++            if (FAILED(sessions->GetSession(k, &ctl)) ||
++                FAILED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void **)&ctl2)) ||
++                FAILED(ctl2->GetState(&state)) || FAILED(ctl2->GetProcessId(&pid)) || !pid || pid == self ||
++                state != AudioSessionStateActive)
++                continue;
++            out.push_back({ProcOf(table, pid), device});
++        }
++    }
++    return out;
++}
++
++// Friendly name of an endpoint id; "default"/empty = Windows default (recording:
++// communications, as OBS opens it; playback: console).
++QString EndpointName(const QString &id, bool capture) {
++    Com<IMMDeviceEnumerator> en;
++    Com<IMMDevice> d;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
++                                (void **)&en)))
++        return {};
++    HRESULT hr = id.isEmpty() || id == "default"
++                     ? en->GetDefaultAudioEndpoint(capture ? eCapture : eRender, capture ? eCommunications : eConsole, &d)
++                     : en->GetDevice(reinterpret_cast<LPCWSTR>(id.utf16()), &d);
++    return SUCCEEDED(hr) && d ? FriendlyName(d.p) : QString();
++}
++
++// ---- saved mixer settings ----
++
++// One audio input of the saved mixer that is heard in the stream (not muted, volume above 0).
++struct SavedInput {
++    enum Kind { Mic, System, Program } kind;
++    QString name; // device name, or the program for Program
++    bool cable = false;
++};
++
++struct Saved {
++    bool found = false; // a readable settings file with audio inputs
++    QDateTime time;     // when it was written
++    std::vector<SavedInput> inputs;
++};
++
++bool IsCableName(const QString &name) {
++    return name.contains("CABLE Output", Qt::CaseInsensitive) || IsCableEndpointName(name.toStdString());
++}
++
++QByteArray ReadFile(const QString &path) {
++    QFile f(path);
++    return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
++}
++
++// An OBS scene collection: the global channels ("DesktopAudioDevice1", "AuxAudioDevice1", 直播姬's
++// "Desktop Audio" / "Mic/Aux") and audio sources added to scenes.
++Saved ReadObsCollection(const QString &path) {
++    Saved s;
++    const QJsonObject root = QJsonDocument::fromJson(ReadFile(path)).object();
++    if (root.isEmpty()) return s;
++    auto take = [&](const QJsonObject &src) {
++        const QString id = src.value("id").toString();
++        SavedInput::Kind kind;
++        if (id == "wasapi_input_capture") kind = SavedInput::Mic;
++        else if (id == "wasapi_output_capture") kind = SavedInput::System;
++        else if (id == "wasapi_process_output_capture") kind = SavedInput::Program;
++        else return;
++        s.found = true;
++        if (src.value("muted").toBool(false) || !src.value("enabled").toBool(true) || src.value("volume").toDouble(1.0) <= 0.0)
++            return;
++        const QJsonObject settings = src.value("settings").toObject();
++        SavedInput in{kind, {}, false};
++        if (kind == SavedInput::Program) {
++            // "window": "title:class:program.exe"
++            in.name = settings.value("window").toString().section(':', -1);
++            if (in.name.isEmpty()) in.name = src.value("name").toString();
++        } else {
++            const QString device = settings.value("device_id").toString();
++            in.name = EndpointName(device, kind == SavedInput::Mic);
++            if (in.name.isEmpty()) in.name = settings.value("audio_device_name").toString();
++            if (in.name.isEmpty()) in.name = device.isEmpty() || device == "default" ? "默认设备" : "已拔出的设备";
++            in.cable = IsCableName(in.name);
++        }
++        s.inputs.push_back(in);
++    };
++    for (auto it = root.begin(); it != root.end(); ++it)
++        if (it.value().isObject()) take(it.value().toObject());
++    for (const QJsonValue &v : root.value("sources").toArray()) take(v.toObject());
++    if (s.found) s.time = QFileInfo(path).lastModified();
++    return s;
++}
++
++// 抖音直播伴侣's audioStore.json (an internal format seen in 13.2.x-13.3.x).
++Saved ReadDouyinStore(const QString &path) {
++    Saved s;
++    const QJsonObject store = QJsonDocument::fromJson(ReadFile(path)).object().value("audioStore").toObject();
++    const QJsonObject states = store.value("audioState").toObject();
++    const QJsonObject mixing = store.value("mixingAudio").toObject();
++    if (states.isEmpty() || !mixing.value("inputs").isArray()) return s;
++    s.found = true;
++    s.time = QFileInfo(path).lastModified();
++    const std::pair<const char *, SavedInput::Kind> groups[] = {
++        {"inputs", SavedInput::Mic}, {"outputs", SavedInput::System}, {"process", SavedInput::Program}};
++    for (auto &g : groups) {
++        for (const QJsonValue &id : mixing.value(g.first).toArray()) {
++            const QJsonObject state = states.value(id.toString()).toObject();
++            const QJsonValue volume = state.value("filter").toObject().value("setting").toObject().value("volume");
++            if (volume.isDouble() && volume.toDouble() <= 0.0) continue;
++            SavedInput in{g.second, state.value("name").toString(), false};
++            if (state.value("deviceId").toString() == "DefaultID") in.name = "默认设备";
++            in.cable = g.second == SavedInput::Mic && IsCableName(in.name);
++            s.inputs.push_back(in);
++        }
++    }
++    return s;
++}
++
++// Newest readable collection among the files (per-account folders: the last one used).
++Saved Newest(QStringList files) {
++    std::sort(files.begin(), files.end(),
++              [](const QString &a, const QString &b) { return QFileInfo(a).lastModified() > QFileInfo(b).lastModified(); });
++    for (const QString &f : files) {
++        Saved s = ReadObsCollection(f);
++        if (s.found) return s;
++    }
++    return {};
++}
++
++QStringList AccountDirs(const QString &base) {
++    QStringList out;
++    static const QRegularExpression digits("^\\d+$");
++    for (const QFileInfo &d : QDir(base).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot))
++        if (digits.match(d.fileName()).hasMatch() && d.fileName() != "0") out << d.absoluteFilePath();
++    return out;
++}
++
++// 直播姬: %LOCALAPPDATA%/bililive/User Data/<account>/*.json and "Scene Collection/*.json". The
++// collection in use was the newest one (its Preferences named an older file, seen 2026-11-14).
++Saved ReadBilibili() {
++    QStringList files;
++    for (const QString &dir : AccountDirs(qEnvironmentVariable("LOCALAPPDATA") + "/bililive/User Data"))
++        for (const QString &sub : {dir, dir + "/Scene Collection"})
++            for (const QFileInfo &f : QDir(sub).entryInfoList({"*.json"}, QDir::Files)) files << f.absoluteFilePath();
++    return Newest(files);
++}
++
++// 虎牙直播: %APPDATA%/HuyaPcPresenter/presenter/<account>/setting/scenes.json.
++Saved ReadHuya() {
++    QStringList files;
++    for (const QString &dir : AccountDirs(qEnvironmentVariable("APPDATA") + "/HuyaPcPresenter/presenter"))
++        if (QFileInfo::exists(dir + "/setting/scenes.json")) files << dir + "/setting/scenes.json";
++    return Newest(files);
++}
++
++// 斗鱼直播伴侣: %LOCALAPPDATA%/DYToolEx/Config, the collection named in global.ini (OBS layout).
++Saved ReadDouyu() {
++    const QString config = qEnvironmentVariable("LOCALAPPDATA") + "/DYToolEx/Config";
++    QString file;
++    for (const QString &line : QString::fromUtf8(ReadFile(config + "/global.ini")).split('\n'))
++        if (line.trimmed().startsWith("SceneCollectionFile=")) file = line.trimmed().section('=', 1);
++    if (file.isEmpty()) return {};
++    return ReadObsCollection(config + "/basic/scenes/" + file + ".json");
++}
++
++struct AppDef {
++    const char *name;
++    const char *running; // the process that means "running" (lower-case executable name)
++    // The process that records the microphone, and its parent when the name alone is generic.
++    const char *recorder;
++    const char *recorder_parent;
++};
++
++// Checked 2026-11-14: 直播伴侣 13.3.4 (MediaSDK_Server.exe started by 直播伴侣.exe), 直播姬 8.14
++// (livehime.exe), 虎牙直播 (hyanchor.exe starts nan_server.exe, which records), 斗鱼直播伴侣 6.6.3
++// (DYToolEx.exe, runs as administrator).
++const AppDef kApps[] = {
++    {"抖音直播伴侣", "直播伴侣.exe", "mediasdk_server.exe", "直播伴侣.exe"},
++    {"直播姬", "livehime.exe", "livehime.exe", nullptr},
++    {"虎牙直播", "hyanchor.exe", "nan_server.exe", "hyanchor.exe"},
++    {"斗鱼直播伴侣", "dytoolex.exe", "dytoolex.exe", nullptr},
++};
++
++bool IsRecorder(const AppDef &app, const Proc &p) {
++    return p.exe == QString::fromUtf8(app.recorder) &&
++           (!app.recorder_parent || p.parent == QString::fromUtf8(app.recorder_parent));
++}
++
++} // namespace
++
++StreamingReport CheckStreamingApps(const std::string &cable_std, bool program_sound_bad, const std::string &douyin_store) {
++    using F = StreamingFinding;
++    ComScope com;
++    StreamingReport report;
++    const QString cable = QString::fromStdString(cable_std);
++    auto add = [&](F::Level level, F::Kind kind, const QString &app, const QString &title, const QString &detail,
++                   const QString &basis = {}) {
++        report.items.push_back({level, kind, app.toStdString(), title.toStdString(), detail.toStdString(), basis.toStdString()});
++    };
++
++    const int n = (int)std::size(kApps);
++    std::vector<Saved> saved(n);
++    saved[0] = ReadDouyinStore(douyin_store.empty()
++                                   ? qEnvironmentVariable("APPDATA") + "/webcast_mate/WBStore/audioStore.json"
++                                   : QString::fromStdString(douyin_store));
++    saved[1] = ReadBilibili();
++    saved[2] = ReadHuya();
++    saved[3] = ReadDouyu();
++
++    const auto table = ProcessTable();
++    std::vector<bool> running(n, false);
++    for (auto &kv : table) {
++        const Proc p = ProcOf(table, kv.first);
++        for (int i = 0; i < n; i++)
++            running[i] = running[i] || p.exe == QString::fromUtf8(kApps[i].running) || IsRecorder(kApps[i], p);
++    }
++    std::vector<int> chosen;
++    for (int i = 0; i < n; i++)
++        if (running[i]) chosen.push_back(i);
++    if (chosen.empty()) {
++        int last = -1;
++        for (int i = 0; i < n; i++)
++            if (saved[i].found && (last < 0 || saved[i].time > saved[last].time)) last = i;
++        if (last >= 0) chosen.push_back(last);
++    }
++    if (chosen.empty()) {
++        add(F::Note, F::NoApp, {}, "没找到支持的推流软件",
++            "会自动检查抖音直播伴侣、直播姬、虎牙直播和斗鱼直播伴侣。用其他推流软件时请确认麦克风只选 " + cable +
++                "，并关闭系统声音。");
++        return report;
++    }
++
++    const std::vector<Recording> recordings =
++        std::find(running.begin(), running.end(), true) != running.end() ? ActiveRecordings(table) : std::vector<Recording>();
++    report.settings_read = true;
++    for (int i : chosen) {
++        const QString app = QString::fromUtf8(kApps[i].name);
++        const Saved &s = saved[i];
++        const QString stale = running[i] ? "按" + app + "上次保存的设置判断，刚改过可能还没保存。"
++                                         : app + "没在运行，按上次保存的设置判断。";
++
++        // Microphone: what it records now; when it records nothing yet (虎牙 opens the
++        // microphone a while after start, seen 2026-11-14) or is closed, what it saved.
++        QStringList real;
++        bool cable_seen = false;
++        bool live = false;
++        for (const Recording &r : recordings) {
++            if (!running[i] || !IsRecorder(kApps[i], r.proc)) continue;
++            live = true;
++            if (IsCableName(r.device)) cable_seen = true;
++            else if (!real.contains(r.device)) real << r.device;
++        }
++        if (!live) {
++            for (const SavedInput &in : s.inputs) {
++                if (in.kind != SavedInput::Mic) continue;
++                if (in.cable) cable_seen = true;
++                else if (!real.contains(in.name)) real << in.name;
++            }
++        }
++        const QString micBasis = live ? QString() : stale;
++        for (const QString &dev : real)
++            add(F::Bad, F::RealMic, app, app + "在采集麦克风“" + dev + "”",
++                "原声会绕过消音进入直播，" + app + "里麦克风只选 " + cable + "。", micBasis);
++        if (!cable_seen)
++            add(F::Bad, F::NoCable, app, app + "没有采集 " + cable,
++                "直播里会没有消音后的声音。在" + app + "里把麦克风选为 " + cable + "。", micBasis);
++        if (real.isEmpty() && cable_seen)
++            add(F::Ok, F::CableOk, app, app + "的麦克风是 " + cable, "没有另加真实麦克风。", micBasis);
++
++        // System sound and programs: only the saved settings know.
++        if (!s.found) {
++            report.settings_read = false;
++            add(F::Note, F::SettingsUnread, app, "没读到" + app + "的设置", "请在" + app + "里确认已关闭系统声音（桌面音频）。");
++            continue;
++        }
++        bool system = false;
++        for (const SavedInput &in : s.inputs) {
++            if (in.kind == SavedInput::System) {
++                system = true;
++                add(F::Bad, F::SystemSound, app, app + "在采集系统声音（" + in.name + "）",
++                    "原声会绕过消音进入直播，在" + app + "里把桌面音频静音。", stale);
++            } else if (in.kind == SavedInput::Program) {
++                if (program_sound_bad)
++                    add(F::Bad, F::ProgramSound, app, app + "在采集程序声音“" + in.name + "”",
++                        "这一路不经过消音，也不跟画面一起延迟。游戏声音请在 OBS 里采集，在" + app + "里移除它。", stale);
++                else
++                    add(F::Note, F::ProgramSound, app, app + "在采集程序声音“" + in.name + "”",
++                        "这一路不经过消音。游戏声音可以这样采，但游戏内语音不会被消音。", stale);
++            }
++        }
++        if (!system) add(F::Ok, F::SystemOk, app, app + "没有采集系统声音", "", stale);
++    }
++    return report;
++}
++
++#else
++
++StreamingReport CheckStreamingApps(const std::string &, bool, const std::string &) {
++    return {};
++}
++
++#endif
+diff --git a/src/streaming-apps.hpp b/src/streaming-apps.hpp
+new file mode 100644
+index 0000000..699a192
+--- /dev/null
++++ b/src/streaming-apps.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++
++// Checks of the streaming program (推流软件) that takes the filtered voice from CABLE Output:
++// 抖音直播伴侣, 直播姬 (Bilibili), 虎牙直播 and 斗鱼直播伴侣 (all checked 2026-11-14). Shared by
++// the OBS plugin (companion mode) and the standalone 直播消音 program.
++//
++// - Microphone, while the program records: Windows audio sessions on recording devices show
++//   which device its audio process really records (live, wherever it is installed, also when
++//   it runs as administrator). Processes are matched by executable name, for generic names
++//   also by the parent process, never by install folder.
++// - System sound and programs captured, and the microphone while it is closed or not recording
++//   yet: its saved mixer settings. 直播姬, 虎牙 and 斗鱼 use OBS scene collections (虎牙 and 斗鱼
++//   write them only when they exit), 直播伴侣 its own audioStore.json. The files live under the
++//   user profile, not in the install folder.
++//
++// Running programs are checked; when none runs, the one whose settings were saved last.
++
++#include <string>
++#include <vector>
++
++struct StreamingFinding {
++    enum Level { Ok, Bad, Note } level = Ok;
++    enum Kind {
++        CableOk,        // records CABLE and no real microphone
++        NoCable,        // does not record CABLE: the stream has no filtered voice
++        RealMic,        // records a real microphone: raw voice
++        SystemOk,       // system sound off
++        SystemSound,    // records system sound: raw sound of every program
++        ProgramSound,   // records one program's sound
++        SettingsUnread, // its settings file was not found or not understood
++        NoApp,          // no supported program found
++    } kind = CableOk;
++    std::string app;    // "直播姬"; empty for NoApp
++    std::string title;  // one line, e.g. "直播姬在采集麦克风“…”"
++    std::string detail; // what it means and what to do
++    std::string basis;  // how it was judged ("按直播姬上次保存的设置判断…"), may be empty
++};
++
++struct StreamingReport {
++    std::vector<StreamingFinding> items;
++    // Every program checked had readable settings (system sound known). False also when no
++    // supported program was found.
++    bool settings_read = false;
++};
++
++// cable: the cable's recording endpoint as shown to the user ("CABLE Output").
++// program_sound_bad: a captured program's sound is a problem (OBS plugin: game sound must go
++// through OBS to stay in sync with the delayed picture), otherwise a note (standalone).
++// douyin_store: 直播伴侣 audioStore.json; empty = %APPDATA%/webcast_mate/WBStore/audioStore.json.
++// Call from a thread where COM may be used (the UI thread).
++StreamingReport CheckStreamingApps(const std::string &cable, bool program_sound_bad,
++                                   const std::string &douyin_store = std::string());
+-- 
+2.55.0.windows.5
+

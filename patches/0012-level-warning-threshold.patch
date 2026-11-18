@@ -1,0 +1,42 @@
+From 6d57455308a5f3c0d9c12b43f07ba4e8eaef5cc0 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sat, 7 Nov 2026 06:06:16 -0700
+Subject: [PATCH] level-warning-threshold
+
+Raise the speech-detection floor to -60 dBFS RMS and ignore peaks below
+-50 dBFS for the low-level warning, so KOOK background noise is not
+reported as quiet speech.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/profanity-filter.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index c369618..010bb44 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -161,7 +161,9 @@ void ProfanityFilter::UpdateInputLevel(float rms, float peak, size_t frames) {
+     // Some devices gate silence to exact zeros; those packets say nothing about the
+     // noise floor (and an all-zero window is normal when nobody speaks).
+     if (rms > 1e-6f) window_min_rms = min(window_min_rms, rms);
+-    if (rms > max(noise_floor_rms * 4.0f, 0.0003f)) window_speech_frames += frames;
++    // Absolute floor -60 dBFS RMS: KOOK carried phone-mic background noise at about
++    // -60 dBFS peak (2026-11-07), which a -70 dBFS floor counted as speech.
++    if (rms > max(noise_floor_rms * 4.0f, 0.001f)) window_speech_frames += frames;
+     if (now - level_window_start_ns >= 10000000000ULL) {
+         uint32_t sr = sample_rate.load(); if (!sr) sr = 48000;
+         level_peak = window_peak;
+@@ -232,7 +234,8 @@ std::string ProfanityFilter::GetLevelReport(bool warnings_only) {
+         }
+         // Speech for at least 1 s in the window that the AGC still cannot lift near
+         // its target peak: recognition will be unreliable.
+-        if (speech >= 1.0f && peak * max_gain < 0.3f) {
++        // Peaks below -50 dBFS are background noise, not speech that is too quiet.
++        if (speech >= 1.0f && peak >= 0.003f && peak * max_gain < 0.3f) {
+             snprintf(text, sizeof(text), "识别电平偏低：%s 峰值%.0f dBFS%s", name.c_str(),
+                      20.0 * log10(max(peak, 1e-6f)),
+                      agc ? "，请调高麦克风音量" : "，建议开启自动增益或调高音量");
+-- 
+2.55.0.windows.5
+

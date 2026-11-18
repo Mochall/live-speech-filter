@@ -1,0 +1,392 @@
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 005b362..8e4965b 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -74,23 +74,46 @@ static int obs_stream_delay_seconds() {
+     return (int)config_get_uint(profile, "Output", "DelaySec");
+ }
+ 
++static std::mutex sync_summary_mutex;
++static std::string sync_reason, sync_voices;
++
++void SetSyncSummary(const std::string &reason, const std::string &voices) {
++    lock_guard<std::mutex> lock(sync_summary_mutex);
++    sync_reason = reason;
++    sync_voices = voices;
++}
++
+ std::string GetViewerLatencyText() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     if (!cfg) return "";
+     double delay;
++    bool syncing;
+     {
+         lock_guard<std::mutex> lock(cfg->mutex);
+         if (!cfg->global_enable) return "";
+         delay = cfg->delay_seconds;
++        syncing = cfg->video_delay_enabled;
+     }
+-    int obs_delay = obs_stream_delay_seconds();
+-    char text[256];
+-    if (obs_delay > 0)
+-        snprintf(text, sizeof(text), "推流观众约晚%.1f秒（插件%.1f秒+OBS串流延迟%d秒，后者不参与消音）",
+-                 delay + obs_delay, delay, obs_delay);
++    string reason, voices;
++    {
++        lock_guard<std::mutex> lock(sync_summary_mutex);
++        reason = sync_reason;
++        voices = sync_voices;
++    }
++    char text[512];
++    if (syncing)
++        snprintf(text, sizeof(text), "画面与语音同步（%s），推流整体晚约%.1f秒", reason.c_str(), delay);
++    else if (!voices.empty())
++        snprintf(text, sizeof(text), "语音比画面晚约%.1f秒（%s；游戏画面与声音不延迟）", delay, voices.c_str());
+     else
+-        snprintf(text, sizeof(text), "观众约晚%.1f秒", delay);
+-    return text;
++        snprintf(text, sizeof(text), "画面不延迟；过滤的语音将比画面晚约%.1f秒", delay);
++    string out = text;
++    int obs_delay = obs_stream_delay_seconds();
++    if (obs_delay > 0) {
++        snprintf(text, sizeof(text), "；OBS串流延迟另加%d秒，不参与消音", obs_delay);
++        out += text;
++    }
++    return out;
+ }
+ 
+ void GlobalConfig::Save() {
+@@ -112,7 +135,7 @@ void GlobalConfig::Save() {
+         obs_data_set_int(data, "beep_freq", beep_frequency);
+         obs_data_set_int(data, "beep_mix", beep_mix_percent);
+         obs_data_set_bool(data, "enable_agc", enable_agc);
+-        obs_data_set_bool(data, "video_delay_enabled", video_delay_enabled);
++        obs_data_set_int(data, "sync_mode", sync_mode);
+         obs_data_set_bool(data, "auto_filter_microphones", auto_filter_microphones);
+         obs_data_set_bool(data, "delay_follows_padding", delay_follows_padding);
+ 
+@@ -191,7 +214,6 @@ void GlobalConfig::Load() {
+     string json_path = get_config_path("global_config.json");
+     
+     if (json_path.empty() || !filesystem::exists(json_path)) {
+-        video_delay_enabled = true;
+         is_first_run = true;
+         NormalizeDelay();
+         ParsePatterns();
+@@ -240,8 +262,12 @@ void GlobalConfig::Load() {
+             enable_agc = obs_data_get_bool(data, "enable_agc");
+         }
+ 
+-        if (obs_data_has_user_value(data, "video_delay_enabled")) {
+-            video_delay_enabled = obs_data_get_bool(data, "video_delay_enabled");
++        if (obs_data_has_user_value(data, "sync_mode")) {
++            sync_mode = (int)obs_data_get_int(data, "sync_mode");
++            if (sync_mode < 0 || sync_mode > 2) sync_mode = 0;
++        } else if (obs_data_has_user_value(data, "video_delay_enabled")) {
++            // Before 0011: an explicit "off" stays off, "on" becomes automatic.
++            sync_mode = obs_data_get_bool(data, "video_delay_enabled") ? 0 : 2;
+         }
+ 
+         if (obs_data_has_user_value(data, "auto_filter_microphones")) {
+@@ -397,8 +423,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutAudio->addRow("", chkDelayAuto);
+     lblLatency = new QLabel();
+     lblLatency->setWordWrap(true);
+-    lblLatency->setToolTip("插件延迟让识别有时间在声音播出前找到并静音命中词，画面同步延迟同样时长；推流和录制都有。\nOBS“设置→高级→串流延迟”只推迟已编码的推流输出，不参与消音，也不影响录制；开启时观众还要再多等这么久。");
+-    layoutAudio->addRow("观众延迟:", lblLatency);
++    lblLatency->setToolTip("插件延迟让识别有时间在声音播出前找到并静音命中词。\n不同步画面时，只有被过滤的语音（KOOK、麦克风）变晚，游戏画面和声音照常。\nOBS“设置→高级→串流延迟”只推迟已编码的推流输出，不参与消音；开启时观众还要再多等这么久。");
++    layoutAudio->addRow("延迟说明:", lblLatency);
+     connect(spinCensorPadding, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDelayUI(); });
+     connect(chkDelayAuto, &QCheckBox::toggled, this, [this](bool) { updateDelayUI(); });
+     layoutAudio->addRow("", chkEnableAGC);
+@@ -411,9 +437,12 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutAudio->addRow("识别电平:", lblRecognitionLevel);
+     layoutAudio->addRow("屏蔽音效:", comboEffect);
+     
+-    chkEnableVideoDelay = new QCheckBox("启用音画同步缓冲 (自动应用到所有场景)");
+-    chkEnableVideoDelay->setToolTip("开启后，将自动向所有场景添加音画同步滤镜。\n关闭后，将从所有场景移除该滤镜。");
+-    layoutAudio->addRow("", chkEnableVideoDelay);
++    comboSyncMode = new QComboBox();
++    comboSyncMode->addItem("自动（推荐）", 0);
++    comboSyncMode->addItem("总是同步", 1);
++    comboSyncMode->addItem("不同步", 2);
++    comboSyncMode->setToolTip("自动：只过滤KOOK/麦克风这类单独语音时画面不延迟（省显存，语音比画面晚几秒）；\n场景中有摄像头，或被过滤的是游戏/桌面/带画面的声音（游戏内语音）时，画面一起延迟以保持同步。\n总是同步：画面始终延迟，解说与画面严格对齐，占用显存。");
++    layoutAudio->addRow("画面同步:", comboSyncMode);
+     
+     lblVideoMemory = new QLabel("当前音画同步显存占用: 0.0 MB");
+     lblVideoMemory->setStyleSheet("color: #888; font-style: italic;");
+@@ -616,7 +645,10 @@ void ConfigDialog::LoadToUI() {
+     if (effect_idx != -1) comboEffect->setCurrentIndex(effect_idx);
+     else comboEffect->setCurrentIndex(0); // Default to Beep
+ 
+-    chkEnableVideoDelay->setChecked(cfg->video_delay_enabled);
++    {
++        int idx = comboSyncMode->findData(cfg->sync_mode);
++        comboSyncMode->setCurrentIndex(idx < 0 ? 0 : idx);
++    }
+     chkAutoFilterMic->setChecked(cfg->auto_filter_microphones);
+     chkDelayAuto->setChecked(cfg->delay_follows_padding);
+     updateDelayUI();
+@@ -654,13 +686,8 @@ void ConfigDialog::updateDelayUI() {
+ 
+ void ConfigDialog::updateStatus() {
+     {
+-        int obs_delay = obs_stream_delay_seconds();
+-        double delay = spinDelay->value() / 1000.0;
+-        QString text = obs_delay > 0
+-            ? QString("推流观众约晚 %1 秒 = 插件 %2 秒 + OBS串流延迟 %3 秒（OBS串流延迟不参与消音，可在OBS设置→高级关闭）")
+-                  .arg(delay + obs_delay, 0, 'f', 1).arg(delay, 0, 'f', 1).arg(obs_delay)
+-            : QString("观众约晚 %1 秒（插件延迟，推流与录制都有）").arg(delay, 0, 'f', 1);
+-        lblLatency->setText(text);
++        std::string latency = GetViewerLatencyText();
++        lblLatency->setText(latency.empty() ? QString("过滤已关闭，无延迟") : QString::fromStdString(latency));
+     }
+     {
+         auto level = ProfanityFilter::GetLevelReport(false);
+@@ -686,7 +713,7 @@ void ConfigDialog::updateStatus() {
+     
+     if (!chkGlobalEnable->isChecked()) {
+         text += " (全局已禁用)";
+-    } else if (mb < 0.1 && chkEnableVideoDelay->isChecked()) {
++    } else if (mb < 0.1) {
+         text += " (待机中)";
+     }
+     
+@@ -928,11 +955,11 @@ bool ConfigDialog::onApply() {
+ 
+     GlobalConfig *cfg = GetGlobalConfig();
+     
+-    bool old_enabled_state;
++    int old_sync_mode;
+     bool old_auto_mic;
+     {
+         lock_guard<std::mutex> lock(cfg->mutex);
+-        old_enabled_state = cfg->video_delay_enabled;
++        old_sync_mode = cfg->sync_mode;
+         old_auto_mic = cfg->auto_filter_microphones;
+         
+         cfg->global_enable = chkGlobalEnable->isChecked();
+@@ -947,7 +974,7 @@ bool ConfigDialog::onApply() {
+         
+         cfg->audio_effect = comboEffect->currentData().toInt();
+ 
+-        cfg->video_delay_enabled = chkEnableVideoDelay->isChecked();
++        cfg->sync_mode = comboSyncMode->currentData().toInt();
+         cfg->auto_filter_microphones = chkAutoFilterMic->isChecked();
+         cfg->delay_follows_padding = chkDelayAuto->isChecked();
+         cfg->NormalizeDelay();
+@@ -961,7 +988,7 @@ bool ConfigDialog::onApply() {
+     cfg->Save();
+ 
+     // Apply state change ONLY if switch toggled
+-    if (old_enabled_state != cfg->video_delay_enabled || old_auto_mic != cfg->auto_filter_microphones) {
++    if (old_sync_mode != cfg->sync_mode || old_auto_mic != cfg->auto_filter_microphones) {
+         UpdateVideoDelayFiltersState();
+     }
+     return true;
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index d7a4e79..463ac58 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -32,6 +32,9 @@
+ // Global Configuration Structure
+ // Viewer latency summary for the status bar ("" when the plugin is disabled).
+ std::string GetViewerLatencyText();
++// Set by UpdateVideoDelayFiltersState: why the picture is (not) delayed and which
++// filtered voice sources lag the picture when it is not.
++void SetSyncSummary(const std::string &reason, const std::string &voices);
+ 
+ struct GlobalConfig {
+     bool loaded = false;
+@@ -42,7 +45,7 @@ struct GlobalConfig {
+     std::string model_path;
+     int model_offset_ms = 0; // Model latency compensation
+     double delay_seconds = 0.5;
+-    int censor_padding_ms = 1000;
++    int censor_padding_ms = 500;
+     std::string dirty_words_str;
+     std::string pinyin_words_str;
+     int audio_effect = 0; // 0=Beep, 1=Silence, 2=Squeaky, 3=Robot
+@@ -51,13 +54,18 @@ struct GlobalConfig {
+     bool enable_agc = true; // Automatic Gain Control (Default: ON)
+     bool use_pinyin = true;
+     bool asr_debug_logging = false;
+-    bool video_delay_enabled = true;
++    // Runtime state, decided every second by UpdateVideoDelayFiltersState from sync_mode;
++    // not a user setting any more (kept under this name for the readers in the filters).
++    bool video_delay_enabled = false;
++    // Picture sync: 0 = auto (only when a camera is active or filtered audio belongs to
++    // the picture/game/desktop), 1 = always, 2 = never.
++    int sync_mode = 0;
+     bool auto_filter_microphones = true; // attach a recognizing filter to microphone inputs
+     // Delay = padding + recognition margin. The delay must exceed the front padding plus
+     // the time recognition needs, otherwise a word starts playing before it is muted.
+     bool delay_follows_padding = true;
+-    static constexpr int kAutoDelayMarginMs = 2000; // used when delay follows padding
+-    static constexpr int kMinDelayMarginMs = 1500;  // lower bound for a manual delay
++    static constexpr int kAutoDelayMarginMs = 1500; // used when delay follows padding
++    static constexpr int kMinDelayMarginMs = 1000;  // lower bound for a manual delay
+     void NormalizeDelay(); // call with mutex held (or before the config is shared)
+ 
+     // GPU Acceleration Settings
+@@ -131,7 +139,7 @@ private:
+     QComboBox *comboEffect;
+     QCheckBox *chkUsePinyin;
+     QCheckBox *chkAsrDebugLogging;
+-    QCheckBox *chkEnableVideoDelay;
++    QComboBox *comboSyncMode;
+     QLabel *lblVideoMemory;
+     QLabel *lblPathTitle; // Added for dynamic label update
+     QTimer *statusTimer;
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index c9a7a67..dd69346 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -1,5 +1,7 @@
+ #include <obs-module.h>
+ #include <obs-frontend-api.h>
++#include <cctype>
++#include <initializer_list>
+ 
+ #include "profanity-filter.hpp"
+ #include "plugin-config.hpp"
+@@ -83,8 +85,7 @@ static void start_filter_warning() {
+             : "color: #ffcc66; font-weight: bold; padding: 3px;");
+         std::string latency = GetViewerLatencyText();
+         filter_warning->setText(QString::fromStdString(message.empty()
+-            ? (syncing ? "音画同步：自动维护中（画面与各独立音源使用同一延迟）" + (latency.empty() ? "" : "；" + latency)
+-                       : "语音过滤与自动同步已关闭") : message));
++            ? (latency.empty() ? std::string("语音过滤已关闭") : latency) : message));
+         static std::string last_message;
+         std::string current = filter_warning->text().toStdString();
+         if (current != last_message) {
+@@ -292,16 +293,94 @@ static std::vector<obs_source_t *> filters_of_type(obs_source_t *source, const c
+     return search.result;
+ }
+ 
++static bool id_is(const char *id, std::initializer_list<const char *> ids) {
++    for (const char *x : ids)
++        if (id && !strcmp(id, x)) return true;
++    return false;
++}
++
++// Executable part of a window setting ("title:class:exe.exe"), lower-case.
++static std::string window_exe(obs_source_t *source) {
++    obs_data_t *settings = obs_source_get_settings(source);
++    std::string window = obs_data_get_string(settings, "window");
++    obs_data_release(settings);
++    auto pos = window.rfind(':');
++    std::string exe = pos == std::string::npos ? "" : window.substr(pos + 1);
++    for (char &c : exe) c = (char)tolower((unsigned char)c);
++    return exe;
++}
++
++static bool has_recognizing_filter(obs_source_t *source) {
++    bool found = false;
++    obs_source_enum_filters(source, [](obs_source_t *, obs_source_t *filter, void *p) {
++        if (strcmp(obs_source_get_id(filter), "profanity_filter") || !obs_source_enabled(filter)) return;
++        obs_data_t *settings = obs_source_get_settings(filter);
++        if (!obs_data_get_bool(settings, "sync_delay_only") && obs_data_get_bool(settings, "enabled"))
++            *static_cast<bool *>(p) = true;
++        obs_data_release(settings);
++    }, &found);
++    return found;
++}
++
++// Automatic picture sync. Delaying only separately captured voices (KOOK app audio,
++// microphone) leaves game picture and sound in real time, saves the video cache, and
++// keeps the voices in step with each other; they then lag the picture by the delay.
++// The picture must follow when that lag would be visible or would split one source:
++// an active camera (lip sync), or filtered audio that belongs to the picture itself
++// (a source with video, desktop audio, or an application capture of a captured game
++// window, e.g. in-game voice chat).
++static bool decide_sync(const std::vector<obs_source_t *> &sources, std::string &reason, std::string &voices) {
++    std::vector<std::string> captured_exes;
++    for (auto *s : sources) {
++        if (obs_source_active(s) && id_is(obs_source_get_id(s), {"game_capture", "window_capture"})) {
++            std::string exe = window_exe(s);
++            if (!exe.empty()) captured_exes.push_back(exe);
++        }
++    }
++    bool need = false;
++    for (auto *s : sources) {
++        if (!obs_source_active(s) || obs_source_get_type(s) != OBS_SOURCE_TYPE_INPUT) continue;
++        const char *id = obs_source_get_id(s);
++        std::string name = obs_source_get_name(s);
++        if (id_is(id, {"dshow_input", "av_capture_input", "av_capture_input_v2", "v4l2_input"})) {
++            if (!need) reason = "摄像头：" + name;
++            need = true;
++            continue;
++        }
++        uint32_t flags = obs_source_get_output_flags(s);
++        if (!(flags & OBS_SOURCE_AUDIO) || (flags & OBS_SOURCE_COMPOSITE) || !has_recognizing_filter(s)) continue;
++        std::string why;
++        if (flags & OBS_SOURCE_VIDEO)
++            why = "过滤的声音带画面：" + name;
++        else if (id_is(id, {"wasapi_output_capture", "pulse_output_capture", "coreaudio_output_capture"}))
++            why = "过滤的是桌面音频：" + name;
++        else if (id_is(id, {"wasapi_process_output_capture"})) {
++            std::string exe = window_exe(s);
++            for (auto &e : captured_exes)
++                if (!exe.empty() && e == exe) why = "过滤的是游戏声音：" + name;
++        }
++        if (!why.empty()) {
++            if (!need) reason = why;
++            need = true;
++        } else {
++            if (!voices.empty()) voices += "、";
++            voices += name;
++        }
++    }
++    return need;
++}
++
+ void UpdateVideoDelayFiltersState() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     if (!cfg) return;
+     bool enable;
+     bool global_enable;
+     bool auto_mic;
++    int sync_mode;
+     {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         global_enable = cfg->global_enable;
+-        enable = cfg->video_delay_enabled && global_enable;
++        sync_mode = cfg->sync_mode;
+         auto_mic = cfg->auto_filter_microphones && global_enable;
+     }
+     bool mic_seen = false;
+@@ -309,8 +388,6 @@ void UpdateVideoDelayFiltersState() {
+         std::lock_guard<std::mutex> lock(sync_warning_mutex);
+         sync_warning.clear();
+     }
+-    if (global_enable && !enable)
+-        append_sync_warning("音画同步已关闭：语音仍有缓存延迟，请在插件设置启用自动音画同步");
+ 
+     // Delay after scene composition: nested scenes share a single video cache.
+     std::vector<obs_source_t *> sources;
+@@ -324,6 +401,24 @@ void UpdateVideoDelayFiltersState() {
+         sources.push_back(obs_source_get_ref(scenes.sources.array[i]));
+     obs_frontend_source_list_free(&scenes);
+ 
++    {
++        std::string reason, voices;
++        bool need = decide_sync(sources, reason, voices);
++        if (sync_mode == 1) { need = true; reason = "设置为总是同步"; }
++        if (sync_mode == 2) need = false;
++        enable = global_enable && need;
++        bool changed;
++        {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            changed = cfg->video_delay_enabled != enable;
++            cfg->video_delay_enabled = enable;
++        }
++        SetSyncSummary(reason, voices);
++        if (changed)
++            blog(LOG_INFO, "[Speech Sync] picture sync %s (%s)", enable ? "on" : "off",
++                 enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
++    }
++
+     for (auto *source : sources) {
+         auto video = filters_of_type(source, "profanity_video_delay");
+         for (auto *filter : video) {

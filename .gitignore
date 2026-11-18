@@ -1,0 +1,12 @@
+# Local dependencies, models, recordings and build output
+upstream/
+downloads/
+models/
+recordings/
+work/
+.venv/
+__pycache__/
+*.obj
+*.exe
+*.pdb
+*.ilk

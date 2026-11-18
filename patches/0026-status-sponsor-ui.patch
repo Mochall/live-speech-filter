@@ -1,0 +1,194 @@
+From 30fc31a57eb76200d6445b02e3b4833dae022e5c Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Sun, 8 Nov 2026 07:55:38 -0700
+Subject: [PATCH] =?UTF-8?q?status-sponsor-ui:=20check=20lines=20colored=20?=
+ =?UTF-8?q?by=20result=20(green=20=E2=9C=93,=20red=20=E2=9C=97,=20grey=20?=
+ =?UTF-8?q?=C2=B7);=20master=20switch=20hint=20says=20the=20model=20is=20r?=
+ =?UTF-8?q?eleased=20from=20memory=20and=20kept=20on=20disk=20(was=20read?=
+ =?UTF-8?q?=20as=20uninstall);=20=E8=B5=9E=E5=8A=A9=E6=94=AF=E6=8C=81=20bu?=
+ =?UTF-8?q?tton=20showing=20data/sponsor-qr.png,=20with=20a=20note=20when?=
+ =?UTF-8?q?=20the=20image=20is=20missing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp | 88 +++++++++++++++++++++++++++++++++++++++----
+ src/plugin-config.hpp |  1 +
+ 2 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index eba023c..4aaaab1 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -28,6 +28,7 @@
+ #include <QScrollBar>
+ #include <QCoreApplication>
+ #include <QWheelEvent>
++#include <QPixmap>
+ 
+ using namespace std;
+ 
+@@ -430,6 +431,28 @@ void GlobalConfig::Load() {
+ 
+ // --- UI Implementation ---
+ 
++// Check lines start with ✓ (fine), ✗ (needs a change) or · (information). Shown as rich
++// text with a colored mark so problems stand out; the rest of the line is escaped.
++static QString ColorCheckLines(const QStringList &lines) {
++    QString html;
++    for (const QString &line : lines) {
++        QString color, mark, rest = line;
++        if (line.startsWith(QString::fromUtf8("✓"))) color = "#67C23A";
++        else if (line.startsWith(QString::fromUtf8("✗"))) color = "#F56C6C";
++        else if (line.startsWith(QString::fromUtf8("·"))) color = "#9a9cab";
++        if (!color.isEmpty()) {
++            mark = line.left(1);
++            rest = line.mid(1);
++        }
++        if (!html.isEmpty()) html += "<br>";
++        if (!mark.isEmpty()) html += QString("<span style=\"color:%1; font-weight:bold;\">%2</span>").arg(color, mark);
++        QString body = rest.toHtmlEscaped();
++        if (color == "#F56C6C") body = QString("<span style=\"color:%1;\">%2</span>").arg(color, body);
++        html += body;
++    }
++    return html;
++}
++
+ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     setWindowTitle("语音消音设置");
+     resize(640, 550);
+@@ -467,7 +490,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     font.setBold(true);
+     chkGlobalEnable->setFont(font);
+     mainLayout->addWidget(chkGlobalEnable);
+-    QLabel *lblGlobalHint = hint("关闭后卸载识别模型，停止检测和画面延迟，所有声音照常输出。");
++    QLabel *lblGlobalHint = hint("关闭后暂停识别并释放模型占用的内存，画面不再延迟，所有声音照常输出；"
++                                 "模型和插件都保留在电脑上，重新勾选即可恢复。");
+     lblGlobalHint->setContentsMargins(22, 0, 0, 0);
+     mainLayout->addWidget(lblGlobalHint);
+ 
+@@ -498,6 +522,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     }
+     lblCompanion = new QLabel();
+     lblCompanion->setWordWrap(true);
++    lblCompanion->setTextFormat(Qt::RichText);
+     lblCompanion->setTextInteractionFlags(Qt::TextSelectableByMouse);
+     layoutCompanion->addWidget(lblCompanion);
+     companionDetails = new QWidget();
+@@ -556,6 +581,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutSources->addRow("", chkAutoFilterMic);
+     lblAudioSetup = new QLabel();
+     lblAudioSetup->setWordWrap(true);
++    lblAudioSetup->setTextFormat(Qt::RichText);
+     lblAudioSetup->setTextInteractionFlags(Qt::TextSelectableByMouse);
+     layoutSources->addRow("当前场景检查：", lblAudioSetup);
+     containerLayout->addWidget(grpSources);
+@@ -761,6 +787,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     connect(btnApply, &QPushButton::clicked, this, &ConfigDialog::onApply);
+     connect(btnCancel, &QPushButton::clicked, this, &ConfigDialog::reject);
+ 
++    QPushButton *btnSponsor = new QPushButton("赞助支持…");
++    btnSponsor->setToolTip("觉得好用可以扫码赞助，支持项目继续更新。赞助完全自愿，不影响任何功能。");
++    connect(btnSponsor, &QPushButton::clicked, this, [this] { showSponsorDialog(); });
++    btnLayout->addWidget(btnSponsor);
+     btnLayout->addStretch();
+     btnLayout->addWidget(btnSave);
+     btnLayout->addWidget(btnApply);
+@@ -895,15 +925,16 @@ void ConfigDialog::updateStatus() {
+             lock_guard<std::mutex> lock(cfg->mutex);
+             saved = cfg->voice_source;
+         }
+-        QString text;
++        QStringList lines;
+         if (comboVoiceSource->currentData().toInt() != saved)
+-            text = "点“应用”后按新的选择检查。";
++            lines << "· 点“应用”后按新的选择检查。";
+         else
+             for (auto &line : GetAudioSetupReport()) {
+                 if (line.rfind("✗", 0) == 0) ++failed_checks;
+-                text += (text.isEmpty() ? "" : "\n") + QString::fromStdString(line);
++                lines << QString::fromStdString(line);
+             }
+-        if (text.isEmpty()) text = "没有可检查的音源。";
++        if (lines.isEmpty()) lines << "· 没有可检查的音源。";
++        QString text = ColorCheckLines(lines);
+         if (lblAudioSetup->text() != text) lblAudioSetup->setText(text);
+     }
+ 
+@@ -1281,7 +1312,7 @@ void ConfigDialog::updateCompanionUI() {
+     btnInstallCable->setVisible(comboBroadcastMode->currentData().toInt() == 1 && st.supported &&
+                                 GetCableRenderState() == CableRenderState::NotInstalled);
+     if (comboBroadcastMode->currentData().toInt() != 1) {
+-        lblCompanion->setText("OBS 自己推流，不需要 VB-CABLE，也不需要直播伴侣。");
++        lblCompanion->setText(ColorCheckLines({"· OBS 自己推流，不需要 VB-CABLE，也不需要直播伴侣。"}));
+         companionDetails->setVisible(false);
+         companionProblems = 0;
+         return;
+@@ -1309,7 +1340,50 @@ void ConfigDialog::updateCompanionUI() {
+     else for (auto &p : problems) text += "\n✗ " + p;
+     problem_count += (int)problems.size();
+     companionProblems = problem_count;
+-    lblCompanion->setText(QString::fromStdString(text));
++    lblCompanion->setText(ColorCheckLines(QString::fromStdString(text).split('\n')));
++}
++
++// The QR image is data/sponsor-qr.png in the plugin folder; replacing that file changes it
++// without rebuilding. When it is missing the dialog says so instead of showing nothing.
++void ConfigDialog::showSponsorDialog() {
++    QDialog dlg(this);
++    dlg.setWindowTitle("赞助支持");
++    QVBoxLayout *layout = new QVBoxLayout(&dlg);
++    QLabel *intro = new QLabel("这个插件免费使用。觉得有帮助的话，可以扫码赞助，支持后续维护和更新。\n"
++                               "赞助完全自愿，不赞助也能使用全部功能。");
++    intro->setWordWrap(true);
++    layout->addWidget(intro);
++
++    QPixmap qr;
++    if (g_module) {
++        char *path = obs_find_module_file(g_module, "sponsor-qr.png");
++        if (path) {
++            bool loaded = qr.load(QString::fromUtf8(path));
++            blog(LOG_INFO, "[Speech Sync] sponsor image %s: %s", path, loaded ? "loaded" : "not readable");
++            bfree(path);
++        } else {
++            blog(LOG_INFO, "[Speech Sync] sponsor image sponsor-qr.png not found in the plugin data folder");
++        }
++    }
++    QLabel *image = new QLabel();
++    image->setAlignment(Qt::AlignCenter);
++    if (!qr.isNull()) {
++        if (qr.width() > 360 || qr.height() > 360)
++            qr = qr.scaled(360, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation);
++        image->setPixmap(qr);
++    } else {
++        image->setText("（赞助二维码还没有放进插件文件夹：data\\sponsor-qr.png）");
++        image->setStyleSheet("color: #9a9cab; padding: 24px;");
++    }
++    layout->addWidget(image);
++
++    QHBoxLayout *buttons = new QHBoxLayout();
++    QPushButton *close = new QPushButton("关闭");
++    connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
++    buttons->addStretch();
++    buttons->addWidget(close);
++    layout->addLayout(buttons);
++    dlg.exec();
+ }
+ 
+ void ConfigDialog::onSave() {
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 9e917f5..47e9625 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -157,6 +157,7 @@ private:
+     QCheckBox *chkCableAutoDisable;
+     QPushButton *btnInstallCable;
+     void openCableDownload();
++    void showSponsorDialog();
+     QLabel *lblAudioSetup;
+     void updateCompanionUI();
+     QCheckBox *chkDelayAuto;
+-- 
+2.55.0.windows.5
+
