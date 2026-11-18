@@ -166,7 +166,7 @@ VB-CABLE 不会随之卸载；不需要时，在“应用”里卸载 *VBCABLE, 
 
 ### 收费吗？
 
-免费，代码开源（GPL-2.0）。如果有帮助到你，可以在程序的“支持项目”页扫码支持。
+免费，代码开源（GPL-2.0）。如果有帮助到你，可以用微信扫[下面的赞赏码](#反馈与支持)支持，程序里的“支持项目”页也是同一个码。
 
 ## 验证情况
 
@@ -180,6 +180,10 @@ VB-CABLE 不会随之卸载；不需要时，在“应用”里卸载 *VBCABLE, 
 - 反馈 QQ：**549466926**
 - 问题和建议：[GitHub Issues](https://github.com/Mochall/live-speech-filter/issues)
 - 更新：[Releases](https://github.com/Mochall/live-speech-filter/releases)
+
+本项目免费使用。如果它帮到了你，欢迎微信扫码赞赏，支持后续开发：
+
+<p align="center"><img src="docs/images/sponsor-qr.png" width="240" alt="漠秋的微信赞赏码"></p>
 
 反馈问题时请说明使用的版本（插件还是直播消音、版本号）、推流软件和平台，尽量附上日志：插件看 OBS 菜单“帮助 → 日志文件”，直播消音的日志在 `%APPDATA%\LiveSpeechFilter`。
 
@@ -208,7 +212,7 @@ bash tools/make-obs28-sdk.sh        # 按 OBS 28.0.3 头文件配置 work/build-
 cmake --build work/build-obs28 --config Release --target obs-profanity-filter
 ```
 
-直播消音的编译步骤见 [standalone/README.md](standalone/README.md)。识别模型（sherpa-onnx X-ASR zh-en 160ms int8，Apache-2.0，来源 https://github.com/Gilgamesh-J/X-ASR ）不在仓库里，组装安装包前需要另行下载。赞赏码图片不在仓库里；不设置 `SPONSOR_IMAGE` / `LSF_SPONSOR_IMAGE` 时，编译出的程序不显示赞赏码。
+直播消音的编译步骤见 [standalone/README.md](standalone/README.md)。识别模型（sherpa-onnx X-ASR zh-en 160ms int8，Apache-2.0，来源 https://github.com/Gilgamesh-J/X-ASR ）不在仓库里，组装安装包前需要另行下载。赞赏码图片是 `docs/images/sponsor-qr.png`；编译时把 `SPONSOR_IMAGE`（插件）/ `LSF_SPONSOR_IMAGE`（直播消音）设为这张图，程序里才会显示赞赏码。
 
 </details>
 

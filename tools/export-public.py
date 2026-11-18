@@ -37,6 +37,7 @@ EXTRA = {'README.md': 'README.md', 'gitignore': '.gitignore'}
 
 TEXT_BLOCK = [r'C:[/\\]Users', r'D:[/\\]code']    # local paths (a user folder path names the account)
 SPONSOR = r'sponsor-qr\.png$'
+SPONSOR_PUBLIC = 'docs/images/sponsor-qr.png'   # the one copy meant for the README
 MEDIA = r'\.wav$|\.mkv$|\.mp4$|\.onnx$'
 ALLOWED_BINARY = re.compile(r'^standalone/data/sounds/[a-z]+\.wav$')
 
@@ -82,7 +83,7 @@ def main():
         rel = p.relative_to(OUT).as_posix()
         if not p.is_file() or rel.startswith('.git/'):
             continue
-        if re.search(SPONSOR, rel) or (re.search(MEDIA, rel) and not ALLOWED_BINARY.match(rel)):
+        if (re.search(SPONSOR, rel) and rel != SPONSOR_PUBLIC) or (re.search(MEDIA, rel) and not ALLOWED_BINARY.match(rel)):
             problems.append(f'{rel}: private or large media file')
             continue
         data = p.read_bytes()
