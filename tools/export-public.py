@@ -31,7 +31,7 @@ FILES = [
     'tools/check-plugin-imports.py',
     'tools/export-public.py',
 ]
-DIRS = ['standalone', 'docs/design/app-icon', 'tools/tests']
+DIRS = ['standalone', 'docs/design/app-icon', 'docs/images', 'tools/tests']
 # public-only files: source in packaging/public -> path in the export
 EXTRA = {'README.md': 'README.md', 'gitignore': '.gitignore'}
 
