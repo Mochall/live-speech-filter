@@ -15,7 +15,7 @@
 ; Settings, custom words, logs and downloaded models live in %APPDATA%\LiveSpeechFilter and are
 ; kept on uninstall. The uninstaller removes the "start with Windows" entry only when it points
 ; into this installation.
-#define Version "0.10.1"
+#define Version "0.10.2"
 #define Payload "..\work\installer-payload-lite-" + Version
 #define ExeName "LiveSpeechFilter.exe"
 

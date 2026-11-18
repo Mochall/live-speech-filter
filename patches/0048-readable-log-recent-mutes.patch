@@ -1,0 +1,640 @@
+From 8f17fe5fa5964ee59b8616a1b2a36d4b6eae4298 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Wed, 18 Nov 2026 06:57:49 -0700
+Subject: [PATCH] =?UTF-8?q?Readable=20log:=20one=20=E6=B6=88=E9=9F=B3=20li?=
+ =?UTF-8?q?ne=20per=20muted=20word=20with=20source,=20[=E8=AF=AD=E9=9F=B3?=
+ =?UTF-8?q?=E6=B6=88=E9=9F=B3]=20prefix,=20recent-mutes=20list?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Hit line: "消音 来源=<source> 词=<word>[（同音：<pinyin>）]", plus 原文="..." only while
+  debug logging is on. The "(extended by stream)" and "[ASR Debug] stream muted" lines are gone.
+- Debug recognition lines: "识别 来源=… 时间=…" at sentence end, "识别中 …" at most every 2 s of
+  audio (counted from the sentence start), instead of one line per partial.
+- Prefix [Profanity Filter] / [Speech Sync] -> [语音消音]; model load line simplified.
+- censor::RecordHit/RecentHits/ClearHits/HitSerial: last 100 mutes in memory.
+- Settings: 屏蔽词 > 最近消音 [查看…] opens a list (time, source, word, sentence) with 清空.
+- Log tooltip describes the new lines.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/asr-model.cpp        |   2 +-
+ src/censor-engine.cpp    |  91 ++++++++++++++++++++++----------
+ src/censor-engine.hpp    |  14 +++++
+ src/logging-macros.hpp   |   2 +-
+ src/plugin-config.cpp    | 110 ++++++++++++++++++++++++++++++++++-----
+ src/plugin-main.cpp      |  44 ++++++++--------
+ src/profanity-filter.cpp |   2 +-
+ 7 files changed, 199 insertions(+), 66 deletions(-)
+
+diff --git a/src/asr-model.cpp b/src/asr-model.cpp
+index 720a9c3..7611e69 100644
+--- a/src/asr-model.cpp
++++ b/src/asr-model.cpp
+@@ -152,7 +152,7 @@ std::shared_ptr<ASRModel> ModelManager::Get(const std::string& path, const std::
+     }
+ 
+     // Load new
+-    CLOG(censor::kLogInfo, "🆕 [ModelManager] Loading NEW model for: %s (provider: %s)", path.c_str(), provider.c_str());
++    CLOG(censor::kLogInfo, "Loading model: %s (provider: %s)", path.c_str(), provider.c_str());
+     auto ptr = std::make_shared<ASRModel>(path, provider, error_out);
+     if (!ptr->recognizer) {
+         return nullptr; // Failed
+diff --git a/src/censor-engine.cpp b/src/censor-engine.cpp
+index 791e7be..3df410f 100644
+--- a/src/censor-engine.cpp
++++ b/src/censor-engine.cpp
+@@ -20,6 +20,31 @@ static LogHandler g_log_handler = nullptr;
+ 
+ void SetLogHandler(LogHandler handler) { g_log_handler = handler; }
+ 
++static mutex g_hits_mutex;
++static deque<HitRecord> g_hits;
++static atomic<uint64_t> g_hit_serial{0};
++static const size_t kMaxHits = 100;
++
++void RecordHit(HitRecord hit) {
++    lock_guard<mutex> lock(g_hits_mutex);
++    g_hits.push_back(std::move(hit));
++    while (g_hits.size() > kMaxHits) g_hits.pop_front();
++    g_hit_serial++;
++}
++
++vector<HitRecord> RecentHits() {
++    lock_guard<mutex> lock(g_hits_mutex);
++    return vector<HitRecord>(g_hits.begin(), g_hits.end());
++}
++
++void ClearHits() {
++    lock_guard<mutex> lock(g_hits_mutex);
++    g_hits.clear();
++    g_hit_serial++;
++}
++
++uint64_t HitSerial() { return g_hit_serial.load(); }
++
+ void Log(int level, const char *format, ...) {
+     if (!g_log_handler) return;
+     char small[1024];
+@@ -216,6 +241,9 @@ void CensorEngine::ASRLoop() {
+ 
+     string last_debug_text;
+     uint64_t last_debug_segment = 0;
++    uint64_t last_debug_logged_16k = 0;
++    uint64_t debug_seen_segment = UINT64_MAX, debug_seen_16k = 0; // when this sentence first had text
++    bool last_debug_final = false;
+     while (running) {
+         // Poll Global Config for model path changes and Gain settings
+         int censor_padding_ms;
+@@ -456,9 +484,18 @@ void CensorEngine::ASRLoop() {
+                     // Reconstruct text
+                     for(int i=0; i<token_count; i++) full_text += tokens[i];
+ 
+-                    // Stream results are revisable partials, not a final transcript.
+-                    if (asr_debug_logging && lane_index == 0 && !full_text.empty() &&
+-                        (full_text != last_debug_text || last_reset_sample_16k != last_debug_segment)) {
++                    // Recognized text (debug only): one line when the sentence ends, and while it goes
++                    // on one line per 2 s of audio (counted from its first text) if the text changed.
++                    // Each partial used to get a line.
++                    if (lane_index == 0 && !full_text.empty() && debug_seen_segment != last_reset_sample_16k) {
++                        debug_seen_segment = last_reset_sample_16k;
++                        debug_seen_16k = total_samples_popped_16k;
++                    }
++                    const bool debug_changed = full_text != last_debug_text || last_reset_sample_16k != last_debug_segment;
++                    const bool debug_due =
++                        segment_final ? (debug_changed || !last_debug_final)
++                                      : (debug_changed && total_samples_popped_16k >= std::max(last_debug_logged_16k, debug_seen_16k) + 16000 * 2);
++                    if (asr_debug_logging && lane_index == 0 && !full_text.empty() && debug_due) {
+                         const string source_name = host->SourceName();
+                         double segment_seconds = last_reset_sample_16k / 16000.0 +
+                                                  (double)start_offset_input / current_sr;
+@@ -466,12 +503,14 @@ void CensorEngine::ASRLoop() {
+                         for (char &c : log_text) {
+                             if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+                         }
+-                        CLOG(censor::kLogInfo, "[ASR Debug] source=\"%s\" input=%.3f..%.3f partial=\"%s\"",
+-                             source_name.c_str(),
++                        CLOG(censor::kLogInfo, "%s 来源=%s 时间=%.2f-%.2f秒 \"%s\"",
++                             segment_final ? "识别" : "识别中", source_name.c_str(),
+                              segment_seconds + token_times[0],
+                              segment_seconds + token_times[token_count - 1], log_text.c_str());
+                         last_debug_text = full_text;
+                         last_debug_segment = last_reset_sample_16k;
++                        last_debug_logged_16k = total_samples_popped_16k;
++                        last_debug_final = segment_final;
+                     }
+                     
+                     if (lane_index == 0 && !full_text.empty()) {
+@@ -650,16 +689,6 @@ void CensorEngine::ASRLoop() {
+                                 }
+                             }
+                             
+-                            // Debug Log Pinyin (First 3s only to avoid spam)
+-                            static int debug_log_count = 0;
+-                            if (asr_debug_logging && debug_log_count < 3 && !text_pinyins.empty()) {
+-                                stringstream ss;
+-                                ss << "DEBUG Pinyin: ";
+-                                for(auto& p : text_pinyins) ss << p << " ";
+-                                CLOG(censor::kLogInfo, "%s", ss.str().c_str());
+-                                debug_log_count++;
+-                            }
+-
+                             // Match
+                             for (const auto& pat : cached_pinyin_patterns) {
+                                 if (pat.size() > text_pinyins.size()) continue;
+@@ -708,11 +737,7 @@ void CensorEngine::ASRLoop() {
+                                         end_abs += margin; 
+                                         
+                                         stringstream ss;
+-                                        ss << "已屏蔽(拼音): ";
+-                                        for(const auto& p : pat) ss << p << " ";
+-                                        ss << "[匹配源: ";
+-                                        for(int k=0; k<pat.size(); k++) ss << text_pinyins[i+k] << " ";
+-                                        ss << "]";
++                                        for (size_t k = 0; k < pat.size(); k++) ss << (k ? " " : "") << pat[k];
+                                         
+                                         candidates.push_back({char_pos, start_abs, end_abs, ss.str(), true, word_start,
+                                                               end_pos, false});
+@@ -794,13 +819,25 @@ void CensorEngine::ASRLoop() {
+                             if (mute_history.size() > kMuteHistory) mute_history.pop_front();
+                             if (!same_word) {
+                                 censored_count++;
+-                                CLOG(censor::kLogInfo, "%s", m.log_text.c_str());
+-                            } else if (asr_debug_logging) {
+-                                CLOG(censor::kLogInfo, "%s (extended by stream %zu)", m.log_text.c_str(), lane_index);
++                                // One line per muted word (lines == censored_count). The sentence only
++                                // while debug logging is on: the log otherwise holds no dialogue.
++                                censor::HitRecord hit;
++                                hit.unix_ms = chrono::duration_cast<chrono::milliseconds>(
++                                                  chrono::system_clock::now().time_since_epoch()).count();
++                                hit.source = host->SourceName();
++                                hit.word = matched;
++                                hit.pinyin = m.is_pinyin;
++                                string how = m.is_pinyin ? "（同音：" + m.log_text + "）" : "";
++                                if (asr_debug_logging) {
++                                    hit.text = full_text;
++                                    CLOG(censor::kLogInfo, "消音 来源=%s 词=%s%s 原文=\"%s\"", hit.source.c_str(),
++                                         matched.c_str(), how.c_str(), full_text.c_str());
++                                } else {
++                                    CLOG(censor::kLogInfo, "消音 来源=%s 词=%s%s", hit.source.c_str(), matched.c_str(),
++                                         how.c_str());
++                                }
++                                censor::RecordHit(std::move(hit));
+                             }
+-                            if (asr_debug_logging)
+-                                CLOG(censor::kLogInfo, "[ASR Debug] stream %zu muted \"%s\" in \"%s\"", lane_index,
+-                                     m.log_text.c_str(), full_text.c_str());
+                             recent_mutes.push_back({m.start_sample, m.end_sample});
+                             while (recent_mutes.size() > 64) recent_mutes.pop_front();
+                         }
+@@ -912,7 +949,7 @@ void CensorEngine::Process(float *const *planes, uint32_t frames, uint64_t times
+             const string source_name = host->SourceName();
+             // A filter only outputs when input arrives, so delayed audio that fell due
+             // during the gap (up to one delay length) cannot be output any more.
+-            CLOG(censor::kLogInfo, "[Speech Sync] source=\"%s\" audio gap %.0f ms; %.0f ms of delayed audio unplayable (gaps=%zu)",
++            CLOG(censor::kLogInfo, "source=\"%s\" audio gap %.0f ms; %.0f ms of delayed audio unplayable (gaps=%zu)",
+                  source_name.c_str(), gap_frames * 1000.0 / current_sr,
+                  (double)min<uint64_t>(gap_frames, delay_samples) * 1000.0 / current_sr, gaps);
+         }
+diff --git a/src/censor-engine.hpp b/src/censor-engine.hpp
+index d3b66d2..6aa43a6 100644
+--- a/src/censor-engine.hpp
++++ b/src/censor-engine.hpp
+@@ -22,6 +22,20 @@
+ #include "asr-model.hpp"
+ #include "cpp-pinyin/Pinyin.h"
+ 
++namespace censor {
++// Recent mutes of all sources in this process, newest last, for the settings page. Memory only.
++// text (the recognized sentence so far) is filled only while debug logging is on.
++struct HitRecord {
++    int64_t unix_ms = 0;
++    std::string source, word, text;
++    bool pinyin = false;
++};
++void RecordHit(HitRecord hit);
++std::vector<HitRecord> RecentHits();
++void ClearHits();
++uint64_t HitSerial(); // changes whenever a hit is recorded or the list is cleared
++} // namespace censor
++
+ // Read for every audio packet.
+ struct CensorAudioSettings {
+     bool enable = true; // false: pass the audio through unchanged and unload the model
+diff --git a/src/logging-macros.hpp b/src/logging-macros.hpp
+index cb49c85..61eadbf 100644
+--- a/src/logging-macros.hpp
++++ b/src/logging-macros.hpp
+@@ -3,4 +3,4 @@
+ #include <obs-module.h>
+ 
+ // Global unified log prefix
+-#define BLOG(level, format, ...) blog(level, "[Profanity Filter] " format, ##__VA_ARGS__)
++#define BLOG(level, format, ...) blog(level, "[语音消音] " format, ##__VA_ARGS__)
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index f4022b7..c393a08 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -36,6 +36,10 @@
+ #include <QDir>
+ #include <QFileInfo>
+ #include <QProcess>
++#include <QTreeWidget>
++#include <QHeaderView>
++#include <QTimer>
++#include <QDateTime>
+ #ifdef _WIN32
+ #ifndef NOMINMAX
+ #define NOMINMAX
+@@ -293,7 +297,7 @@ void GlobalConfig::Load() {
+                 found = QDir(downloaded).absolutePath();
+         }
+         if (found.isEmpty()) return;
+-        blog(LOG_INFO, "[Profanity Filter] model folder moved: %s -> %s", model_path.c_str(), found.toUtf8().constData());
++        blog(LOG_INFO, "[语音消音] model folder moved: %s -> %s", model_path.c_str(), found.toUtf8().constData());
+         model_path = found.toStdString();
+     };
+     
+@@ -451,6 +455,64 @@ static QString ColorCheckLines(const QStringList &lines) {
+     return html;
+ }
+ 
++// Recent mutes of all sources (censor::RecentHits), refreshed while the dialog is open.
++static void showRecentHits(QWidget *parent) {
++    QDialog *dlg = new QDialog(parent);
++    dlg->setAttribute(Qt::WA_DeleteOnClose);
++    dlg->setWindowTitle("最近消音");
++    dlg->resize(720, 420);
++    QVBoxLayout *v = new QVBoxLayout(dlg);
++    QLabel *note = new QLabel("这次打开 OBS 以来最近 100 次消音，最新的在最上面。只保存在内存里，关闭 OBS 后清空。\n"
++                              "“原文”只在勾选“把识别出的文字写进 OBS 日志”时记录。");
++    note->setWordWrap(true);
++    v->addWidget(note);
++    QTreeWidget *list = new QTreeWidget();
++    list->setColumnCount(4);
++    list->setHeaderLabels({"时间", "声音来源", "消音的词", "原文"});
++    list->setRootIsDecorated(false);
++    list->setUniformRowHeights(true);
++    list->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
++    list->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
++    list->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
++    list->header()->setStretchLastSection(true);
++    v->addWidget(list, 1);
++    QHBoxLayout *buttons = new QHBoxLayout();
++    QPushButton *clear = new QPushButton("清空");
++    QPushButton *close = new QPushButton("关闭");
++    buttons->addWidget(clear);
++    buttons->addStretch();
++    buttons->addWidget(close);
++    v->addLayout(buttons);
++
++    auto serial = std::make_shared<uint64_t>(UINT64_MAX);
++    auto fill = [list, serial] {
++        const uint64_t now = censor::HitSerial();
++        if (now == *serial) return;
++        *serial = now;
++        list->clear();
++        const auto hits = censor::RecentHits();
++        for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
++            QString word = QString::fromStdString(it->word);
++            if (it->pinyin) word += "（同音）";
++            auto *row = new QTreeWidgetItem({QDateTime::fromMSecsSinceEpoch(it->unix_ms).toString("HH:mm:ss"),
++                                             QString::fromStdString(it->source), word,
++                                             QString::fromStdString(it->text)});
++            list->addTopLevelItem(row);
++        }
++        if (hits.empty()) list->addTopLevelItem(new QTreeWidgetItem({"", "", "还没有消音", ""}));
++    };
++    fill();
++    QTimer *timer = new QTimer(dlg);
++    QObject::connect(timer, &QTimer::timeout, dlg, fill);
++    timer->start(1000);
++    QObject::connect(clear, &QPushButton::clicked, dlg, [fill] {
++        censor::ClearHits();
++        fill();
++    });
++    QObject::connect(close, &QPushButton::clicked, dlg, &QDialog::close);
++    dlg->show();
++}
++
+ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     setWindowTitle("语音消音设置");
+     resize(640, 550);
+@@ -536,7 +598,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     connect(btnFixDefaults, &QPushButton::clicked, this, [this] {
+         std::string message;
+         bool ok = RestoreDefaultPlayback(message);
+-        blog(LOG_INFO, "[Speech Sync] restore default playback: %s", message.c_str());
++        blog(LOG_INFO, "[语音消音] restore default playback: %s", message.c_str());
+         if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
+         else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         updateCompanionUI();
+@@ -607,6 +669,25 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     wordButtons->addWidget(lblCustomCount);
+     wordButtons->addStretch();
+     layoutWords->addRow("自定义：", wordButtons);
++    // Recent mutes (memory only, all sources, since OBS started).
++    QHBoxLayout *hitButtons = new QHBoxLayout();
++    QPushButton *btnHits = new QPushButton("查看…");
++    btnHits->setToolTip("这次打开 OBS 以来消音的时间、声音来源和命中的词，只保存在内存里，关闭 OBS 后清空。\n"
++                        "勾选“排查漏词”里的“把识别出的文字写进 OBS 日志”时，还会显示当时识别出的整句话。");
++    connect(btnHits, &QPushButton::clicked, this, [this] { showRecentHits(this); });
++    QLabel *lblHits = new QLabel();
++    auto updateHits = [lblHits] {
++        const size_t n = censor::RecentHits().size();
++        lblHits->setText(n ? QString("已记录 %1 次").arg(n) : QString("还没有消音"));
++    };
++    updateHits();
++    QTimer *hitTimer = new QTimer(lblHits);
++    connect(hitTimer, &QTimer::timeout, lblHits, updateHits);
++    hitTimer->start(1000);
++    hitButtons->addWidget(btnHits);
++    hitButtons->addWidget(lblHits);
++    hitButtons->addStretch();
++    layoutWords->addRow("最近消音：", hitButtons);
+     chkUsePinyin = new QCheckBox("同音字也消音（推荐）");
+     chkUsePinyin->setToolTip("开启后按拼音比较，内置词库和自定义屏蔽词都适用。");
+     layoutWords->addRow("", chkUsePinyin);
+@@ -733,12 +814,13 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QGroupBox *grpDebug = new QGroupBox("排查漏词");
+     QVBoxLayout *layoutDebug = new QVBoxLayout(grpDebug);
+     chkAsrDebugLogging = new QCheckBox("把识别出的文字写进 OBS 日志");
+-    chkAsrDebugLogging->setToolTip("记录音源、输入音频时间及变化中的识别文字。识别文字可能修订。");
++    chkAsrDebugLogging->setToolTip("每句话说完写一行识别出的文字（长句每 2 秒写一行进度），消音行也带上整句原文。");
+     layoutDebug->addWidget(chkAsrDebugLogging);
+     layoutDebug->addWidget(hint("日志里会有未消音的对话原文，测完请关闭，分享日志前检查。"));
+     QPushButton *btnOpenLog = new QPushButton("打开当前日志");
+     btnOpenLog->setToolTip("用系统默认程序打开 OBS 正在写的日志文件（与 OBS“帮助 → 日志文件 → 查看当前日志”相同）。\n"
+-                           "识别文字所在行带 [ASR Debug] 标记。日志持续写入，看最新内容请重新打开。");
++                           "插件写的行以 [语音消音] 开头：“消音”行是消掉的词，“识别”行是识别出的文字（只在勾选上面一项时写）。\n"
++                           "日志持续写入，看最新内容请重新打开。");
+     connect(btnOpenLog, &QPushButton::clicked, this, [this] {
+         QString path = LatestObsLogPath();
+         if (path.isEmpty() || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+@@ -1256,7 +1338,7 @@ bool ConfigDialog::onApply() {
+         if (st.console_is_cable || st.communications_is_cable) {
+             std::string message;
+             bool ok = RestoreDefaultPlayback(message);
+-            blog(LOG_INFO, "[Speech Sync] restore default playback: %s", message.c_str());
++            blog(LOG_INFO, "[语音消音] restore default playback: %s", message.c_str());
+             if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
+             else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+         }
+@@ -1264,7 +1346,7 @@ bool ConfigDialog::onApply() {
+         showCompanionChecklist();
+     }
+     if (old_cable_auto_disable && !cfg->cable_auto_disable && GetCableRenderState() == CableRenderState::Disabled)
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback enabled (auto disable turned off)%s", SetCableRenderEnabled(true) ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] VB-CABLE playback enabled (auto disable turned off)%s", SetCableRenderEnabled(true) ? "" : " (failed)");
+     UpdateVideoDelayFiltersState(); // also refreshes the audio source checklist
+     updateCompanionUI();
+     updateStatus();
+@@ -1317,10 +1399,10 @@ static QString RunBundledCableSetup(const QString &zip) {
+     info.nShow = SW_SHOWNORMAL;
+     if (!ShellExecuteExW(&info)) {
+         const DWORD error = GetLastError();
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE setup not started (%lu)", error);
++        blog(LOG_INFO, "[语音消音] VB-CABLE setup not started (%lu)", error);
+         return error == ERROR_CANCELLED ? QString() : "没能打开 VB-CABLE 安装程序。";
+     }
+-    blog(LOG_INFO, "[Speech Sync] VB-CABLE setup opened from the bundled pack");
++    blog(LOG_INFO, "[语音消音] VB-CABLE setup opened from the bundled pack");
+     return {};
+ }
+ #endif
+@@ -1403,15 +1485,15 @@ void ConfigDialog::onCheckAction(const QString &link) {
+             obs_source_filter_set_order(source, filter, OBS_ORDER_MOVE_TOP);
+             obs_source_release(filter);
+         }
+-        blog(LOG_INFO, "[Speech Sync] checklist: added filter to \"%s\"%s", name.c_str(), filter ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] checklist: added filter to \"%s\"%s", name.c_str(), filter ? "" : " (failed)");
+     } else if (kind == "mute") {
+         obs_source_set_muted(source, true);
+-        blog(LOG_INFO, "[Speech Sync] checklist: muted \"%s\"", name.c_str());
++        blog(LOG_INFO, "[语音消音] checklist: muted \"%s\"", name.c_str());
+     } else if (kind == "ignore" || kind == "unignore") {
+         obs_data_t *priv = obs_source_get_private_settings(source);
+         obs_data_set_bool(priv, "speech_no_filter", kind == "ignore");
+         obs_data_release(priv);
+-        blog(LOG_INFO, "[Speech Sync] checklist: \"%s\" %s", name.c_str(), kind == "ignore" ? "marked as not needing a filter" : "checked again");
++        blog(LOG_INFO, "[语音消音] checklist: \"%s\" %s", name.c_str(), kind == "ignore" ? "marked as not needing a filter" : "checked again");
+     }
+     obs_source_release(source);
+     UpdateVideoDelayFiltersState(); // refreshes the checklist
+@@ -1489,16 +1571,16 @@ void ConfigDialog::showSponsorDialog() {
+     QPixmap qr;
+ #ifdef EMBEDDED_SPONSOR_IMAGE
+     qr.load(":/sponsor/sponsor-qr.png");
+-    blog(LOG_INFO, "[Speech Sync] sponsor image (built in): %s", qr.isNull() ? "not readable" : "loaded");
++    blog(LOG_INFO, "[语音消音] sponsor image (built in): %s", qr.isNull() ? "not readable" : "loaded");
+ #else
+     if (g_module) {
+         char *path = obs_find_module_file(g_module, "sponsor-qr.png");
+         if (path) {
+             bool loaded = qr.load(QString::fromUtf8(path));
+-            blog(LOG_INFO, "[Speech Sync] sponsor image %s: %s", path, loaded ? "loaded" : "not readable");
++            blog(LOG_INFO, "[语音消音] sponsor image %s: %s", path, loaded ? "loaded" : "not readable");
+             bfree(path);
+         } else {
+-            blog(LOG_INFO, "[Speech Sync] sponsor image sponsor-qr.png not found in the plugin data folder");
++            blog(LOG_INFO, "[语音消音] sponsor image sponsor-qr.png not found in the plugin data folder");
+         }
+     }
+ #endif
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 790262a..2fa4f47 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -162,7 +162,7 @@ static void start_filter_warning() {
+         if (full.empty()) full = main.toStdString();
+         static std::string last_message;
+         if (full != last_message) {
+-            blog(LOG_INFO, "[Speech Sync] %s", full.c_str());
++            blog(LOG_INFO, "[语音消音] %s", full.c_str());
+             last_message = full;
+         }
+     });
+@@ -348,7 +348,7 @@ static void frontend_event(enum obs_frontend_event event, void *) {
+ MODULE_EXPORT bool obs_module_load(void)
+ {
+     InstallCensorLogHandler();
+-    blog(LOG_INFO, "[Speech Sync] live-speech-filter plugin %s (https://github.com/Mochall/live-speech-filter)",
++    blog(LOG_INFO, "[语音消音] live-speech-filter plugin %s (https://github.com/Mochall/live-speech-filter)",
+          LSF_PLUGIN_VERSION);
+     obs_register_source(&profanity_filter_info);
+     obs_register_source(&profanity_video_delay_info);
+@@ -420,7 +420,7 @@ static void set_monitoring_device(const char *name, const char *id) {
+         config_set_string(profile, "Audio", "MonitoringDeviceId", id);
+         config_save_safe(profile, "tmp", nullptr);
+     }
+-    blog(LOG_INFO, "[Speech Sync] monitoring device set to %s", name);
++    blog(LOG_INFO, "[语音消音] monitoring device set to %s", name);
+ }
+ 
+ // Companion mode (直播伴侣): the companion app captures the OBS virtual camera and the
+@@ -468,15 +468,15 @@ static void maintain_cable(bool companion, bool auto_disable) {
+     if (state == CableRenderState::NotInstalled) return;
+     if (companion && state != CableRenderState::Enabled) {
+         bool ok = SetCableRenderEnabled(true);
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback enabled for companion mode%s", ok ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] VB-CABLE playback enabled for companion mode%s", ok ? "" : " (failed)");
+         cable_reinit_pending = ok;
+         companion_tick = 0; // re-query devices on the next tick
+     } else if (!companion && cable_used_by_source && state != CableRenderState::Enabled) {
+         bool ok = SetCableRenderEnabled(true);
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback enabled: an audio input records CABLE Output%s", ok ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] VB-CABLE playback enabled: an audio input records CABLE Output%s", ok ? "" : " (failed)");
+     } else if (!companion && auto_disable && !cable_used_by_source && state != CableRenderState::Disabled) {
+         bool ok = SetCableRenderEnabled(false);
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled (companion mode off)%s", ok ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] VB-CABLE playback disabled (companion mode off)%s", ok ? "" : " (failed)");
+     }
+ }
+ 
+@@ -490,7 +490,7 @@ static void DisableCableOnExit() {
+     }
+     if (disable && !cable_used_by_source && GetCableRenderState() != CableRenderState::Disabled &&
+         GetCableRenderState() != CableRenderState::NotInstalled)
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE playback disabled on exit%s", SetCableRenderEnabled(false) ? "" : " (failed)");
++        blog(LOG_INFO, "[语音消音] VB-CABLE playback disabled on exit%s", SetCableRenderEnabled(false) ? "" : " (failed)");
+ }
+ 
+ // OBS 33 replaced the monitoring type by an on/off switch and logs a warning on every call of
+@@ -514,7 +514,7 @@ static void resolve_monitoring_api() {
+     if (get && set) {
+         monitoring_enabled_get = get;
+         monitoring_enabled_set = set;
+-        blog(LOG_INFO, "[Speech Sync] using obs_source_get/set_monitoring_enabled");
++        blog(LOG_INFO, "[语音消音] using obs_source_get/set_monitoring_enabled");
+     }
+ #endif
+ }
+@@ -557,7 +557,7 @@ static void companion_apply_monitoring(obs_source_t *s) {
+         if (type == OBS_MONITORING_TYPE_NONE) {
+             type = (obs_monitoring_type)(held - 1);
+             set_monitoring(s, type);
+-            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" unmuted, own monitoring restored", name);
++            blog(LOG_INFO, "[语音消音] companion: \"%s\" unmuted, own monitoring restored", name);
+         }
+         obs_data_erase(priv, "companion_held");
+     }
+@@ -566,17 +566,17 @@ static void companion_apply_monitoring(obs_source_t *s) {
+             if (ours) obs_data_set_bool(priv, "companion_monitor", false);
+             else obs_data_set_int(priv, "companion_held", (int)type + 1);
+             set_monitoring(s, OBS_MONITORING_TYPE_NONE);
+-            blog(LOG_INFO, "[Speech Sync] companion: \"%s\" muted, monitoring off", name);
++            blog(LOG_INFO, "[语音消音] companion: \"%s\" muted, monitoring off", name);
+         }
+     } else if (active && type == OBS_MONITORING_TYPE_NONE) {
+         set_monitoring(s, OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
+         obs_data_set_bool(priv, "companion_monitor", true);
+-        blog(LOG_INFO, "[Speech Sync] companion: \"%s\" monitor and output", name);
++        blog(LOG_INFO, "[语音消音] companion: \"%s\" monitor and output", name);
+     } else if (!active && ours) {
+         if (type == OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT)
+             set_monitoring(s, OBS_MONITORING_TYPE_NONE);
+         obs_data_set_bool(priv, "companion_monitor", false);
+-        blog(LOG_INFO, "[Speech Sync] companion: \"%s\" inactive, monitoring off", name);
++        blog(LOG_INFO, "[语音消音] companion: \"%s\" inactive, monitoring off", name);
+     }
+     obs_data_release(priv);
+ }
+@@ -655,11 +655,11 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             if (name && IsCableEndpointName(name)) {
+                 if (prev_id.empty()) set_monitoring_device("Default", "default");
+                 else set_monitoring_device(prev_name.c_str(), prev_id.c_str());
+-                blog(LOG_INFO, "[Speech Sync] monitoring device restored to %s",
++                blog(LOG_INFO, "[语音消音] monitoring device restored to %s",
+                      prev_id.empty() ? "Default" : prev_name.c_str());
+             }
+             if (!prev_id.empty()) save_prev_monitoring("", "");
+-            blog(LOG_INFO, "[Speech Sync] companion mode off");
++            blog(LOG_INFO, "[语音消音] companion mode off");
+         }
+         companion_was_on = false;
+         return;
+@@ -678,11 +678,11 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             problems.push_back({f.kind == StreamingFinding::NoCable, f.title + "，" + detail});
+         }
+         if (problems != companion_app_problems)
+-            for (auto &p : problems) blog(LOG_INFO, "[Speech Sync] streaming app: %s", p.second.c_str());
++            for (auto &p : problems) blog(LOG_INFO, "[语音消音] streaming app: %s", p.second.c_str());
+         companion_app_problems = problems;
+     }
+     if (!companion_was_on) {
+-        blog(LOG_INFO, "[Speech Sync] companion mode on");
++        blog(LOG_INFO, "[语音消音] companion mode on");
+         if (!obs_frontend_virtualcam_active()) obs_frontend_start_virtualcam();
+     }
+     companion_was_on = true;
+@@ -723,7 +723,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             set_monitoring(s, type);
+             ++count;
+         }
+-        blog(LOG_INFO, "[Speech Sync] VB-CABLE enabled: reopened monitoring of %d sources", count);
++        blog(LOG_INFO, "[语音消音] VB-CABLE enabled: reopened monitoring of %d sources", count);
+     }
+     // Mirror the OBS output mix (see companion_apply_monitoring).
+     for (auto *s : sources) {
+@@ -743,7 +743,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         if (!cable_restore_failed) {
+             std::string message;
+             bool ok = RestoreDefaultPlayback(message);
+-            blog(LOG_INFO, "[Speech Sync] restore default playback (auto): %s", message.c_str());
++            blog(LOG_INFO, "[语音消音] restore default playback (auto): %s", message.c_str());
+             cable_restore_failed = !ok;
+             if (ok) {
+                 cable_notice = "直播伴侣模式：" + message + "（原来是CABLE，原声会绕过消音进入直播）";
+@@ -893,7 +893,7 @@ static void scan_mic_devices(const std::vector<obs_source_t *> &sources) {
+             mic_devices[obs_source_get_name(s)] = d;
+         }
+         if (used != cable_used_by_source)
+-            blog(LOG_INFO, "[Speech Sync] audio input on CABLE Output: %s", used ? "yes" : "no");
++            blog(LOG_INFO, "[语音消音] audio input on CABLE Output: %s", used ? "yes" : "no");
+         cable_used_by_source = used;
+     }
+ }
+@@ -1087,7 +1087,7 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+     if (lines != last_lines)
+         for (auto l : lines) {
+             for (size_t k; (k = l.find('\x1f')) != std::string::npos;) l.replace(k, 1, " | ");
+-            blog(LOG_INFO, "[Speech Sync] audio setup (mode %d): %s", mode, l.c_str());
++            blog(LOG_INFO, "[语音消音] audio setup (mode %d): %s", mode, l.c_str());
+         }
+     last_lines = lines;
+     SetAudioSetupReport(lines);
+@@ -1205,7 +1205,7 @@ void UpdateVideoDelayFiltersState() {
+         maintain_companion(sources, companion);
+         check_audio_setup(sources, voice_source, companion, sync_mode);
+         if (changed)
+-            blog(LOG_INFO, "[Speech Sync] picture sync %s (%s)", enable ? "on" : "off",
++            blog(LOG_INFO, "[语音消音] picture sync %s (%s)", enable ? "on" : "off",
+                  enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
+     }
+ 
+@@ -1260,7 +1260,7 @@ void UpdateVideoDelayFiltersState() {
+                         // or other effect filter on the same source alters it.
+                         obs_source_filter_set_order(source, filter, OBS_ORDER_MOVE_TOP);
+                         audio.push_back(filter);
+-                        blog(LOG_INFO, "[Speech Sync] added microphone filter to \"%s\"", obs_source_get_name(source));
++                        blog(LOG_INFO, "[语音消音] added microphone filter to \"%s\"", obs_source_get_name(source));
+                     } else add_warning(WARN_LEAK, "无法给主播麦克风添加消音滤镜");
+                 }
+                 if (auto_mic && obs_source_active(source)) mic_seen = true;
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 5923ae1..650a9be 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -45,7 +45,7 @@ ProfanityFilter::~ProfanityFilter() {
+ }
+ 
+ static void censor_log_to_obs(int level, const char *message) {
+-    blog(level, "[Profanity Filter] %s", message);
++    blog(level, "[语音消音] %s", message);
+ }
+ 
+ void InstallCensorLogHandler() {
+-- 
+2.55.0.windows.5
+

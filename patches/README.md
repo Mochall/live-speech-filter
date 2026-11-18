@@ -50,3 +50,6 @@
 | [0044](0044-plugin-version-0100.patch) | Plugin version 0.10.0 (same number as the standalone program), author/website in buildspec point to the project repository, version logged when the module loads |
 | [0045](0045-generic-wording.patch) | Generic wording: 其他人的语音 / 游戏或程序声音 instead of 队友语音 / 游戏声音 in settings and checklist |
 | [0046](0046-version-0.10.1.patch) | Plugin version 0.10.1 |
+| [0047](0047-lexicon-mabi.patch) | Built-in lexicon: 妈逼 (missed in a real KOOK recording), allowed phrases 吗比 and 麻痹大意 for its pinyin; word count skips allowed phrases |
+| [0048](0048-readable-log-recent-mutes.patch) | Readable log: one 消音 line per muted word with source, [语音消音] prefix, recent-mutes list |
+| [0049](0049-version-0.10.2.patch) | Plugin version 0.10.2 |

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(live-speech-filter-lite VERSION 0.10.1 LANGUAGES C CXX RC)
+project(live-speech-filter-lite VERSION 0.10.2 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

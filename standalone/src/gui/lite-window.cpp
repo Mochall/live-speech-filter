@@ -2,6 +2,7 @@
 
 #include "audio-io.hpp"
 #include "cable-setup.hpp"
+#include "censor-engine.hpp"
 #include "censor-log.hpp"
 #include "companion-audio.hpp"
 #include "lite-checks.hpp"
@@ -615,6 +616,44 @@ QWidget *LiteWindow::BuildWordsPage() {
     c->addWidget(ui::Help("内置词库会屏蔽的字，出现在例外这句话里时不屏蔽。比如加了例外“打几把”，“再打几把”就不会被消音，"
                           "单说那个词仍然会。"));
     p.body->addWidget(card2);
+    // Recent mutes (memory only, newest first), refreshed when the engine records a hit.
+    QWidget *hitCard = ui::Card("最近消音");
+    QVBoxLayout *hb = CardBody(hitCard, 6);
+    auto *hits = new QListWidget;
+    hits->setMinimumHeight(150);
+    hits->setMaximumHeight(220);
+    hb->addWidget(hits);
+    hb->addWidget(ui::Help("这次打开以来最近 100 次：时间、声音来源和消掉的词。只在内存里，关掉程序就清空。"
+                          "在“支持项目”页打开“把识别出的文字写进日志”时，还会带上当时识别出的整句话。漏掉的词可以在上面自己添加。"));
+    auto *clearHits = ui::Pill("清空", "sec", "s");
+    auto *bh2 = new QHBoxLayout;
+    bh2->addWidget(clearHits);
+    bh2->addStretch();
+    hb->addLayout(bh2);
+    auto hitSerial = std::make_shared<uint64_t>(UINT64_MAX);
+    auto fillHits = [hits, hitSerial] {
+        const uint64_t now = censor::HitSerial();
+        if (now == *hitSerial) return;
+        *hitSerial = now;
+        hits->clear();
+        const auto all = censor::RecentHits();
+        for (auto it = all.rbegin(); it != all.rend(); ++it) {
+            QString line = QDateTime::fromMSecsSinceEpoch(it->unix_ms).toString("HH:mm:ss") + "  " +
+                           Q(it->source) + "  " + Q(it->word) + (it->pinyin ? "（同音）" : "");
+            if (!it->text.empty()) line += "  “" + Q(it->text) + "”";
+            new QListWidgetItem(line, hits);
+        }
+        if (all.empty()) new QListWidgetItem("还没有消音", hits);
+    };
+    fillHits();
+    auto *hitTimer = new QTimer(hits);
+    connect(hitTimer, &QTimer::timeout, hits, fillHits);
+    hitTimer->start(1000);
+    connect(clearHits, &QPushButton::clicked, hits, [fillHits] {
+        censor::ClearHits();
+        fillHits();
+    });
+    p.body->addWidget(hitCard);
     p.body->addStretch();
     return p.page;
 }
@@ -857,6 +896,7 @@ QWidget *LiteWindow::BuildSupportPage() {
     bh->addWidget(openDir);
     bh->addStretch();
     c->addLayout(bh);
+
     p.body->addWidget(logCard);
 
     QWidget *aboutCard = ui::Card("关于");

@@ -26,7 +26,7 @@
   #error NoObsCheck is only for test builds
 #endif
 #define PluginName "obs-profanity-filter"
-#define Version "0.10.1"
+#define Version "0.10.2"
 #define Payload "..\work\installer-payload-plugin-" + Version
 
 [Setup]
