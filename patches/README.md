@@ -48,3 +48,5 @@
 | [0042](0042-plugin-bundled-vbcable.patch) | plugin-config: 安装 VB-CABLE uses VB-Audio's original Pack46 installed with the plugin in data/vbcable (SHA256 checked, unpacked with tar.exe, VB-Audio's own setup opened as administrator; distribution as is with attribution allowed by https://vb-audio.com/Services/licensing.htm); falls back to the official download page when the pack is missing |
 | [0043](0043-sponsor-feedback-qq-repo-link.patch) | plugin-config: 支持项目 shows the feedback QQ 549466926 after the author and links the project repository https://github.com/Mochall/live-speech-filter |
 | [0044](0044-plugin-version-0100.patch) | Plugin version 0.10.0 (same number as the standalone program), author/website in buildspec point to the project repository, version logged when the module loads |
+| [0045](0045-generic-wording.patch) | Generic wording: 其他人的语音 / 游戏或程序声音 instead of 队友语音 / 游戏声音 in settings and checklist |
+| [0046](0046-version-0.10.1.patch) | Plugin version 0.10.1 |

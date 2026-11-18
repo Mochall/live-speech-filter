@@ -1,0 +1,25 @@
+From 5fd610931d6f8bb2e76278b4d4d9190d21ad05ce Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Wed, 18 Nov 2026 05:10:03 -0700
+Subject: [PATCH] Plugin version 0.10.1
+
+---
+ buildspec.json | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/buildspec.json b/buildspec.json
+index 8343c35..b40ff8c 100644
+--- a/buildspec.json
++++ b/buildspec.json
+@@ -38,7 +38,7 @@
+     },
+     "name": "obs-profanity-filter",
+     "displayName": "OBS Profanity Filter",
+-    "version": "0.10.0",
++    "version": "0.10.1",
+     "author": "Mochall (based on Cloud370/obs-profanity-filter)",
+     "website": "https://github.com/Mochall/live-speech-filter",
+     "email": "y@7z.ee"
+-- 
+2.55.0.windows.5
+

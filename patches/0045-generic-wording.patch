@@ -1,0 +1,213 @@
+From 88877b094c3569b8db1c6ff24f1bae71c24a6570 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Wed, 18 Nov 2026 04:53:58 -0700
+Subject: [PATCH] =?UTF-8?q?Generic=20wording:=20=E5=85=B6=E4=BB=96?=
+ =?UTF-8?q?=E4=BA=BA=E7=9A=84=E8=AF=AD=E9=9F=B3=20/=20=E6=B8=B8=E6=88=8F?=
+ =?UTF-8?q?=E6=88=96=E7=A8=8B=E5=BA=8F=E5=A3=B0=E9=9F=B3=20instead=20of=20?=
+ =?UTF-8?q?=E9=98=9F=E5=8F=8B=E8=AF=AD=E9=9F=B3=20/=20=E6=B8=B8=E6=88=8F?=
+ =?UTF-8?q?=E5=A3=B0=E9=9F=B3=20in=20settings=20and=20checklist?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp  | 17 ++++++++--------
+ src/plugin-main.cpp    | 44 +++++++++++++++++++++---------------------
+ src/streaming-apps.cpp |  4 ++--
+ 3 files changed, 33 insertions(+), 32 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index d6a42db..e151a5d 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -174,7 +174,7 @@ std::string GetViewerLatencyText() {
+     if (syncing)
+         snprintf(text, sizeof(text), "画面与语音同步（%s），推流整体晚约%.1f秒", reason.c_str(), delay);
+     else if (!voices.empty())
+-        snprintf(text, sizeof(text), "语音比画面晚约%.1f秒（%s；游戏画面与声音不延迟）", delay, voices.c_str());
++        snprintf(text, sizeof(text), "语音比画面晚约%.1f秒（%s；画面和其他声音不延迟）", delay, voices.c_str());
+     else
+         snprintf(text, sizeof(text), "画面不延迟；消音的语音将比画面晚约%.1f秒", delay);
+     string out = text;
+@@ -564,14 +564,15 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QGroupBox *grpSources = new QGroupBox("要消音的声音");
+     QFormLayout *layoutSources = new QFormLayout(grpSources);
+     comboVoiceSource = new QComboBox();
+-    comboVoiceSource->addItem("没有队友语音（单排）", 0);
+-    comboVoiceSource->addItem("语音软件（KOOK、YY、Discord 等）", 1);
+-    comboVoiceSource->addItem("游戏内语音", 2);
++    comboVoiceSource->addItem("只有我说话（没有其他人的语音）", 0);
++    comboVoiceSource->addItem("语音软件（KOOK、YY、Discord、QQ 等）", 1);
++    comboVoiceSource->addItem("游戏或其他程序的声音里（如游戏内语音）", 2);
+     comboVoiceSource->setToolTip("插件按这里的选择检查当前场景的声音设置：\n"
+-                                 "语音软件：单独采集语音软件并消音，桌面音频要静音，游戏声音由游戏采集提供（画面不延迟）。\n"
+-                                 "游戏内语音：队友语音混在游戏声音里，给整个游戏声音消音，桌面音频要静音（画面与声音整体延迟）。\n"
++                                 "其他人的语音指队友、连麦嘉宾、语音频道里的人说话。\n"
++                                 "语音软件：单独采集语音软件并消音，桌面音频要静音，游戏或其他程序的声音另外采集（画面不延迟）。\n"
++                                 "游戏或其他程序的声音里：语音混在这个程序的声音里，给它的整个声音消音，桌面音频要静音（画面与声音整体延迟）。\n"
+                                  "麦克风在所有情况下都会检查。");
+-    layoutSources->addRow("队友语音来自：", comboVoiceSource);
++    layoutSources->addRow("其他人的语音来自：", comboVoiceSource);
+     chkAutoFilterMic = new QCheckBox("自动给麦克风加消音滤镜");
+     chkAutoFilterMic->setToolTip("开启后，自动给场景中的麦克风音源（音频输入采集）加上消音滤镜。\n"
+                                  "麦克风设备选“默认”时跟随 Windows 默认录音设备。\n"
+@@ -657,7 +658,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     comboSyncMode->setToolTip("总是同步：画面始终延迟，解说与画面严格对齐，占用显存。\n不同步：画面始终不延迟。");
+     layoutAudio->addRow("画面同步：", comboSyncMode);
+     layoutAudio->addRow("", hint("自动：只给 KOOK、麦克风这类单独语音消音时画面不延迟（省显存，语音比画面晚）；"
+-                                 "给游戏声音、桌面音频或带画面的声音消音，或场景里有摄像头时，画面一起延迟。"));
++                                 "给游戏/程序声音、桌面音频或带画面的声音消音，或场景里有摄像头时，画面一起延迟。"));
+     lblVideoMemory = new QLabel();
+     layoutAudio->addRow("", lblVideoMemory);
+     containerLayout->addWidget(grpAudio);
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 25b6c6b..790262a 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -913,7 +913,7 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+     // needs its own application audio capture.
+     static const bool capture_audio_option = (obs_get_version() >> 24) >= 30;
+     const std::string add_game_audio = capture_audio_option ? "双击它，勾选“采集音频”"
+-                                                            : "来源列表点“+” → “应用程序音频采集”，窗口选游戏";
++                                                            : "来源列表点“+” → “应用程序音频采集”，窗口选游戏或程序";
+     std::vector<obs_source_t *> mics, desktops, apps, games, displays, media, others;
+     for (auto *s : sources) {
+         if (!obs_source_active(s) || obs_source_get_type(s) != OBS_SOURCE_TYPE_INPUT) continue;
+@@ -970,9 +970,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         }
+         desktop_on = true;
+         if (mode == 0)
+-            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已消音（画面与声音整体延迟）" : "不消音：游戏声音、音乐从这里进直播"));
++            lines.push_back("· 桌面音频" + name(d) + (has_recognizing_filter(d) ? "已消音（画面与声音整体延迟）" : "不消音：游戏/程序声音、音乐从这里进直播"));
+         else
+-            bad("桌面音频" + name(d) + "还开着，会把队友语音不经消音再收进直播一次 → 点“静音”，或在混音器里点它的喇叭图标" + act("mute", d));
++            bad("桌面音频" + name(d) + "还开着，会把其他人的语音不经消音再收进直播一次 → 点“静音”，或在混音器里点它的喇叭图标" + act("mute", d));
+     }
+ 
+     // Voice programs making sound whose sound reaches the stream only via desktop audio.
+@@ -997,15 +997,15 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         if (display_game && !voice && filtered && audible(a)) continue;
+         voice_captured |= voice || filtered;
+         if (!audible(a)) lines.push_back("· 应用程序音频" + name(a) + "已静音");
+-        else if (voice && filtered) lines.push_back("✓ 队友语音" + name(a) + "已消音");
+-        else if (voice) bad("队友语音" + name(a) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", a));
++        else if (voice && filtered) lines.push_back("✓ 语音软件" + name(a) + "已消音");
++        else if (voice) bad("语音软件" + name(a) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", a));
+         else if (filtered) lines.push_back("✓ 应用程序音频" + name(a) + "已消音");
+         else lines.push_back("· 应用程序音频" + name(a) + "不消音；如果它是语音软件，点“加消音”" + act("add", a));
+     }
+ 
+     if (mode == 0) {
+         if (!uncaptured.empty() && desktop_on)
+-            bad("检测到" + uncaptured + "在使用耳机/扬声器，它的声音会经桌面音频原样进入直播 → 如果是队友语音，在上面把“队友语音来自”选为语音软件");
++            bad("检测到" + uncaptured + "在使用耳机/扬声器，它的声音会经桌面音频原样进入直播 → 如果里面有其他人说话，在上面把“其他人的语音来自”选为语音软件");
+     } else if (mode == 1) {
+         if (!voice_captured)
+             bad(std::string(uncaptured.empty() ? "没有找到语音软件的采集" : "检测到" + uncaptured + "在运行，但没有单独采集它") +
+@@ -1013,9 +1013,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         for (auto *g : games) {
+             obs_source_t *audio = game_audio(g);
+             if (audio && has_recognizing_filter(audio))
+-                lines.push_back("· 游戏声音" + name(audio) + "也加了消音滤镜：队友语音在语音软件里时游戏声音不需要消音，删掉它的滤镜可让画面不延迟");
+-            else if (audio) lines.push_back("✓ 游戏声音" + name(audio) + "已采集（不消音）");
+-            else bad("游戏采集" + name(g) + "没有采集声音，桌面音频静音后直播里没有游戏声音 → " + add_game_audio);
++                lines.push_back("· 游戏/程序声音" + name(audio) + "也加了消音滤镜：语音在语音软件里时它不需要消音，删掉它的滤镜可让画面不延迟");
++            else if (audio) lines.push_back("✓ 游戏/程序声音" + name(audio) + "已采集（不消音）");
++            else bad("游戏采集" + name(g) + "没有采集声音，桌面音频静音后直播里没有它的声音 → " + add_game_audio);
+         }
+         // Display capture only: it carries no sound, and the plugin cannot tell which
+         // program is the game. Ask for a game capture; a separate application capture
+@@ -1023,9 +1023,9 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         bool other_app = false;
+         for (auto *a : apps) other_app |= !IsVoiceAppExe(window_exe(a)) && audible(a);
+         if (games.empty() && !displays.empty() && !desktop_on && !other_app)
+-            bad("显示器采集" + name(displays.front()) + "不带声音，桌面音频静音后直播里没有游戏声音 → 改用“游戏采集”" +
++            bad("显示器采集" + name(displays.front()) + "不带声音，桌面音频静音后直播里没有游戏/程序声音 → 改用“游戏采集”或“窗口采集”" +
+                 (capture_audio_option ? "并勾选“采集音频”" : "") +
+-                "；游戏采集黑屏时保留显示器采集，另加“应用程序音频采集”，窗口选游戏");
++                "；游戏采集黑屏时保留显示器采集，另加“应用程序音频采集”，窗口选游戏或程序");
+         else if (games.empty()) lines.push_back("· 没有找到游戏采集或窗口采集");
+     } else {
+         obs_source_t *ok = nullptr, *no_filter = nullptr, *no_audio = nullptr;
+@@ -1035,8 +1035,8 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+             else if (audio) no_filter = no_filter ? no_filter : audio;
+             else if (!no_audio || !strcmp(obs_source_get_id(g), "game_capture")) no_audio = g;
+         }
+-        if (ok) lines.push_back("✓ 游戏声音（含队友语音）" + name(ok) + "已消音，画面自动同步");
+-        else if (no_filter) bad("游戏声音" + name(no_filter) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", no_filter));
++        if (ok) lines.push_back("✓ 游戏/程序声音（含其中的语音）" + name(ok) + "已消音，画面自动同步");
++        else if (no_filter) bad("游戏/程序声音" + name(no_filter) + "没有消音 → 点“加消音”，或右键它 → 滤镜 → 添加" + F + act("add", no_filter));
+         else if (no_audio)
+             bad("游戏采集" + name(no_audio) + "没有采集声音 → " + add_game_audio + "，再右键" +
+                 (capture_audio_option ? "它" : "这个音频采集") + " → 滤镜 → 添加" + F);
+@@ -1048,17 +1048,17 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+             for (auto *a : apps)
+                 if (!IsVoiceAppExe(window_exe(a)) && audible(a) && has_recognizing_filter(a)) filtered = a;
+             if (filtered && sync_mode == 1)
+-                lines.push_back("✓ 游戏声音（含队友语音）" + name(filtered) + "已消音，画面同步为“总是”");
++                lines.push_back("✓ 游戏/程序声音（含其中的语音）" + name(filtered) + "已消音，画面同步为“总是”");
+             else if (filtered)
+-                bad("游戏声音" + name(filtered) + "已消音，但用的是显示器采集，插件分不出这是游戏声音，画面不会延迟，直播里声音会比画面晚 → 下方“画面同步”改为“总是”，或改用“游戏采集”");
++                bad("游戏/程序声音" + name(filtered) + "已消音，但用的是显示器采集，插件分不出它属于画面里的哪个程序，画面不会延迟，直播里声音会比画面晚 → 下方“画面同步”改为“总是”，或改用“游戏采集”");
+             else
+-                bad("显示器采集" + name(displays.front()) + "分不出游戏声音 → 改用“游戏采集”" +
++                bad("显示器采集" + name(displays.front()) + "分不出游戏/程序声音 → 改用“游戏采集”或“窗口采集”" +
+                     (capture_audio_option ? "，勾选“采集音频”" : "") + "并添加" + F +
+-                    "；游戏采集黑屏时另加“应用程序音频采集”选游戏、添加" + F + "，再把“画面同步”改为“总是”");
++                    "；游戏采集黑屏时另加“应用程序音频采集”选游戏或程序、添加" + F + "，再把“画面同步”改为“总是”");
+         } else
+-            bad("没有找到游戏采集 → 来源列表点“+” → “游戏采集”，" +
++            bad("没有找到游戏采集或窗口采集 → 来源列表点“+” → “游戏采集”或“窗口采集”，" +
+                 (capture_audio_option ? std::string("勾选“采集音频”，再添加") + F
+-                                      : "再点“+” → “应用程序音频采集”选游戏，给它添加" + F));
++                                      : "再点“+” → “应用程序音频采集”选游戏或程序，给它添加" + F));
+     }
+ 
+     // Media and browser sources (alert sounds, music, danmaku text-to-speech): information
+@@ -1077,7 +1077,7 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         if (has_recognizing_filter(s)) lines.push_back("✓ " + kind + name(s) + "已消音");
+         else if (ignored_by_user(s)) lines.push_back("· " + kind + name(s) + "已设为不用消音" + act("unignore", s));
+         else {
+-            lines.push_back("？ " + kind + name(s) + "有声音，没有消音 → 有人在里面说话（如摄像头麦克风、声卡）点“加消音”；只是游戏或音乐声音点“不用消音”" +
++            lines.push_back("？ " + kind + name(s) + "有声音，没有消音 → 有人在里面说话（如摄像头麦克风、声卡）点“加消音”；只是游戏、音乐等声音点“不用消音”" +
+                             act("add", s) + act("ignore", s));
+             ++unknown;
+         }
+@@ -1129,7 +1129,7 @@ static bool decide_sync(const std::vector<obs_source_t *> &sources, std::string
+             bool own_audio = obs_data_get_bool(settings, "capture_audio");
+             obs_data_release(settings);
+             if (!own_audio) continue;
+-            why = "消音的是游戏声音：" + name;
++            why = "消音的是游戏/程序声音：" + name;
+         } else if (flags & OBS_SOURCE_VIDEO)
+             why = "消音的声音带画面：" + name;
+         else if (id_is(id, {"wasapi_output_capture", "pulse_output_capture", "coreaudio_output_capture"}))
+@@ -1137,7 +1137,7 @@ static bool decide_sync(const std::vector<obs_source_t *> &sources, std::string
+         else if (id_is(id, {"wasapi_process_output_capture"})) {
+             std::string exe = window_exe(s);
+             for (auto &e : captured_exes)
+-                if (!exe.empty() && e == exe) why = "消音的是游戏声音：" + name;
++                if (!exe.empty() && e == exe) why = "消音的是游戏/程序声音：" + name;
+         }
+         if (!why.empty()) {
+             if (!need) reason = why;
+diff --git a/src/streaming-apps.cpp b/src/streaming-apps.cpp
+index 49d5ab5..2cd134e 100644
+--- a/src/streaming-apps.cpp
++++ b/src/streaming-apps.cpp
+@@ -393,10 +393,10 @@ StreamingReport CheckStreamingApps(const std::string &cable_std, bool program_so
+             } else if (in.kind == SavedInput::Program) {
+                 if (program_sound_bad)
+                     add(F::Bad, F::ProgramSound, app, app + "在采集程序声音“" + in.name + "”",
+-                        "这一路不经过消音，也不跟画面一起延迟。游戏声音请在 OBS 里采集，在" + app + "里移除它。", stale);
++                        "这一路不经过消音，也不跟画面一起延迟。游戏等程序的声音请在 OBS 里采集，在" + app + "里移除它。", stale);
+                 else
+                     add(F::Note, F::ProgramSound, app, app + "在采集程序声音“" + in.name + "”",
+-                        "这一路不经过消音。游戏声音可以这样采，但游戏内语音不会被消音。", stale);
++                        "这一路不经过消音。游戏、音乐等声音可以这样采，但这个程序里的语音（如游戏内语音）不会被消音。", stale);
+             }
+         }
+         if (!system) add(F::Ok, F::SystemOk, app, app + "没有采集系统声音", "", stale);
+-- 
+2.55.0.windows.5
+

@@ -229,7 +229,7 @@ QByteArray EffectWav(int effect) {
     return wav;
 }
 
-const char *kEffectHelp[] = {"观众在脏话处听到“哔”。", "观众在脏话处听到一段静音。", "", "脏话换成一串电报“嘀嗒”声。"};
+const char *kEffectHelp[] = {"观众在屏蔽词处听到“哔”。", "观众在屏蔽词处听到一段静音。", "", "屏蔽词换成一串电报“嘀嗒”声。"};
 
 // Animal sounds (CC0, data/sounds/README.md). Saved as effect 10 + index; the engine gets effect 4
 // with the clip, repeated every clip length + gap while the mute lasts.
@@ -238,11 +238,11 @@ struct SoundEffect {
     int gap_ms;
 };
 const SoundEffect kSounds[] = {
-    {"鸟语", "bird.wav", "脏话换成一段鸟叫。", 0},
-    {"猫叫", "cat.wav", "脏话换成“喵”。", 250},
-    {"狗叫", "dog.wav", "脏话换成“汪汪”。", 180},
-    {"鸭子叫", "duck.wav", "脏话换成“嘎嘎”。", 200},
-    {"羊叫", "sheep.wav", "脏话换成“咩”。", 250},
+    {"鸟语", "bird.wav", "屏蔽词换成一段鸟叫。", 0},
+    {"猫叫", "cat.wav", "屏蔽词换成“喵”。", 250},
+    {"狗叫", "dog.wav", "屏蔽词换成“汪汪”。", 180},
+    {"鸭子叫", "duck.wav", "屏蔽词换成“嘎嘎”。", 200},
+    {"羊叫", "sheep.wav", "屏蔽词换成“咩”。", 250},
 };
 constexpr int kSoundBase = 10;
 
@@ -515,7 +515,7 @@ QWidget *LiteWindow::BuildFilterPage() {
     connect(add_program_, &QPushButton::clicked, this, &LiteWindow::ShowAddProgramsDialog);
     addRow->addWidget(add_program_);
     addRow->addSpacing(12);
-    auto *scope = new QLabel("游戏声音不经过这里，在推流软件里单独采集");
+    auto *scope = new QLabel("游戏、音乐等其他声音不经过这里，在推流软件里单独采集");
     scope->setProperty("role", "meta");
     addRow->addWidget(scope);
     addRow->addStretch();
@@ -523,7 +523,7 @@ QWidget *LiteWindow::BuildFilterPage() {
     // Lite delays only the voice it filters (~1.4 s), never the picture: a face camera or a game
     // whose own voice chat is filtered would be out of sync. The OBS plugin delays the picture too.
     // "推流软件" = any streaming program; 直播伴侣 is named only where its own settings are read.
-    auto *plugin = new QLabel("需要音画同步的场景（露脸、过滤游戏内语音）请用 OBS 插件：本程序只延迟声音，不延迟画面");
+    auto *plugin = new QLabel("需要音画同步的场景（露脸、过滤游戏或其他程序里的语音）请用 OBS 插件：本程序只延迟声音，不延迟画面");
     plugin->setProperty("role", "meta");
     plugin->setWordWrap(true);
     body->addWidget(plugin);
@@ -567,7 +567,7 @@ QWidget *LiteWindow::BuildFilterPage() {
 }
 
 QWidget *LiteWindow::BuildWordsPage() {
-    PageParts p = MakePage("屏蔽词", "内置词库已包含常见脏话，随程序更新，不提供查看。这里加你自己的词，添加后立即生效。");
+    PageParts p = MakePage("屏蔽词", "内置词库是常见脏话，随程序更新，不提供查看。其他要屏蔽的词（如带货违禁词）在这里自己添加，添加后立即生效。");
     QWidget *card = ui::Card();
     QVBoxLayout *body = CardBody(card, 14);
     auto *add = new QHBoxLayout;
@@ -654,7 +654,7 @@ QWidget *LiteWindow::BuildSettingsPage() {
     padding_->AddOption("宽 0.7 秒", 700);
     padding_->SetCurrent(1);
     c->addWidget(padding_);
-    c->addWidget(ui::Help("脏话前后各多盖一点，免得漏出字头字尾。窄一些说话更连贯，但可能漏出半个字。"));
+    c->addWidget(ui::Help("屏蔽词前后各多盖一点，免得漏出字头字尾。窄一些说话更连贯，但可能漏出半个字。"));
     connect(padding_, &ui::Segmented::changed, this, [this] {
         ApplySettings();
         SaveConfig();
@@ -759,7 +759,7 @@ QWidget *LiteWindow::BuildModelPage() {
     offset_->setSuffix(" 毫秒");
     offset_->setFixedWidth(100);
     c->addWidget(ui::Stepper(offset_));
-    c->addWidget(ui::Help("消音总是比脏话早或晚时再调，负数往前、正数往后。一般不用改。"));
+    c->addWidget(ui::Help("消音总是比屏蔽词早或晚时再调，负数往前、正数往后。一般不用改。"));
     connect(offset_, &QSpinBox::editingFinished, this, [this] { ApplySettings(); SaveConfig(); });
     p.body->addWidget(card2);
     p.body->addWidget(ui::Help("下载来源 ModelScope。下载的模型存在 " + QDir::toNativeSeparators(DownloadDir()) + "。"));
@@ -1133,7 +1133,7 @@ void LiteWindow::UpdateDelayUi() {
                                  .arg(d, 0, 'f', 1));
     else
         delay_help_->setText(QString("手动，最少 %1 秒（消音范围加 0.7 秒）。越长越不容易漏，观众听到的越晚。"
-                                     "直播回放里听到脏话的字头漏出来，就调长一点。")
+                                     "直播回放里听到屏蔽词的字头漏出来，就调长一点。")
                                  .arg(pad / 1000.0 + AppSettings::kMinDelayMarginMs / 1000.0, 0, 'f', 1));
     const int fx = effect_->currentData().toInt();
     const bool sound = fx >= kSoundBase;
