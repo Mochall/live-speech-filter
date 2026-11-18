@@ -13,7 +13,7 @@ OBS 插件 ＋ 独立程序 · 本机离线识别，不上传 · 免费开源 ·
 [![许可](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)
 
-[下载](#下载) · [选哪个版本](#选哪个版本) · [快速开始](#快速开始) · [常见问题](#常见问题) · [反馈](#反馈与支持)
+[下载](#下载) · [选哪个版本](#选哪个版本) · [快速开始](#快速开始) · [识别模型](#识别模型) · [常见问题](#常见问题) · [反馈](#反馈与支持)
 
 </div>
 
@@ -23,7 +23,7 @@ OBS 插件 ＋ 独立程序 · 本机离线识别，不上传 · 免费开源 ·
 
 - 内置常见脏话词库，装好即用；**带货违禁词、平台敏感词、品牌名等其他词由你自己添加**，保存后立即生效。
 - 同音字也能消音：屏蔽了一个词，同音不同字的写法也会被消掉。
-- 识别全部在本机完成（sherpa-onnx X-ASR 中文模型，只用 CPU），**声音不上传任何服务器**。
+- 识别全部在本机完成（[X-ASR](https://github.com/Gilgamesh-J/X-ASR) 中英流式语音识别模型 + [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)，只用 CPU），**声音不上传任何服务器**。详见[识别模型](#识别模型)。
 - 支持 OBS 直接推流，也支持抖音直播伴侣、B 站直播姬、虎牙直播、斗鱼直播伴侣等推流软件。
 
 > English: *Live Speech Filter* is a free, offline, real-time Chinese profanity / banned-word bleeper for live streaming on Windows. It ships as an OBS Studio plugin (audio and video delayed together) and a standalone app that outputs filtered audio through VB-CABLE to any streaming software. Speech recognition runs locally with sherpa-onnx; custom word lists are supported.
@@ -102,6 +102,21 @@ OBS 插件 ＋ 独立程序 · 本机离线识别，不上传 · 免费开源 ·
 6. 关掉窗口后，程序会缩到右下角托盘里继续过滤。托盘图标上的点：绿色表示正在过滤，灰色表示还没开始，红色表示有问题。
 
 详细说明：[使用说明-直播消音.txt](packaging/使用说明-直播消音.txt)
+
+## 识别模型
+
+安装包内置的语音识别模型是 **X-ASR zh-en 160ms 流式 int8**（约 130 MB，中英双语）：
+
+| 项目 | 说明 |
+| --- | --- |
+| 模型 | [X-ASR](https://github.com/Gilgamesh-J/X-ASR)（[Hugging Face](https://huggingface.co/GilgameshWind/X-ASR-zh-en) · [ModelScope](https://www.modelscope.ai/Gilgamesh-J/X-ASR-zh-en)）：基于 icefall/k2 Zipformer 训练的流式语音识别模型；参与机构：上海交通大学、上海创智学院、复旦大学、华中科技大学 |
+| 本项目使用的文件 | `sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05`，来自 [sherpa-onnx 模型发布页](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models)，未做修改 |
+| 推理引擎 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 1.12.10 + [ONNX Runtime](https://onnxruntime.ai)，只用 CPU |
+| 许可 | Apache-2.0；模型的 LICENSE 和 README 随安装包放在模型文件夹里 |
+
+选它做默认模型的原因：在我们的两份测试素材上，它的命中不少于体积大得多的 2025 中文 FP32 模型，延迟、漏词和误消音之间最平衡，安装包也小。用来判断屏蔽词的是识别出的文字和拼音，所以识别准不准直接决定消音效果。
+
+直播消音的“识别模型”页还可以下载另外三个 sherpa-onnx 中文模型（轻量 14M、中英双语 2023、中文 2025），它们由上游项目托管在 [ModelScope](https://modelscope.cn/models/cloud370/obs-profanity-filter)，同样只在本机运行。插件也可以在设置里选择其他模型文件夹。
 
 ## 常见问题
 
@@ -220,8 +235,9 @@ cmake --build work/build-obs28 --config Release --target obs-profanity-filter
 
 - 本项目以 GPL-2.0 发布（见 [LICENSE](LICENSE)），与上游相同。
 - 上游插件：[Cloud370/obs-profanity-filter](https://github.com/Cloud370/obs-profanity-filter)。
-- 语音识别：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)，模型 [X-ASR](https://github.com/Gilgamesh-J/X-ASR)（Apache-2.0）。
+- 语音识别模型：[X-ASR](https://github.com/Gilgamesh-J/X-ASR)（Apache-2.0），感谢 X-ASR 团队开源模型；模型训练用 [icefall](https://github.com/k2-fsa/icefall)。
+- 推理引擎：[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）、[ONNX Runtime](https://onnxruntime.ai)（MIT）；拼音匹配：[cpp-pinyin](https://github.com/wolfgitpr/cpp-pinyin)（Apache-2.0）。
 - 替换音效为 CC0（见 `standalone/data/sounds/README.md`）。第三方组件的许可随安装包放在 `licenses` 文件夹里。
 - [VB-CABLE](https://vb-audio.com/Cable/) 是 VB-Audio Software 的捐赠软件（www.vb-cable.com），不属于本项目。VB-CABLE is a donationware, all participations are welcome.
 
-<sub>关键词：直播消音、直播屏蔽词、直播敏感词过滤、直播脏话过滤、带货违禁词消音、OBS 消音插件、OBS 脏话过滤、实时语音消音、语音哔声、抖音直播伴侣消音、B 站直播姬、虎牙、斗鱼、KOOK 语音过滤、本地离线语音识别、sherpa-onnx、profanity filter、bleep censor、OBS plugin</sub>
+<sub>关键词：直播消音、直播屏蔽词、直播敏感词过滤、直播脏话过滤、带货违禁词消音、OBS 消音插件、OBS 脏话过滤、实时语音消音、语音哔声、抖音直播伴侣消音、B 站直播姬、虎牙、斗鱼、KOOK 语音过滤、本地离线语音识别、X-ASR、sherpa-onnx、流式语音识别、profanity filter、bleep censor、OBS plugin</sub>
