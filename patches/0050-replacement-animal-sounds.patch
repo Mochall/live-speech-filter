@@ -1,0 +1,197 @@
+From 89e5a4285108b0be584a4f57d0c65e1b0af6b17a Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Thu, 19 Nov 2026 03:38:25 -0700
+Subject: [PATCH 1/2] =?UTF-8?q?Replacement=20sounds:=20five=20animal=20sou?=
+ =?UTF-8?q?nds=20(data/sounds,=20CC0)=20in=20=E6=9B=BF=E6=8D=A2=E6=88=90,?=
+ =?UTF-8?q?=20=E5=B0=8F=E9=BB=84=E4=BA=BA=20removed=20(saved=202=20loads?=
+ =?UTF-8?q?=20as=20silence)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp    | 69 ++++++++++++++++++++++++++++++++++++++--
+ src/plugin-config.hpp    | 18 ++++++++++-
+ src/profanity-filter.cpp |  7 ++++
+ 3 files changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index c393a08..e55bc45 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -108,6 +108,54 @@ static QString BuiltinWordsPath() {
+     return result;
+ }
+ 
++const ReplacementSound kReplacementSounds[5] = {
++    {"鸟语", "bird.wav", 0},
++    {"猫叫", "cat.wav", 250},
++    {"狗叫", "dog.wav", 180},
++    {"鸭子叫", "duck.wav", 200},
++    {"羊叫", "sheep.wav", 250},
++};
++
++// 48 kHz mono 16-bit PCM WAV as shipped in data/sounds (same reader as the standalone app);
++// anything else is refused and the effect then mutes.
++static std::shared_ptr<const std::vector<float>> LoadSoundClip(const char *file) {
++    QString rel = QString("sounds/") + file;
++    char *path = obs_find_module_file(g_module, ("data/" + rel).toUtf8().constData());
++    if (!path) path = obs_find_module_file(g_module, rel.toUtf8().constData());
++    QFile f(path ? QString::fromUtf8(path) : QString());
++    bfree(path);
++    if (!f.open(QIODevice::ReadOnly)) return nullptr;
++    const QByteArray b = f.readAll();
++    if (b.size() < 44 || !b.startsWith("RIFF") || b.mid(8, 4) != "WAVE") return nullptr;
++    qsizetype pos = 12;
++    int rate = 0, channels = 0, bits = 0;
++    while (pos + 8 <= b.size()) {
++        const QByteArray id = b.mid(pos, 4);
++        uint32_t len;
++        memcpy(&len, b.constData() + pos + 4, 4);
++        pos += 8;
++        if (id == "fmt " && len >= 16 && pos + 16 <= b.size()) {
++            uint16_t fmt, ch, bps;
++            uint32_t sr;
++            memcpy(&fmt, b.constData() + pos, 2);
++            memcpy(&ch, b.constData() + pos + 2, 2);
++            memcpy(&sr, b.constData() + pos + 4, 4);
++            memcpy(&bps, b.constData() + pos + 14, 2);
++            if (fmt != 1) return nullptr;
++            rate = (int)sr, channels = ch, bits = bps;
++        } else if (id == "data") {
++            if (rate != 48000 || channels != 1 || bits != 16) return nullptr;
++            const qsizetype n = std::min<qsizetype>(len, b.size() - pos) / 2;
++            auto out = std::make_shared<std::vector<float>>(n);
++            const auto *in = reinterpret_cast<const int16_t *>(b.constData() + pos);
++            for (qsizetype i = 0; i < n; i++) (*out)[i] = in[i] / 32768.0f;
++            return out;
++        }
++        pos += len + (len & 1);
++    }
++    return nullptr;
++}
++
+ // The built-in list is read from the plugin each start (so it updates with the plugin) and
+ // is not user-editable; users add plain words, matched literally (plus pinyin if enabled).
+ void GlobalConfig::RebuildWords() {
+@@ -269,6 +317,12 @@ void GlobalConfig::Load() {
+         return text.toStdString();
+     };
+     builtin_words_str = read_file(BuiltinWordsPath());
++    for (int i = 0; i < kReplacementSoundCount; i++) {
++        sound_clips[i] = LoadSoundClip(kReplacementSounds[i].file);
++        if (!sound_clips[i])
++            blog(LOG_WARNING, "[语音消音] 替换音缺失或格式不对（要 48 kHz 单声道 16 位）：data/sounds/%s，选它时按静音处理",
++                 kReplacementSounds[i].file);
++    }
+     custom_words_str = read_file(QString::fromStdString(get_config_path("custom_words.txt")));
+     RebuildWords();
+     // Supplemental pinyin list: no UI any more (custom words get pinyin automatically); the
+@@ -340,7 +394,15 @@ void GlobalConfig::Load() {
+         
+ 
+         if (obs_data_has_user_value(data, "audio_effect")) {
+-            audio_effect = obs_data_get_int(data, "audio_effect");
++            audio_effect = (int)obs_data_get_int(data, "audio_effect");
++            // 小黄人 (2) was removed in 0.10.3; it and unknown values load as silence.
++            const bool known = audio_effect == 0 || audio_effect == 1 || audio_effect == 3 ||
++                               (audio_effect >= kReplacementSoundBase &&
++                                audio_effect < kReplacementSoundBase + kReplacementSoundCount);
++            if (!known) {
++                blog(LOG_INFO, "[语音消音] 消音方式 %d 已不提供，改为静音", audio_effect);
++                audio_effect = 1;
++            }
+         }
+         
+         if (obs_data_has_user_value(data, "beep_freq")) {
+@@ -699,8 +761,9 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     comboEffect = new QComboBox();
+     comboEffect->addItem("哔声", 0);
+     comboEffect->addItem("静音", 1);
+-    comboEffect->addItem("小黄人音效", 2);
+     comboEffect->addItem("电报音效", 3);
++    for (int i = 0; i < kReplacementSoundCount; i++)
++        comboEffect->addItem(QString::fromUtf8(kReplacementSounds[i].name), kReplacementSoundBase + i);
+     layoutAudio->addRow("替换成：", comboEffect);
+     // The model's word timings are off by up to about 0.4 s (mostly the word's tail), so
+     // the range is extended on both sides; 0.2 s audibly leaked in listening tests (2026-11-08).
+@@ -939,7 +1002,7 @@ void ConfigDialog::LoadToUI() {
+     // Map audio_effect to combo
+     int effect_idx = comboEffect->findData(cfg->audio_effect);
+     if (effect_idx != -1) comboEffect->setCurrentIndex(effect_idx);
+-    else comboEffect->setCurrentIndex(0); // Default to Beep
++    else comboEffect->setCurrentIndex(comboEffect->findData(1)); // silence, the default
+ 
+     {
+         int idx = comboSyncMode->findData(cfg->sync_mode);
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 52b3da1..7415a99 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -27,6 +27,7 @@
+ 
+ #include <string>
+ #include <vector>
++#include <memory>
+ #include <mutex>
+ #include <regex>
+ 
+@@ -57,7 +58,9 @@ struct GlobalConfig {
+     std::string custom_words_str;    // user's plain words (custom_words.txt)
+     void RebuildWords();
+     std::string pinyin_words_str;
+-    int audio_effect = 1; // 0=Beep, 1=Silence (default, user choice), 2=Squeaky, 3=Robot
++    // 0=Beep, 1=Silence (default, user choice), 3=Telegraph, kReplacementSoundBase + i = animal
++    // sound i. 2 (minion) is no longer offered and loads as silence.
++    int audio_effect = 1;
+     int beep_frequency = 1000;
+     int beep_mix_percent = 100;
+     bool use_pinyin = true;
+@@ -95,6 +98,8 @@ struct GlobalConfig {
+ 
+     // Parsed State
+     std::vector<std::regex> dirty_patterns;
++    // Animal sounds read from data/sounds at Load (null when missing or not 48 kHz mono 16-bit).
++    std::shared_ptr<const std::vector<float>> sound_clips[5];
+ 
+     mutable std::mutex mutex;
+ 
+@@ -103,6 +108,17 @@ struct GlobalConfig {
+     void ParsePatterns();
+ };
+ 
++// Animal replacement sounds (CC0, data/sounds/README.md), the same list as the standalone app.
++// Saved as audio_effect kReplacementSoundBase + index; the engine plays them as effect 4, the
++// clip repeated every clip length + gap_ms while the mute lasts.
++struct ReplacementSound {
++    const char *name, *file;
++    int gap_ms;
++};
++extern const ReplacementSound kReplacementSounds[5];
++constexpr int kReplacementSoundBase = 10;
++constexpr int kReplacementSoundCount = 5;
++
+ // Singleton Access
+ GlobalConfig* GetGlobalConfig();
+ 
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index 650a9be..d305039 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -58,6 +58,13 @@ void ProfanityFilter::GetAudioSettings(CensorAudioSettings &s) {
+     s.delay_seconds = cfg->delay_seconds;
+     s.model_path = cfg->model_path;
+     s.effect = cfg->audio_effect;
++    const int sound = cfg->audio_effect - kReplacementSoundBase;
++    if (sound >= 0 && sound < kReplacementSoundCount) {
++        s.effect = 4; // clip; without one (file missing) the engine mutes
++        s.clip = cfg->sound_clips[sound];
++        s.clip_rate = 48000;
++        s.clip_period = s.clip ? s.clip->size() + (size_t)kReplacementSounds[sound].gap_ms * 48 : 0;
++    }
+     s.beep_frequency = cfg->beep_frequency;
+     s.beep_mix_percent = cfg->beep_mix_percent;
+     s.enable = cfg->global_enable;
+-- 
+2.55.0.windows.5
+

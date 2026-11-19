@@ -53,3 +53,7 @@
 | [0047](0047-lexicon-mabi.patch) | Built-in lexicon: 妈逼 (missed in a real KOOK recording), allowed phrases 吗比 and 麻痹大意 for its pinyin; word count skips allowed phrases |
 | [0048](0048-readable-log-recent-mutes.patch) | Readable log: one 消音 line per muted word with source, [语音消音] prefix, recent-mutes list |
 | [0049](0049-version-0.10.2.patch) | Plugin version 0.10.2 |
+| [0050](0050-replacement-animal-sounds.patch) | Replacement sounds: five animal sounds (data/sounds, CC0) in 替换成, 小黄人 removed (saved 2 loads as silence) |
+| [0051](0051-version-0.10.3.patch) | Plugin version 0.10.3 |
+| [0052](0052-replacement-sound-preview.patch) | 试听 button for the replacement sound (PlaySound, as in the standalone app); warning text buffer 512 bytes |
+| [0053](0053-recognizer-lanes-setting.patch) | 识别路数 setting (1/2/4, default 1): more recognizer streams with 40 ms chunks as in the standalone app; backlog warning suggests fewer |

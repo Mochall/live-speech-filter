@@ -6,6 +6,7 @@ Layout (installed as C:/ProgramData/obs-studio/plugins/obs-profanity-filter):
     bin/64bit/  plugin DLL + its DLLs      (OBS 28-32, still read by OBS 33)
     ./          the same DLLs              (OBS 33 layout; OBS 34 will read only this one)
     data/       dictionary, word list, locale, bundled X-ASR model (shared by both)
+    data/sounds/   animal replacement sounds (CC0; README.md lists authors and links)
     data/vbcable/  VB-Audio's original VBCABLE_Driver_Pack46.zip, unmodified (the installer's task and the
                 plugin's 安装 VB-CABLE button open VB-Audio's own setup from it)
     licenses/   sources and licenses
@@ -44,7 +45,11 @@ shutil.copy2(src_data / 'builtin_dirty_words.txt', out / 'data/builtin_dirty_wor
 for f in ('models.json', 'runtime.json'):
     assert (src_data / f).read_bytes() == (out / 'data' / f).read_bytes(), f
 
-VBCABLE_ZIP = ROOT / 'downloads/vbcable-pack46/VBCABLE_Driver_Pack46.zip'
+# Animal replacement sounds (0050): the standalone app's CC0 files and their attribution README.
+shutil.copytree(ROOT / 'standalone/data/sounds', out / 'data/sounds')
+assert sorted(p.name for p in (out / 'data/sounds').iterdir()) == ['README.md', 'bird.wav', 'cat.wav', 'dog.wav', 'duck.wav', 'sheep.wav']
+
+VBCABLE_ZIP = ROOT /'downloads/vbcable-pack46/VBCABLE_Driver_Pack46.zip'
 VBCABLE_SHA = 'BC44E8974191A5A2427D6C979E2DAB08DBB09925F3F435DFA2F0BA3E45B6EB90'  # as published by VB-Audio
 (out / 'data/vbcable').mkdir()
 shutil.copy2(VBCABLE_ZIP, out / 'data/vbcable')
@@ -75,7 +80,9 @@ text = text.replace('Statically linked', 'OBS Studio is not included; the plugin
 text += ('\nVB-CABLE by VB-Audio Software (www.vb-cable.com): data\\vbcable\\VBCABLE_Driver_Pack46.zip is VB-Audio\'s original\n'
          '  driver pack, unmodified (SHA256 ' + VBCABLE_SHA + '), from https://vb-audio.com/Cable/ . It is not part of this\n'
          '  plugin and is distributed as is under https://vb-audio.com/Services/licensing.htm .\n'
-         '  VB-CABLE is a donationware, all participations are welcome.\n')
+         '  VB-CABLE is a donationware, all participations are welcome.\n'
+         '\nReplacement sounds in data\\sounds (bird, cat, dog, duck, sheep): CC0 1.0 recordings from Freesound,\n'
+         '  trimmed and level-matched; authors and links in data\\sounds\\README.md.\n')
 (lic / 'SOURCES.txt').write_text(text, encoding='utf-8')
 
 # rcc stores resource names as UTF-16 big-endian.

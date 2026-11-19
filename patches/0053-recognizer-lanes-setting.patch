@@ -1,0 +1,154 @@
+From 60dc442a8447794151082c84f8c0b1edfcd83ced Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Thu, 19 Nov 2026 04:25:58 -0700
+Subject: [PATCH 2/2] =?UTF-8?q?=E8=AF=86=E5=88=AB=E8=B7=AF=E6=95=B0=20sett?=
+ =?UTF-8?q?ing=20(1/2/4,=20default=201):=20more=20recognizer=20streams=20w?=
+ =?UTF-8?q?ith=2040=20ms=20chunks=20as=20in=20the=20standalone=20app;=20ba?=
+ =?UTF-8?q?cklog=20warning=20suggests=20fewer?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/plugin-config.cpp    | 23 ++++++++++++++++++++++-
+ src/plugin-config.hpp    |  5 +++++
+ src/profanity-filter.cpp | 13 +++++++++++--
+ 3 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 6253241..9fe0012 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -297,6 +297,7 @@ void GlobalConfig::Save() {
+         obs_data_set_bool(data, "use_pinyin", use_pinyin);
+         obs_data_set_bool(data, "asr_debug_logging", asr_debug_logging);
+         obs_data_set_int(data, "audio_effect", audio_effect);
++        obs_data_set_int(data, "recognizer_lanes", recognizer_lanes);
+         obs_data_set_int(data, "beep_freq", beep_frequency);
+         obs_data_set_int(data, "beep_mix", beep_mix_percent);
+         obs_data_set_int(data, "sync_mode", sync_mode);
+@@ -448,6 +449,11 @@ void GlobalConfig::Load() {
+             }
+         }
+         
++        if (obs_data_has_user_value(data, "recognizer_lanes")) {
++            recognizer_lanes = (int)obs_data_get_int(data, "recognizer_lanes");
++            if (recognizer_lanes != 2 && recognizer_lanes != 4) recognizer_lanes = 1;
++        }
++
+         if (obs_data_has_user_value(data, "beep_freq")) {
+             beep_frequency = obs_data_get_int(data, "beep_freq");
+         }
+@@ -926,6 +932,15 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     spinModelOffset->setSuffix(" ms");
+     spinModelOffset->setToolTip("不同模型给出词语时间的偏差不同。消音整体偏早或偏晚时调整：正值往后推，负值往前提。");
+     layoutModel->addRow("消音位置校准：", spinModelOffset);
++
++    comboLanes = new QComboBox();
++    comboLanes->addItem("1 路（默认，最省 CPU）", 1);
++    comboLanes->addItem("2 路", 2);
++    comboLanes->addItem("4 路（最不容易漏词）", 4);
++    comboLanes->setToolTip("同一路声音同时用几份识别错开跑：这个模型认不认得出一个词，跟它落在声音分块里的位置有关，\n"
++                           "错开跑能补上单路漏掉的词。每个加了消音的声音来源各跑这么多路，路数越多越占 CPU（测试机上 4 路时插件所在的 OBS 约为 1 路的 3.5 倍），也偶尔会多出误消音。\n"
++                           "开游戏时 CPU 跟不上，状态栏会提示“识别积压”，这时改回更少的路数。");
++    layoutModel->addRow("识别路数：", comboLanes);
+     layoutAdvanced->addWidget(grpModel);
+ 
+     QGroupBox *grpDebug = new QGroupBox("排查漏词");
+@@ -1082,6 +1097,10 @@ void ConfigDialog::LoadToUI() {
+     if (effect_idx != -1) comboEffect->setCurrentIndex(effect_idx);
+     else comboEffect->setCurrentIndex(comboEffect->findData(1)); // silence, the default
+     btnPreviewEffect->setEnabled(comboEffect->currentData().toInt() != 1);
++    {
++        int idx = comboLanes->findData(cfg->recognizer_lanes);
++        comboLanes->setCurrentIndex(idx < 0 ? 0 : idx);
++    }
+ 
+     {
+         int idx = comboSyncMode->findData(cfg->sync_mode);
+@@ -1101,7 +1120,8 @@ void ConfigDialog::LoadToUI() {
+     updateWordCounts((int)SplitWordList(cfg->custom_words_str).size());
+     // Open the advanced section when something in it is not at its default, so a
+     // running debug log (private conversation in the OBS log) stays visible.
+-    bool advanced = cfg->asr_debug_logging || comboModel->currentData().toString() == "custom";
++    bool advanced = cfg->asr_debug_logging || comboModel->currentData().toString() == "custom" ||
++                    cfg->recognizer_lanes != 1;
+     btnAdvanced->setChecked(advanced);
+ }
+ 
+@@ -1460,6 +1480,7 @@ bool ConfigDialog::onApply() {
+         cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
+         
+         cfg->audio_effect = comboEffect->currentData().toInt();
++        cfg->recognizer_lanes = comboLanes->currentData().toInt();
+ 
+         cfg->sync_mode = comboSyncMode->currentData().toInt();
+         cfg->auto_filter_microphones = chkAutoFilterMic->isChecked();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 42e1975..7ec230b 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -62,6 +62,10 @@ struct GlobalConfig {
+     // sound i. 2 (minion) is no longer offered and loads as silence.
+     int audio_effect = 1;
+     int beep_frequency = 1000;
++    // Recognizer streams per filtered source (1, 2 or 4). 1 = the plugin's behaviour before
++    // 0052 (one stream, fed whatever is queued). 2/4 = the standalone app's way: fixed 40 ms
++    // chunks, streams offset so the model's 160 ms blocks fall on different audio positions.
++    int recognizer_lanes = 1;
+     int beep_mix_percent = 100;
+     bool use_pinyin = true;
+     bool asr_debug_logging = false;
+@@ -188,6 +192,7 @@ private:
+     QCheckBox *chkMuteMode; // Deprecated UI, replaced by comboEffect
+     QComboBox *comboEffect;
+     QPushButton *btnPreviewEffect;
++    QComboBox *comboLanes;
+     QByteArray previewWav; // played asynchronously from memory by PlaySoundW; kept alive here
+     void previewEffect();
+     QCheckBox *chkUsePinyin;
+diff --git a/src/profanity-filter.cpp b/src/profanity-filter.cpp
+index b786bf8..116c5fc 100644
+--- a/src/profanity-filter.cpp
++++ b/src/profanity-filter.cpp
+@@ -80,6 +80,13 @@ void ProfanityFilter::GetAsrSettings(CensorAsrSettings &s) {
+     s.censor_padding_ms = cfg->censor_padding_ms;
+     s.model_offset_ms = cfg->model_offset_ms;
+     s.debug_logging = cfg->asr_debug_logging;
++    // 1 lane: unchanged (fixed_chunk_16k 0). More: the standalone app's settings (app-core.hpp,
++    // lite-window.cpp): 40 ms chunks, streams offset by 40 ms (4) or 80 ms (2).
++    s.recognizer_lanes = cfg->recognizer_lanes;
++    if (s.recognizer_lanes > 1) {
++        s.fixed_chunk_16k = 40 * 16;
++        s.lane_step_16k = (s.recognizer_lanes >= 4 ? 40 : 80) * 16;
++    }
+ }
+ 
+ void ProfanityFilter::GetLexicon(CensorLexicon &l) {
+@@ -232,10 +239,12 @@ std::string ProfanityFilter::GetRecognitionWarning() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     if (!cfg) return "";
+     double delay;
++    int lanes;
+     {
+         lock_guard<mutex> lock(cfg->mutex);
+         if (!cfg->global_enable) return "";
+         delay = cfg->delay_seconds;
++        lanes = cfg->recognizer_lanes;
+     }
+     const uint64_t now = CensorEngine::NowNs();
+     const double backlog_limit = max(1.0, delay * 0.5);
+@@ -262,8 +271,8 @@ std::string ProfanityFilter::GetRecognitionWarning() {
+         }
+         double backlog = queued / 16000.0;
+         if (backlog >= backlog_limit) {
+-            snprintf(text, sizeof(text), "识别积压：%s 约%.1f秒（延迟%.1f秒），超过延迟将漏消音",
+-                     name.c_str(), backlog, delay);
++            snprintf(text, sizeof(text), "识别积压：%s 约%.1f秒（延迟%.1f秒），超过延迟将漏消音%s",
++                     name.c_str(), backlog, delay, lanes > 1 ? "，请在设置里减少识别路数" : "");
+             if (!out.empty()) out += "；";
+             out += text;
+         }
+-- 
+2.55.0.windows.5
+
