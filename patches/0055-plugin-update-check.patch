@@ -1,0 +1,1076 @@
+From 42a6ff3cda92851098ef261dfa13b934759d51ed Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Thu, 19 Nov 2026 09:49:32 -0700
+Subject: [PATCH] =?UTF-8?q?=E6=A3=80=E6=9F=A5=E6=9B=B4=E6=96=B0=20(plugin)?=
+ =?UTF-8?q?:=20shared=20WinHTTP=20update=20module=20(also=20used=20by=20th?=
+ =?UTF-8?q?e=20standalone=20app),=20check=20at=20most=20once=20a=20day=203?=
+ =?UTF-8?q?0=20s=20after=20start=20with=20an=20off=20switch=20and=20a=20bu?=
+ =?UTF-8?q?tton,=20notice=20in=20the=20status=20bar=20and=20settings=20pag?=
+ =?UTF-8?q?e=20only,=20download=20with=20size/SHA256=20check=20into=20the?=
+ =?UTF-8?q?=20plugin=20config=20folder;=20never=20starts=20the=20installer?=
+ =?UTF-8?q?=20(exit=20OBS=20first)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ CMakeLists.txt        |  13 ++
+ src/plugin-config.cpp | 113 ++++++++++++++
+ src/plugin-config.hpp |  10 ++
+ src/plugin-main.cpp   |  13 ++
+ src/plugin-update.cpp | 256 +++++++++++++++++++++++++++++++
+ src/plugin-update.hpp |  54 +++++++
+ src/update-check.cpp  | 343 ++++++++++++++++++++++++++++++++++++++++++
+ src/update-check.hpp  |  78 ++++++++++
+ 8 files changed, 880 insertions(+)
+ create mode 100644 src/plugin-update.cpp
+ create mode 100644 src/plugin-update.hpp
+ create mode 100644 src/update-check.cpp
+ create mode 100644 src/update-check.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2922a0e..f2cc239 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -155,6 +155,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+     src/plugin-config.cpp
+     src/companion-audio.cpp
+     src/streaming-apps.cpp
++    src/update-check.cpp
++    src/plugin-update.cpp
+     src/model-manager.cpp
+     src/asr-model.cpp
+     src/utils.cpp
+@@ -168,6 +170,17 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+ 
+ set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+ 
++# Update check (src/update-check.cpp): WinHTTP, Qt Core only.
++if(WIN32)
++  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE winhttp)
++endif()
++# Test builds only: the one latest.json address (http://127.0.0.1 allowed). Empty for real builds.
++set(LSF_UPDATE_TEST_URL "" CACHE STRING "test address of latest.json (test builds only)")
++if(LSF_UPDATE_TEST_URL)
++  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE LSF_UPDATE_TEST_URL="${LSF_UPDATE_TEST_URL}")
++  message(WARNING "Update check test build: ${LSF_UPDATE_TEST_URL}")
++endif()
++
+ # Sponsor QR image compiled into the DLL (Qt resource :/sponsor/sponsor-qr.png), so it cannot be
+ # swapped by replacing a file. The image is not part of the sources; without it the dialog falls
+ # back to data/sponsor-qr.png. Added after set_target_properties_plugin, whose source_group
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 9a2e8e1..243f98a 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -6,6 +6,7 @@
+ #include "utils.hpp"
+ #include "companion-audio.hpp"
+ #include "streaming-apps.hpp"
++#include "plugin-update.hpp"
+ #include <obs-module.h>
+ #include <obs.h>
+ #include <obs-frontend-api.h>
+@@ -311,6 +312,7 @@ void GlobalConfig::Save() {
+         obs_data_set_int(data, "voice_source", voice_source);
+         obs_data_set_bool(data, "cable_auto_disable", cable_auto_disable);
+         obs_data_set_bool(data, "delay_follows_padding", delay_follows_padding);
++        obs_data_set_bool(data, "check_updates", check_updates);
+ 
+         // GPU Settings
+         obs_data_set_bool(data, "enable_gpu", enable_gpu);
+@@ -488,6 +490,8 @@ void GlobalConfig::Load() {
+         if (voice_source < 0 || voice_source > 2) voice_source = 0;
+         if (obs_data_has_user_value(data, "cable_auto_disable"))
+             cable_auto_disable = obs_data_get_bool(data, "cable_auto_disable");
++        if (obs_data_has_user_value(data, "check_updates"))
++            check_updates = obs_data_get_bool(data, "check_updates");
+         if (obs_data_has_user_value(data, "delay_follows_padding")) {
+             delay_follows_padding = obs_data_get_bool(data, "delay_follows_padding");
+         }
+@@ -1044,6 +1048,31 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     connect(btnApply, &QPushButton::clicked, this, &ConfigDialog::onApply);
+     connect(btnCancel, &QPushButton::clicked, this, &ConfigDialog::reject);
+ 
++    // Update row: outside the scroll area so it stays visible when the master switch hides the settings.
++    QHBoxLayout *updateLayout = new QHBoxLayout();
++    lblUpdate = new QLabel();
++    lblUpdate->setWordWrap(true);
++    lblUpdate->setTextInteractionFlags(Qt::TextSelectableByMouse);
++    lblUpdate->setStyleSheet("color: #9a9cab;");
++    btnUpdate = new QPushButton("检查更新");
++    btnUpdateCancel = new QPushButton("取消");
++    btnUpdatePage = new QPushButton("打开下载页");
++    chkAutoUpdate = new QCheckBox("自动检查（每天最多一次）");
++    chkAutoUpdate->setToolTip("OBS 启动约 30 秒后检查一次有没有新版插件（距上次检查不到 20 小时则不查）。\n"
++                              "只读取 Gitee/GitHub 上公开仓库的版本信息文件，不上传任何东西；有新版只在这里和状态栏提示，不弹窗。");
++    connect(btnUpdate, &QPushButton::clicked, this, &ConfigDialog::onUpdateButton);
++    connect(btnUpdateCancel, &QPushButton::clicked, this, [] { pluginupdate::Cancel(); });
++    connect(btnUpdatePage, &QPushButton::clicked, this, [] {
++        const QString page = pluginupdate::Get().release.page;
++        if (!page.isEmpty() && lsfupdate::HostAllowed(QUrl(page))) QDesktopServices::openUrl(QUrl(page));
++    });
++    updateLayout->addWidget(lblUpdate, 1);
++    updateLayout->addWidget(btnUpdate);
++    updateLayout->addWidget(btnUpdateCancel);
++    updateLayout->addWidget(btnUpdatePage);
++    updateLayout->addWidget(chkAutoUpdate);
++    mainLayout->addLayout(updateLayout);
++
+     QPushButton *btnSponsor = new QPushButton("支持项目…");
+     btnSponsor->setToolTip("作者：漠秋（反馈 QQ：549466926）。插件免费使用，有帮助的话可以扫码支持。");
+     connect(btnSponsor, &QPushButton::clicked, this, [this] { showSponsorDialog(); });
+@@ -1061,6 +1090,7 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     connect(statusTimer, &QTimer::timeout, this, &ConfigDialog::updateStatus);
+     statusTimer->start(1000); // Update every 1 second
+     updateStatus();
++    updateUpdateUI();
+ }
+ 
+ ConfigDialog::~ConfigDialog() {
+@@ -1133,6 +1163,7 @@ void ConfigDialog::LoadToUI() {
+     
+     chkUsePinyin->setChecked(cfg->use_pinyin);
+     chkAsrDebugLogging->setChecked(cfg->asr_debug_logging);
++    chkAutoUpdate->setChecked(cfg->check_updates);
+     
+     // Map audio_effect to combo
+     int effect_idx = comboEffect->findData(cfg->audio_effect);
+@@ -1200,7 +1231,87 @@ void ConfigDialog::updateDelayUI() {
+     }
+ }
+ 
++void ConfigDialog::updateUpdateUI() {
++    using pluginupdate::State;
++    const pluginupdate::Snapshot s = pluginupdate::Get();
++    const QString mb = QString::number(std::max<qint64>(1, (s.release.size + 512 * 1024) / (1024 * 1024)));
++    const QString notes = s.release.notes.section('\n', 0, 1).trimmed();
++    QString text, button;
++    bool busy = false, page = false, highlight = false;
++    switch (s.state) {
++    case State::Idle:
++        if (!s.found_before.isEmpty())
++            text = "上次检查发现新版本 " + s.found_before, highlight = true;
++        else if (s.last_check > 0)
++            text = "上次检查（" + QDateTime::fromSecsSinceEpoch(s.last_check).toString("M月d日 HH:mm") + "）时已是最新版本";
++        else
++            text = "还没检查过更新";
++        button = "检查更新";
++        break;
++    case State::Checking:
++        text = "正在检查更新…";
++        busy = true;
++        break;
++    case State::UpToDate:
++        text = "检查过，已是最新版本";
++        button = "检查更新";
++        break;
++    case State::CheckFailed:
++        text = "没查到版本信息（" + s.error + "）";
++        if (!s.found_before.isEmpty()) text += "；上次检查发现新版本 " + s.found_before, highlight = true;
++        button = "检查更新";
++        break;
++    case State::Available:
++        text = "有新版本 " + s.release.version + (notes.isEmpty() ? QString() : "：" + notes);
++        button = "下载更新（" + mb + " MB）";
++        page = highlight = true;
++        break;
++    case State::Downloading:
++        text = QString("正在下载新版本 %1：%2%").arg(s.release.version).arg(s.release.size > 0 ? s.received * 100 / s.release.size : 0);
++        busy = true;
++        break;
++    case State::Downloaded:
++        text = "新版本 " + s.release.version + " 已下载并核对（大小和 SHA256）。安装要先退出 OBS：退出后运行 " + s.file;
++        button = "打开所在文件夹";
++        highlight = true;
++        break;
++    case State::DownloadFailed:
++        text = "新版本 " + s.release.version + " 下载失败（" + s.error + "），可以重试或打开下载页手动下载";
++        button = "重新下载（" + mb + " MB）";
++        page = highlight = true;
++        break;
++    }
++    text = "插件 " LSF_PLUGIN_VERSION "　" + text;
++    if (lblUpdate->text() != text) lblUpdate->setText(text);
++    const QString style = highlight ? "color: #67C23A;" : "color: #9a9cab;";
++    if (lblUpdate->styleSheet() != style) lblUpdate->setStyleSheet(style);
++    btnUpdate->setVisible(!busy);
++    if (!busy && btnUpdate->text() != button) btnUpdate->setText(button);
++    btnUpdateCancel->setVisible(busy);
++    btnUpdatePage->setVisible(page && !s.release.page.isEmpty());
++}
++
++void ConfigDialog::onUpdateButton() {
++    using pluginupdate::State;
++    const pluginupdate::Snapshot s = pluginupdate::Get();
++    if (s.state == State::Available || s.state == State::DownloadFailed) {
++        pluginupdate::Download();
++    } else if (s.state == State::Downloaded) {
++        // Only shows the file; the installer is never started from OBS (it needs OBS closed).
++        if (QFileInfo::exists(s.file)) {
++            const std::wstring params = L"/select,\"" + s.file.toStdWString() + L"\"";
++            ShellExecuteW(nullptr, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
++        } else {
++            QMessageBox::warning(this, "插件更新", "下载的安装包不见了，请重新检查更新。");
++        }
++    } else {
++        pluginupdate::CheckNow();
++    }
++    updateUpdateUI();
++}
++
+ void ConfigDialog::updateStatus() {
++    updateUpdateUI();
+     // The companion section reads Windows devices and the companion app's settings file;
+     // refresh it every few seconds so it follows changes made outside OBS.
+     static int companion_refresh = 0;
+@@ -1524,6 +1635,8 @@ bool ConfigDialog::onApply() {
+         
+         cfg->use_pinyin = chkUsePinyin->isChecked();
+         cfg->asr_debug_logging = chkAsrDebugLogging->isChecked();
++        cfg->check_updates = chkAutoUpdate->isChecked();
++        pluginupdate::SetAutoCheck(cfg->check_updates);
+         
+         cfg->audio_effect = comboEffect->currentData().toInt();
+         cfg->recognizer_lanes = comboLanes->currentData().toInt();
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 66825fa..2d069ea 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -96,6 +96,8 @@ struct GlobalConfig {
+     // Delay = padding + recognition margin. The delay must exceed the front padding plus
+     // the time recognition needs, otherwise a word starts playing before it is muted.
+     bool delay_follows_padding = true;
++    // Look for a newer plugin about 30 s after OBS starts, at most once a day (plugin-update.cpp).
++    bool check_updates = true;
+     static constexpr int kAutoDelayMarginMs = 1500; // used when delay follows padding
+     // Lower bound for a manual delay. X-ASR int8, real-time paced, all CPUs busy: a 4-character
+     // word is recognised up to 1.26 s after its first character starts (2026-11-08).
+@@ -188,6 +190,14 @@ private:
+     QPushButton *btnInstallCable;
+     void openCableDownload();
+     void showSponsorDialog();
++    // 插件更新 row below the settings (visible with the master switch off too).
++    QLabel *lblUpdate;
++    QPushButton *btnUpdate;       // 检查更新 / 下载更新 / 打开所在文件夹
++    QPushButton *btnUpdateCancel;
++    QPushButton *btnUpdatePage;
++    QCheckBox *chkAutoUpdate;
++    void updateUpdateUI();
++    void onUpdateButton();
+     QLabel *lblAudioSetup;
+     void updateCompanionUI();
+     // A link in the checklist: add a filter, mute, or (un)mark a source as not needing one.
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 927774f..0ac521c 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "profanity-filter.hpp"
+ #include "plugin-config.hpp"
++#include "plugin-update.hpp"
+ #include "video-delay.hpp"
+ #include "companion-audio.hpp"
+ #include "streaming-apps.hpp"
+@@ -134,9 +135,11 @@ static void start_filter_warning() {
+         std::string latency = GetViewerLatencyText();
+         if (companion && !latency.empty())
+             latency += remote ? "；双机推流（监听声音经采集卡送直播机）" : "；直播伴侣模式（虚拟摄像头+CABLE）";
++        const QString new_version = pluginupdate::NewVersionText();
+         QString main, suffix, color;
+         if (items.empty()) {
+             main = QString::fromStdString(latency.empty() ? std::string("语音消音已关闭") : latency);
++            if (!new_version.isEmpty()) suffix = "；" + new_version + "（在语音消音设置里下载）";
+             color = "#88cc88";
+         } else {
+             main = QString::fromStdString(items[0].text);
+@@ -155,6 +158,7 @@ static void start_filter_warning() {
+                                               QString::fromStdString(it.text));
+         }
+         if (!latency.empty()) tip += "\n\n" + QString::fromStdString(latency);
++        if (!new_version.isEmpty()) tip += "\n\n" + new_version + "：在语音消音设置底部下载，退出 OBS 后安装。";
+         tip += "\n\n提醒只显示在 OBS，不进入直播画面；不能发现采集设备或平台带来的偏差、语音漏识别。异常时声音继续输出。";
+         if (filter_warning->toolTip() != tip) filter_warning->setToolTip(tip);
+ 
+@@ -357,6 +361,14 @@ MODULE_EXPORT bool obs_module_load(void)
+     
+     SetGlobalConfigModule(obs_current_module());
+     InitGlobalConfig();
++    {
++        bool check_updates = true;
++        if (GlobalConfig *cfg = GetGlobalConfig()) {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            check_updates = cfg->check_updates;
++        }
++        pluginupdate::Start(check_updates);
++    }
+     
+     // Register Menu Item
+     obs_frontend_add_tools_menu_item("语音消音设置", [](void *){
+@@ -1493,6 +1505,7 @@ void UpdateVideoDelayFiltersState() {
+ 
+ MODULE_EXPORT void obs_module_unload(void)
+ {
++    pluginupdate::Shutdown(); // first: cancels a check or download and joins its thread
+     delete filter_warning_timer;
+     delete filter_warning;
+     unhook_mute_signals();
+diff --git a/src/plugin-update.cpp b/src/plugin-update.cpp
+new file mode 100644
+index 0000000..517ace6
+--- /dev/null
++++ b/src/plugin-update.cpp
+@@ -0,0 +1,256 @@
++#include "plugin-update.hpp"
++
++#include <obs-module.h>
++
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QSaveFile>
++
++#include <chrono>
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <thread>
++
++#ifndef LSF_PLUGIN_VERSION
++#define LSF_PLUGIN_VERSION "0.0.0"
++#endif
++
++namespace pluginupdate {
++
++namespace {
++
++enum class Job { None, Check, Download };
++
++constexpr auto kAutoDelay = std::chrono::seconds(30);   // after OBS start, so it does not slow loading
++constexpr qint64 kAutoInterval = 20 * 3600;              // "at most once a day", a bit early is fine
++
++std::mutex m;
++std::condition_variable cv;
++Snapshot snap;
++Job job = Job::None;
++bool manual_job = false;
++bool auto_on = true;
++bool auto_pending = false;
++bool shutting = false;
++bool started = false;
++std::unique_ptr<lsfupdate::Http> http; // the one in use, so Cancel/Shutdown can stop it
++std::thread worker;
++
++QString ConfigFile(const char *name) {
++    char *p = obs_module_config_path(name);
++    QString s = p ? QString::fromUtf8(p) : QString();
++    bfree(p);
++    return s;
++}
++
++bool Newer(const QString &v) { return !v.isEmpty() && lsfupdate::CompareVersions(v, LSF_PLUGIN_VERSION) > 0; }
++
++// update_state.json: written only by the worker (GlobalConfig::Save is the Qt thread's file).
++void SaveState(qint64 last_check, const QString &found) {
++    const QString path = ConfigFile("update_state.json");
++    if (path.isEmpty()) return;
++    QDir().mkpath(QFileInfo(path).absolutePath());
++    QJsonObject o;
++    o["last_check"] = (double)last_check;
++    o["found"] = found;
++    QSaveFile f(path);
++    if (f.open(QIODevice::WriteOnly)) {
++        f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
++        f.commit();
++    }
++}
++
++void LoadState(qint64 &last_check, QString &found) {
++    QFile f(ConfigFile("update_state.json"));
++    if (!f.open(QIODevice::ReadOnly) || f.size() > 64 * 1024) return;
++    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
++    last_check = (qint64)o.value("last_check").toDouble(0);
++    found = o.value("found").toString();
++}
++
++void ClearDownloads() {
++    QDir dir(DownloadFolder());
++    if (!dir.exists()) return;
++    for (const QFileInfo &fi : dir.entryInfoList({"*.exe", "*.part"}, QDir::Files)) QFile::remove(fi.absoluteFilePath());
++}
++
++void Run() {
++    const auto auto_due = std::chrono::steady_clock::now() + kAutoDelay;
++    std::unique_lock<std::mutex> l(m);
++    for (;;) {
++        cv.wait_until(l, auto_pending ? auto_due : std::chrono::steady_clock::time_point::max(), [&] {
++            return shutting || job != Job::None || (auto_pending && std::chrono::steady_clock::now() >= auto_due);
++        });
++        if (shutting) break;
++        Job j = job;
++        bool manual = manual_job;
++        job = Job::None;
++        if (j == Job::None) {
++            auto_pending = false;
++            // Not when switched off, or when the user already checked / downloaded in this session
++            // (an automatic check must not replace a finished download).
++            if (!auto_on || snap.state != State::Idle) continue;
++            const qint64 now = QDateTime::currentSecsSinceEpoch();
++            const bool due = Newer(snap.found_before) || snap.last_check <= 0 || now - snap.last_check >= kAutoInterval ||
++                             now < snap.last_check;
++            if (!due) continue;
++            j = Job::Check;
++            manual = false;
++        }
++        const lsfupdate::Release release = snap.release;
++        if (j == Job::Download && release.file.isEmpty()) continue;
++
++        l.unlock();
++        auto h = std::make_unique<lsfupdate::Http>(QStringLiteral("live-speech-filter-plugin/" LSF_PLUGIN_VERSION));
++        l.lock();
++        if (shutting) break;
++        http = std::move(h);
++        lsfupdate::Http *hp = http.get();
++
++        if (j == Job::Check) {
++            snap.state = State::Checking;
++            snap.manual = manual;
++            snap.error.clear();
++            l.unlock();
++            lsfupdate::Release r;
++            QString error;
++            const bool ok = lsfupdate::FetchLatest(*hp, lsfupdate::InfoUrls(), "plugin", r, error);
++            const bool newer = ok && Newer(r.version);
++            const qint64 now = QDateTime::currentSecsSinceEpoch();
++            if (ok) SaveState(now, newer ? r.version : QString());
++            if (ok)
++                blog(LOG_INFO, "[语音消音] update check: latest plugin %s (this is %s)%s", r.version.toUtf8().constData(),
++                     LSF_PLUGIN_VERSION, newer ? ", newer version available" : "");
++            else
++                blog(LOG_INFO, "[语音消音] update check failed: %s", error.toUtf8().constData());
++            l.lock();
++            if (ok) {
++                snap.last_check = now;
++                snap.found_before = newer ? r.version : QString();
++                snap.release = newer ? r : lsfupdate::Release();
++                snap.state = newer ? State::Available : State::UpToDate;
++            } else {
++                snap.error = error;
++                snap.state = State::CheckFailed;
++            }
++        } else {
++            snap.state = State::Downloading;
++            snap.received = 0;
++            snap.total = release.size;
++            snap.error.clear();
++            const QString dest = QDir(DownloadFolder()).filePath(release.file);
++            l.unlock();
++            QString error;
++            const bool ok = lsfupdate::DownloadRelease(
++                *hp, release, dest,
++                [](qint64 received, qint64) {
++                    std::lock_guard<std::mutex> g(m);
++                    snap.received = received;
++                },
++                error);
++            if (ok)
++                blog(LOG_INFO, "[语音消音] update %s downloaded and checked%s%s", release.version.toUtf8().constData(),
++                     error.isEmpty() ? "" : "; skipped ", error.toUtf8().constData());
++            else
++                blog(LOG_INFO, "[语音消音] update download failed: %s", error.toUtf8().constData());
++            l.lock();
++            if (ok) {
++                snap.file = QDir::toNativeSeparators(dest);
++                snap.state = State::Downloaded;
++            } else {
++                snap.error = error;
++                snap.state = State::DownloadFailed;
++            }
++        }
++        http.reset();
++        if (shutting) break;
++    }
++    http.reset();
++}
++
++} // namespace
++
++// Absolute: portable OBS gives a module config path relative to its working directory, which neither
++// the settings page text nor Explorer could use.
++QString DownloadFolder() {
++    const QString p = ConfigFile("updates");
++    return p.isEmpty() ? p : QDir::cleanPath(QFileInfo(p).absoluteFilePath());
++}
++
++void Start(bool auto_check) {
++    std::lock_guard<std::mutex> l(m);
++    if (started) return;
++    started = true;
++    ClearDownloads();
++    LoadState(snap.last_check, snap.found_before);
++    if (!Newer(snap.found_before)) snap.found_before.clear();
++    auto_on = auto_check;
++    auto_pending = true;
++    worker = std::thread(Run);
++}
++
++void SetAutoCheck(bool on) {
++    std::lock_guard<std::mutex> l(m);
++    auto_on = on;
++}
++
++void CheckNow() {
++    {
++        std::lock_guard<std::mutex> l(m);
++        if (!started || shutting || job != Job::None || snap.state == State::Checking || snap.state == State::Downloading)
++            return;
++        job = Job::Check;
++        manual_job = true;
++    }
++    cv.notify_all();
++}
++
++void Download() {
++    {
++        std::lock_guard<std::mutex> l(m);
++        if (!started || shutting || job != Job::None || snap.release.file.isEmpty() ||
++            (snap.state != State::Available && snap.state != State::DownloadFailed))
++            return;
++        job = Job::Download;
++    }
++    cv.notify_all();
++}
++
++void Cancel() {
++    std::lock_guard<std::mutex> l(m);
++    if (http) http->Cancel();
++}
++
++Snapshot Get() {
++    std::lock_guard<std::mutex> l(m);
++    return snap;
++}
++
++QString NewVersionText() {
++    std::lock_guard<std::mutex> l(m);
++    QString v;
++    if (snap.state == State::Available || snap.state == State::Downloading || snap.state == State::Downloaded ||
++        snap.state == State::DownloadFailed)
++        v = snap.release.version;
++    else if (snap.state == State::Idle || snap.state == State::Checking || snap.state == State::CheckFailed)
++        v = snap.found_before;
++    return v.isEmpty() ? QString() : "有新版本 " + v;
++}
++
++void Shutdown() {
++    {
++        std::lock_guard<std::mutex> l(m);
++        if (!started) return;
++        shutting = true;
++        if (http) http->Cancel();
++    }
++    cv.notify_all();
++    if (worker.joinable()) worker.join();
++}
++
++} // namespace pluginupdate
+diff --git a/src/plugin-update.hpp b/src/plugin-update.hpp
+new file mode 100644
+index 0000000..f85d834
+--- /dev/null
++++ b/src/plugin-update.hpp
+@@ -0,0 +1,54 @@
++#pragma once
++
++// Plugin update check (update-check.cpp does the network part). One worker thread owned by this
++// module does every request, so nothing touches the network on the audio path, under
++// GlobalConfig::mutex or on the Qt thread. The UI polls Get() from its timers; the worker never
++// calls back into Qt (a queued call could run after the module is unloaded). Shutdown() cancels the
++// request in progress and joins the thread; call it first in obs_module_unload.
++//
++// The installer is only downloaded and checked (size + SHA256). It is never started: installing needs
++// OBS closed and administrator rights, so the settings page offers to open the folder instead.
++
++#include "update-check.hpp"
++
++#include <QString>
++
++namespace pluginupdate {
++
++enum class State {
++    Idle,           // nothing checked in this OBS session yet
++    Checking,
++    UpToDate,
++    Available,      // release holds the newer version
++    CheckFailed,    // error says why
++    Downloading,    // received / total
++    Downloaded,     // file is the checked installer
++    DownloadFailed, // error says why; release still valid (download can be retried)
++};
++
++struct Snapshot {
++    State state = State::Idle;
++    lsfupdate::Release release;
++    QString error;
++    qint64 received = 0, total = -1;
++    QString file;
++    bool manual = false;    // the last check was started by the button
++    QString found_before;   // newer version found by an earlier (saved) check, shown before checking
++    qint64 last_check = 0;  // seconds since 1970 of the last successful check, 0 if never
++};
++
++// obs_module_load, after the global config is loaded: clears the download folder, reads the saved
++// check state and starts the worker (auto check about 30 s later when enabled and due).
++void Start(bool auto_check);
++void SetAutoCheck(bool on);
++void CheckNow();
++void Download(); // only when a release is known and nothing is running
++void Cancel();   // stops a check or download in progress
++Snapshot Get();
++void Shutdown();
++
++// "有新版本 x" when a newer version is known (check done or found before), else empty.
++QString NewVersionText();
++QString DownloadFolder();
++
++} // namespace pluginupdate
+diff --git a/src/update-check.cpp b/src/update-check.cpp
+new file mode 100644
+index 0000000..d6f1b21
+--- /dev/null
++++ b/src/update-check.cpp
+@@ -0,0 +1,343 @@
++#include "update-check.hpp"
++
++#include <QCryptographicHash>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
++
++#include <windows.h>
++#include <winhttp.h>
++
++#include <vector>
++
++// Repositories that publish update/latest.json (owner/name). Programs that are out there keep asking
++// these addresses, so they must not change after a release.
++#ifndef LSF_UPDATE_GITEE_REPO
++#define LSF_UPDATE_GITEE_REPO "mochall/live-speech-filter"
++#endif
++#ifndef LSF_UPDATE_GITHUB_REPO
++#define LSF_UPDATE_GITHUB_REPO "Mochall/live-speech-filter"
++#endif
++// Test builds only (CMake LSF_UPDATE_TEST_URL): the one info address, and http://127.0.0.1 allowed.
++// A setting or file can never change these addresses.
++
++namespace lsfupdate {
++
++namespace {
++
++const char *const kHosts[] = {
++    "gitee.com",                           // repository, raw files, release attachments
++    "foruda.gitee.com",                    // release attachments (gitee.com/…/attach_files redirects here)
++    "raw.giteeusercontent.com",            // raw files (gitee.com/…/raw/… redirects here)
++    "github.com",                          // release downloads
++    "objects.githubusercontent.com",       // release downloads (redirect)
++    "release-assets.githubusercontent.com",
++    "raw.githubusercontent.com",           // raw files
++    "cdn.jsdelivr.net",                    // raw files, last resort
++};
++
++QString WinError(DWORD code) {
++    if (code == ERROR_WINHTTP_TIMEOUT) return "连接超时";
++    if (code == ERROR_WINHTTP_NAME_NOT_RESOLVED) return "找不到服务器（网络不通？）";
++    if (code == ERROR_WINHTTP_CANNOT_CONNECT) return "连不上服务器";
++    if (code == ERROR_WINHTTP_OPERATION_CANCELLED) return "已取消";
++    if (code == ERROR_WINHTTP_SECURE_FAILURE) return "安全连接失败";
++    return QString("网络错误 %1").arg(code);
++}
++
++std::wstring W(const QString &s) { return s.toStdWString(); }
++
++} // namespace
++
++int CompareVersions(const QString &a, const QString &b) {
++    const QStringList x = a.split('.'), y = b.split('.');
++    for (int i = 0; i < qMax(x.size(), y.size()); i++) {
++        const int p = i < x.size() ? x[i].toInt() : 0, q = i < y.size() ? y[i].toInt() : 0;
++        if (p != q) return p < q ? -1 : 1;
++    }
++    return 0;
++}
++
++bool HostAllowed(const QUrl &url) {
++#ifdef LSF_UPDATE_TEST_URL
++    if (url.scheme() == "http" && url.host() == "127.0.0.1") return true;
++#endif
++    if (url.scheme() != "https" || !url.userInfo().isEmpty()) return false;
++    const QString host = url.host().toLower();
++    for (const char *h : kHosts)
++        if (host == QLatin1String(h)) return true;
++    return false;
++}
++
++QStringList InfoUrls() {
++#ifdef LSF_UPDATE_TEST_URL
++    return {LSF_UPDATE_TEST_URL};
++#else
++    return {QStringLiteral("https://gitee.com/" LSF_UPDATE_GITEE_REPO "/raw/main/update/latest.json"),
++            QStringLiteral("https://raw.githubusercontent.com/" LSF_UPDATE_GITHUB_REPO "/main/update/latest.json"),
++            QStringLiteral("https://cdn.jsdelivr.net/gh/" LSF_UPDATE_GITHUB_REPO "@main/update/latest.json")};
++#endif
++}
++
++bool ParseLatest(const QByteArray &json, const QString &product, Release &out, QString &error) {
++    QJsonParseError pe;
++    const QJsonDocument doc = QJsonDocument::fromJson(json, &pe);
++    if (!doc.isObject()) {
++        error = "版本信息不是有效的 JSON";
++        return false;
++    }
++    const QJsonObject root = doc.object();
++    if (root.value("format").toInt() != 1) {
++        error = "版本信息格式不认识";
++        return false;
++    }
++    const QJsonObject o = root.value(product).toObject();
++    Release r;
++    r.version = o.value("version").toString();
++    r.notes = o.value("notes").toString();
++    r.page = o.value("page").toString();
++    r.file = o.value("file").toString();
++    r.sha256 = o.value("sha256").toString().toLower();
++    r.size = (qint64)o.value("size").toDouble(0);
++    for (const auto &u : o.value("urls").toArray()) r.urls << u.toString();
++    static const QRegularExpression version_re("^\\d+(\\.\\d+){1,3}$"), sha_re("^[0-9a-f]{64}$"),
++        file_re("^[A-Za-z0-9._-]+\\.exe$");
++    if (!version_re.match(r.version).hasMatch()) error = "版本号无效";
++    else if (!file_re.match(r.file).hasMatch()) error = "文件名无效";
++    else if (!sha_re.match(r.sha256).hasMatch()) error = "SHA256 无效";
++    else if (r.size <= 0 || r.size > 1024LL * 1024 * 1024) error = "文件大小无效";
++    else if (r.urls.isEmpty()) error = "没有下载地址";
++    else if (!r.page.isEmpty() && !HostAllowed(QUrl(r.page))) error = "网页地址不在允许的网站里";
++    if (!error.isEmpty()) return false;
++    for (const QString &u : r.urls)
++        if (!HostAllowed(QUrl(u))) {
++            error = "下载地址不在允许的网站里：" + u;
++            return false;
++        }
++    out = r;
++    return true;
++}
++
++Http::Http(const QString &user_agent) {
++    // Automatic proxy: the Windows proxy settings, as a browser uses them (Windows 8.1+).
++    session_ = WinHttpOpen(W(user_agent).c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
++                           WINHTTP_NO_PROXY_BYPASS, 0);
++    if (!session_)
++        session_ = WinHttpOpen(W(user_agent).c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
++                               WINHTTP_NO_PROXY_BYPASS, 0);
++    if (!session_) return;
++    // A stalled connection fails after 30 s instead of hanging (then the next address is tried).
++    WinHttpSetTimeouts(session_, 15000, 15000, 30000, 30000);
++    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
++    if (!WinHttpSetOption(session_, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
++        protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2; // TLS 1.3 needs Windows 11
++        WinHttpSetOption(session_, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
++    }
++}
++
++Http::~Http() {
++    if (session_) WinHttpCloseHandle(session_);
++}
++
++void Http::Cancel() {
++    std::lock_guard<std::mutex> l(mutex_);
++    cancelled_ = true;
++    if (request_) {
++        WinHttpCloseHandle(request_); // the blocked call in Get returns with an error
++        request_ = nullptr;
++    }
++}
++
++bool Http::Get(const QString &url_text, qint64 max_bytes, const std::function<bool(const char *, size_t)> &sink,
++               const Progress &progress, QString &error) {
++    if (!session_) {
++        error = "网络初始化失败";
++        return false;
++    }
++    QUrl url(url_text);
++    for (int hop = 0; hop < 8; hop++) {
++        if (cancelled_) {
++            error = "已取消";
++            return false;
++        }
++        if (!url.isValid() || !HostAllowed(url)) {
++            error = "地址不在允许的网站里：" + url.host();
++            return false;
++        }
++        const bool secure = url.scheme() == "https";
++        HINTERNET connect = WinHttpConnect(session_, W(url.host()).c_str(),
++                                           (INTERNET_PORT)url.port(secure ? 443 : 80), 0);
++        if (!connect) {
++            error = WinError(GetLastError());
++            return false;
++        }
++        QString path = url.path(QUrl::FullyEncoded);
++        if (path.isEmpty()) path = "/";
++        if (url.hasQuery()) path += "?" + url.query(QUrl::FullyEncoded);
++        HINTERNET request = WinHttpOpenRequest(connect, L"GET", W(path).c_str(), nullptr, WINHTTP_NO_REFERER,
++                                               WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
++        if (!request) {
++            error = WinError(GetLastError());
++            WinHttpCloseHandle(connect);
++            return false;
++        }
++        DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
++        WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof(never));
++        {
++            std::lock_guard<std::mutex> l(mutex_);
++            if (cancelled_) {
++                WinHttpCloseHandle(request);
++                WinHttpCloseHandle(connect);
++                error = "已取消";
++                return false;
++            }
++            request_ = request;
++        }
++        // Closes the request unless Cancel already did.
++        auto finish = [&] {
++            std::lock_guard<std::mutex> l(mutex_);
++            if (request_ == request) {
++                WinHttpCloseHandle(request);
++                request_ = nullptr;
++            }
++            WinHttpCloseHandle(connect);
++        };
++        if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
++            !WinHttpReceiveResponse(request, nullptr)) {
++            error = cancelled_ ? QString("已取消") : WinError(GetLastError());
++            finish();
++            return false;
++        }
++        DWORD status = 0, size = sizeof(status);
++        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
++                            &status, &size, WINHTTP_NO_HEADER_INDEX);
++        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
++            DWORD bytes = 0;
++            WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &bytes,
++                                WINHTTP_NO_HEADER_INDEX);
++            std::vector<wchar_t> location(bytes / sizeof(wchar_t) + 1, 0);
++            const bool ok = bytes && WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
++                                                         location.data(), &bytes, WINHTTP_NO_HEADER_INDEX);
++            finish();
++            if (!ok) {
++                error = "跳转地址缺失";
++                return false;
++            }
++            url = url.resolved(QUrl::fromEncoded(QString::fromWCharArray(location.data()).toUtf8()));
++            continue;
++        }
++        if (status != 200) {
++            error = QString("服务器返回 %1").arg(status);
++            finish();
++            return false;
++        }
++        qint64 total = -1;
++        wchar_t length[32] = {};
++        size = sizeof(length);
++        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, length, &size,
++                                WINHTTP_NO_HEADER_INDEX))
++            total = QString::fromWCharArray(length).toLongLong();
++        if (total > max_bytes) {
++            error = "文件比预期的大";
++            finish();
++            return false;
++        }
++        std::vector<char> buffer(64 * 1024);
++        qint64 received = 0;
++        for (;;) {
++            DWORD got = 0;
++            if (!WinHttpReadData(request, buffer.data(), (DWORD)buffer.size(), &got)) {
++                error = cancelled_ ? QString("已取消") : WinError(GetLastError());
++                finish();
++                return false;
++            }
++            if (got == 0) break;
++            received += got;
++            if (received > max_bytes) {
++                error = "文件比预期的大";
++                finish();
++                return false;
++            }
++            if (!sink(buffer.data(), got)) {
++                if (error.isEmpty()) error = "写文件失败（磁盘满了？）";
++                finish();
++                return false;
++            }
++            if (progress) progress(received, total);
++        }
++        finish();
++        if (total >= 0 && received != total) {
++            error = "下载不完整";
++            return false;
++        }
++        return true;
++    }
++    error = "跳转次数太多";
++    return false;
++}
++
++bool FetchLatest(Http &http, const QStringList &info_urls, const QString &product, Release &out, QString &error) {
++    QStringList errors;
++    for (const QString &url : info_urls) {
++        QByteArray body;
++        QString e;
++        if (http.Get(url, 256 * 1024, [&](const char *p, size_t n) { body.append(p, (qsizetype)n); return true; },
++                     nullptr, e) &&
++            ParseLatest(body, product, out, e))
++            return true;
++        if (http.cancelled()) {
++            error = "已取消";
++            return false;
++        }
++        errors << QUrl(url).host() + "：" + e;
++    }
++    error = errors.join("；");
++    return false;
++}
++
++bool DownloadRelease(Http &http, const Release &release, const QString &dest, const Progress &progress,
++                     QString &error) {
++    QStringList errors;
++    const QString part = dest + ".part";
++    QDir().mkpath(QFileInfo(dest).absolutePath());
++    for (const QString &url : release.urls) {
++        QFile file(part);
++        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++            error = "不能写文件：" + QDir::toNativeSeparators(part);
++            return false;
++        }
++        QCryptographicHash hash(QCryptographicHash::Sha256);
++        QString e;
++        bool ok = http.Get(url, release.size,
++                           [&](const char *p, size_t n) {
++                               hash.addData(QByteArrayView(p, (qsizetype)n));
++                               return file.write(p, (qint64)n) == (qint64)n;
++                           },
++                           progress, e);
++        file.close();
++        if (ok && file.size() != release.size) ok = false, e = "文件大小不对";
++        if (ok && QString::fromLatin1(hash.result().toHex()) != release.sha256) ok = false, e = "SHA256 不对";
++        if (ok) {
++            QFile::remove(dest);
++            if (QFile::rename(part, dest)) {
++                error = errors.join("；"); // addresses that failed before this one (for the log)
++                return true;
++            }
++            e = "不能改文件名";
++        }
++        QFile::remove(part);
++        if (http.cancelled()) {
++            error = "已取消";
++            return false;
++        }
++        errors << QUrl(url).host() + "：" + e;
++    }
++    error = errors.join("；");
++    return false;
++}
++
++} // namespace lsfupdate
+diff --git a/src/update-check.hpp b/src/update-check.hpp
+new file mode 100644
+index 0000000..6697e63
+--- /dev/null
++++ b/src/update-check.hpp
+@@ -0,0 +1,78 @@
++#pragma once
++
++// Update check shared by the OBS plugin and 直播消音 (the standalone program compiles this file from
++// the plugin sources, like streaming-apps.cpp): reads update/latest.json from the public
++// repositories and downloads the installer it names. Qt Core (JSON, SHA256) and WinHTTP only, no Qt
++// Network, so the plugin needs nothing new. Every call blocks; run them on a worker thread and use
++// Http::Cancel from another thread to stop. Nothing is uploaded: plain GET requests only.
++//
++// latest.json (format 1; unknown fields are ignored, so new fields can be added without breaking
++// programs already out there):
++//   {"format": 1,
++//    "lite":   {"version": "0.11.0", "notes": "…", "page": "https://…/releases/tag/v0.11.0",
++//               "file": "LiveSpeechFilter-0.11.0-Update-Windows-x64.exe", "size": 15888103,
++//               "sha256": "<64 hex>", "urls": ["https://gitee.com/…", "https://github.com/…"]},
++//    "plugin": {…same fields…}}
++
++#include <QByteArray>
++#include <QString>
++#include <QStringList>
++#include <QUrl>
++
++#include <atomic>
++#include <functional>
++#include <mutex>
++
++namespace lsfupdate {
++
++struct Release {
++    QString version, notes, page, file, sha256;
++    qint64 size = 0;
++    QStringList urls;
++};
++
++using Progress = std::function<void(qint64 received, qint64 total)>; // total -1 when unknown
++
++// Compares dotted numeric versions ("0.10.3" < "0.11.0"); missing parts count as 0.
++int CompareVersions(const QString &a, const QString &b);
++
++// HTTPS to the repository hosts and the hosts their downloads redirect to (checked on every redirect).
++bool HostAllowed(const QUrl &url);
++
++// The built-in addresses of latest.json, in the order they are tried.
++QStringList InfoUrls();
++
++// Reads one product ("lite" / "plugin") from latest.json. false when the format is not 1 or the entry
++// is incomplete or unsafe (bad file name, hash, size or address).
++bool ParseLatest(const QByteArray &json, const QString &product, Release &out, QString &error);
++
++class Http {
++public:
++    explicit Http(const QString &user_agent);
++    ~Http();
++    Http(const Http &) = delete;
++    Http &operator=(const Http &) = delete;
++
++    // GET, following up to 8 redirects itself so each target is checked with HostAllowed. `sink`
++    // gets the body in pieces and returns false to stop. Fails above max_bytes.
++    bool Get(const QString &url, qint64 max_bytes, const std::function<bool(const char *, size_t)> &sink,
++             const Progress &progress, QString &error);
++    void Cancel(); // any thread; every call after it fails
++    bool cancelled() const { return cancelled_.load(); }
++
++private:
++    void *session_ = nullptr;
++    void *request_ = nullptr; // the request being read, closed by Cancel
++    std::mutex mutex_;
++    std::atomic<bool> cancelled_{false};
++};
++
++// Tries the info addresses in order; the first that gives a valid entry wins.
++bool FetchLatest(Http &http, const QStringList &info_urls, const QString &product, Release &out, QString &error);
++
++// Downloads the release to `dest` (via dest + ".part"), trying its addresses in order; succeeds only when
++// size and SHA256 both match. On success `error` lists the addresses that failed first (empty if none).
++bool DownloadRelease(Http &http, const Release &release, const QString &dest, const Progress &progress,
++                     QString &error);
++
++} // namespace lsfupdate
+-- 
+2.55.0.windows.5
+

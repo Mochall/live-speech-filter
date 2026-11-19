@@ -9,25 +9,39 @@
 ;
 ; Payload: python tools/build-lite-payload.py <version> (after a Release build).
 ;   ISCC installer-lite.iss
+; Without the recognition model (the program downloads 推荐 on its 识别模型 page, ~130 MB):
+;   python tools/build-lite-payload.py <version> --no-model     then  ISCC /DNoModel installer-lite.iss
+; This one keeps {app}\models of an earlier full installation (same model), so upgrading does not
+; make the user download it again.
 ; Test build: own AppId, no shortcuts, never touches the Windows autostart entry:
 ;   ISCC /DTest installer-lite.iss     then  setup.exe /DIR=<test folder> /VERYSILENT
 ;
 ; Settings, custom words, logs and downloaded models live in %APPDATA%\LiveSpeechFilter and are
 ; kept on uninstall. The uninstaller removes the "start with Windows" entry only when it points
 ; into this installation.
-#define Version "0.10.2"
-#define Payload "..\work\installer-payload-lite-" + Version
+#define Version "0.10.3"
+; WorkDir: the ignored work folder (ISCC /DWorkDir=... when building from a git worktree, which has none).
+#ifndef WorkDir
+#define WorkDir "..\work"
+#endif
+#ifdef NoModel
+#define Payload WorkDir + "\installer-payload-lite-" + Version + "-nomodel"
+#define Suffix "-NoModel"
+#else
+#define Payload WorkDir + "\installer-payload-lite-" + Version
+#define Suffix ""
+#endif
 #define ExeName "LiveSpeechFilter.exe"
 
 [Setup]
 #ifdef Test
 AppId=LiveSpeechFilterInstallerTest
 AppName=直播消音（安装程序测试）
-OutputBaseFilename=LiveSpeechFilter-{#Version}-INSTALLER-TEST
+OutputBaseFilename=LiveSpeechFilter-{#Version}{#Suffix}-INSTALLER-TEST
 #else
 AppId=LiveSpeechFilter
 AppName=直播消音
-OutputBaseFilename=LiveSpeechFilter-{#Version}-Windows-x64
+OutputBaseFilename=LiveSpeechFilter-{#Version}{#Suffix}-Windows-x64
 #endif
 AppVersion={#Version}
 AppVerName=直播消音 {#Version}
@@ -44,7 +58,7 @@ DisableDirPage=auto
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.19041
-OutputDir=..\work\installer-output
+OutputDir={#WorkDir}\installer-output
 Compression=lzma2/max
 SolidCompression=yes
 ; The program creates this mutex; setup and uninstall ask to quit it first (right-click the tray
@@ -75,7 +89,9 @@ Name: vbcable; Description: "安装 VB-CABLE 虚拟声卡（必需。VB-Audio �
 ; An older version in the same folder: remove its program files first so no stale DLL, model or
 ; plugin stays behind. User settings are elsewhere (%APPDATA%) and are not touched.
 Type: filesandordirs; Name: "{app}\data"
+#ifndef NoModel
 Type: filesandordirs; Name: "{app}\models"
+#endif
 Type: filesandordirs; Name: "{app}\licenses"
 Type: filesandordirs; Name: "{app}\platforms"
 Type: filesandordirs; Name: "{app}\styles"

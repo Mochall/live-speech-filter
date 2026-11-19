@@ -1,0 +1,881 @@
+From 00d4529ff1b031a01645f76e490fe2e6659bb8c8 Mon Sep 17 00:00:00 2001
+From: "live-speech-filter (local)" <local@live-speech-filter.invalid>
+Date: Thu, 19 Nov 2026 08:14:16 -0700
+Subject: [PATCH] =?UTF-8?q?=E5=8F=8C=E6=9C=BA=20sub-option=20in=20companio?=
+ =?UTF-8?q?n=20mode:=20monitoring=20into=20the=20capture=20card's=20playba?=
+ =?UTF-8?q?ck=20device,=20no=20virtual=20camera/VB-CABLE/streaming=20app?=
+ =?UTF-8?q?=20checks;=20warns=20when=20the=20Windows=20default=20device=20?=
+ =?UTF-8?q?is=20the=20card=20or=20other=20programs=20play=20to=20it;=20hin?=
+ =?UTF-8?q?t=20in=20direct=20mode?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/companion-audio.cpp | 105 ++++++++++++++++++----
+ src/companion-audio.hpp |  21 +++--
+ src/plugin-config.cpp   | 187 +++++++++++++++++++++++++++++++++++++---
+ src/plugin-config.hpp   |  15 ++++
+ src/plugin-main.cpp     | 167 +++++++++++++++++++++++++++++++----
+ 5 files changed, 447 insertions(+), 48 deletions(-)
+
+diff --git a/src/companion-audio.cpp b/src/companion-audio.cpp
+index 163c29b..3cc0544 100644
+--- a/src/companion-audio.cpp
++++ b/src/companion-audio.cpp
+@@ -122,9 +122,16 @@ Endpoint default_render(IMMDeviceEnumerator *e, ERole role) {
+ std::mutex remembered_mutex;
+ std::wstring remembered_id;
+ 
++std::wstring widen(const std::string &s) {
++    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
++    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
++    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
++    return w;
++}
++
+ } // namespace
+ 
+-CompanionAudioState QueryCompanionAudio() {
++CompanionAudioState QueryCompanionAudio(const std::string &target_id) {
+     CompanionAudioState st;
+     st.supported = true;
+     ComScope com;
+@@ -140,12 +147,21 @@ CompanionAudioState QueryCompanionAudio() {
+             st.cable_name = ep.name;
+         }
+     }
++    const std::wstring target = widen(target_id);
++    if (!target.empty())
++        for (auto &ep : render_endpoints(e))
++            if (ep.id == target) {
++                st.target_found = true;
++                st.target_name = ep.name;
++            }
+     Endpoint console = default_render(e, eConsole);
+     Endpoint comm = default_render(e, eCommunications);
+     st.console_name = console.name;
+     st.console_is_cable = is_cable_name(console.name);
+     st.communications_is_cable = is_cable_name(comm.name);
+-    if (!console.id.empty() && !st.console_is_cable) {
++    st.console_is_target = !target.empty() && console.id == target;
++    st.communications_is_target = !target.empty() && comm.id == target;
++    if (!console.id.empty() && !st.console_is_cable && !st.console_is_target) {
+         std::lock_guard<std::mutex> lock(remembered_mutex);
+         remembered_id = console.id;
+     }
+@@ -153,7 +169,10 @@ CompanionAudioState QueryCompanionAudio() {
+     return st;
+ }
+ 
+-bool RestoreDefaultPlayback(std::string &message) {
++bool RestoreDefaultPlayback(std::string &message, const std::string &target_id) {
++    const std::wstring target = widen(target_id);
++    // A default that carries the broadcast: the cable, or the 双机 capture card.
++    auto carries = [&](const Endpoint &ep) { return is_cable_name(ep.name) || (!target.empty() && ep.id == target); };
+     ComScope com;
+     IMMDeviceEnumerator *e = nullptr;
+     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&e)))) {
+@@ -164,24 +183,24 @@ bool RestoreDefaultPlayback(std::string &message) {
+     Endpoint console = default_render(e, eConsole);
+     Endpoint comm = default_render(e, eCommunications);
+     e->Release();
+-    bool fix_console = is_cable_name(console.name), fix_comm = is_cable_name(comm.name);
++    bool fix_console = carries(console), fix_comm = carries(comm);
+     if (!fix_console && !fix_comm) {
+-        message = "默认播放设备不是CABLE，无需修复";
++        message = target.empty() ? "默认播放设备不是CABLE，无需修复" : "默认播放设备不是CABLE或采集卡，无需修复";
+         return true;
+     }
+-    // Target: remembered previous default, else current console default, else first real device.
+-    const Endpoint *target = nullptr;
++    // Remembered previous default, else current console default, else first real device.
+     std::wstring wanted;
+     {
+         std::lock_guard<std::mutex> lock(remembered_mutex);
+         wanted = remembered_id;
+     }
+     if (!fix_console) wanted = console.id;
++    const Endpoint *to = nullptr;
+     for (auto &ep : endpoints)
+-        if (ep.id == wanted && !is_cable_name(ep.name)) target = &ep;
++        if (ep.id == wanted && !carries(ep)) to = &ep;
+     for (auto &ep : endpoints)
+-        if (!target && !is_virtual_name(ep.name)) target = &ep;
+-    if (!target) {
++        if (!to && !is_virtual_name(ep.name) && !carries(ep)) to = &ep;
++    if (!to) {
+         message = "没有找到可用的真实扬声器或耳机";
+         return false;
+     }
+@@ -193,13 +212,13 @@ bool RestoreDefaultPlayback(std::string &message) {
+     }
+     bool ok = true;
+     if (fix_console) {
+-        ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eConsole));
+-        ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eMultimedia));
++        ok &= SUCCEEDED(policy->SetDefaultEndpoint(to->id.c_str(), eConsole));
++        ok &= SUCCEEDED(policy->SetDefaultEndpoint(to->id.c_str(), eMultimedia));
+     }
+-    if (fix_comm) ok &= SUCCEEDED(policy->SetDefaultEndpoint(target->id.c_str(), eCommunications));
++    if (fix_comm) ok &= SUCCEEDED(policy->SetDefaultEndpoint(to->id.c_str(), eCommunications));
+     policy->Release();
+     message = ok ? std::string("已把Windows默认") + (fix_console && fix_comm ? "播放和通信" : fix_console ? "播放" : "通信") +
+-                       "设备改为：" + target->name
++                       "设备改为：" + to->name
+                  : "修改Windows默认设备失败，请在“声音设置”里手动改回";
+     return ok;
+ }
+@@ -269,6 +288,58 @@ std::vector<VoiceApp> ActiveVoiceApps() {
+     return found;
+ }
+ 
++std::vector<std::string> OtherProgramsPlayingTo(const std::string &device_id) {
++    std::vector<std::string> out;
++    if (device_id.empty()) return out;
++    ComScope com;
++    IMMDeviceEnumerator *e = nullptr;
++    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&e)))) return out;
++    IMMDevice *d = nullptr;
++    IAudioSessionManager2 *mgr = nullptr;
++    IAudioSessionEnumerator *sessions = nullptr;
++    const DWORD self = GetCurrentProcessId();
++    if (SUCCEEDED(e->GetDevice(widen(device_id).c_str(), &d)) &&
++        SUCCEEDED(d->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&mgr))) &&
++        SUCCEEDED(mgr->GetSessionEnumerator(&sessions))) {
++        int n = 0;
++        sessions->GetCount(&n);
++        for (int j = 0; j < n; ++j) {
++            IAudioSessionControl *ctl = nullptr;
++            IAudioSessionControl2 *ctl2 = nullptr;
++            AudioSessionState state;
++            DWORD pid = 0;
++            if (SUCCEEDED(sessions->GetSession(j, &ctl)) &&
++                SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), reinterpret_cast<void **>(&ctl2))) &&
++                SUCCEEDED(ctl2->GetState(&state)) && state == AudioSessionStateActive &&
++                SUCCEEDED(ctl2->GetProcessId(&pid)) && pid && pid != self) {
++                std::string exe;
++                if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
++                    wchar_t path[MAX_PATH];
++                    DWORD size = MAX_PATH;
++                    if (QueryFullProcessImageNameW(h, 0, path, &size)) {
++                        exe = utf8(path);
++                        auto slash = exe.find_last_of("\\/");
++                        if (slash != std::string::npos) exe = exe.substr(slash + 1);
++                        for (char &c : exe) c = (char)tolower((unsigned char)c);
++                    }
++                    CloseHandle(h);
++                }
++                if (exe.empty()) exe = "进程 " + std::to_string(pid);
++                bool dup = false;
++                for (auto &o : out) dup |= o == exe;
++                if (!dup) out.push_back(exe);
++            }
++            if (ctl2) ctl2->Release();
++            if (ctl) ctl->Release();
++        }
++    }
++    if (sessions) sessions->Release();
++    if (mgr) mgr->Release();
++    if (d) d->Release();
++    e->Release();
++    return out;
++}
++
+ namespace {
+ struct CableEndpoint {
+     std::wstring id;
+@@ -395,9 +466,11 @@ bool SetCableRenderEnabled(bool) { return false; }
+ 
+ std::vector<VoiceApp> ActiveVoiceApps() { return {}; }
+ 
+-CompanionAudioState QueryCompanionAudio() { return {}; }
++CompanionAudioState QueryCompanionAudio(const std::string &) { return {}; }
++
++std::vector<std::string> OtherProgramsPlayingTo(const std::string &) { return {}; }
+ 
+-bool RestoreDefaultPlayback(std::string &message) {
++bool RestoreDefaultPlayback(std::string &message, const std::string &) {
+     message = "仅支持Windows";
+     return false;
+ }
+diff --git a/src/companion-audio.hpp b/src/companion-audio.hpp
+index 7966f05..0c1f82d 100644
+--- a/src/companion-audio.hpp
++++ b/src/companion-audio.hpp
+@@ -16,15 +16,26 @@ struct CompanionAudioState {
+     bool console_is_cable = false;        // default playback device (console/multimedia)
+     bool communications_is_cable = false; // default communications playback device
+     std::string console_name;             // current default playback device name
++    // Only with a target id (双机: the capture card's playback device that OBS monitors into).
++    bool target_found = false;            // the target is an active playback device
++    std::string target_name;
++    bool console_is_target = false;
++    bool communications_is_target = false;
+ };
+ 
+ // Reads the playback endpoints and default devices (cheap; call from the UI thread).
+-CompanionAudioState QueryCompanionAudio();
++// `target_id`: a playback endpoint that, like the cable, carries the broadcast (双机).
++CompanionAudioState QueryCompanionAudio(const std::string &target_id = std::string());
+ 
+-// Moves every default playback role that points at the cable back to a real device:
+-// the remembered previous default, else the console default, else the first active
+-// non-virtual playback device. Returns false and a reason when nothing could be set.
+-bool RestoreDefaultPlayback(std::string &message);
++// Moves every default playback role that points at the cable (or at `target_id`) back to a
++// real device: the remembered previous default, else the console default, else the first
++// active non-virtual playback device that is not the target. Returns false and a reason when
++// nothing could be set.
++bool RestoreDefaultPlayback(std::string &message, const std::string &target_id = std::string());
++
++// Executables (lower-case names, or "进程 <pid>") of other processes with an active audio
++// session on the playback endpoint `device_id`; the calling process is left out.
++std::vector<std::string> OtherProgramsPlayingTo(const std::string &device_id);
+ 
+ // Known voice chat programs (KOOK, YY, Discord, TeamSpeak) that currently have an active
+ // audio session on a playback device. Voice programs keep the session active while
+diff --git a/src/plugin-config.cpp b/src/plugin-config.cpp
+index 9fe0012..9a2e8e1 100644
+--- a/src/plugin-config.cpp
++++ b/src/plugin-config.cpp
+@@ -304,6 +304,10 @@ void GlobalConfig::Save() {
+         obs_data_set_bool(data, "auto_filter_microphones", auto_filter_microphones);
+         obs_data_set_bool(data, "companion_mode", companion_mode);
+         obs_data_set_bool(data, "companion_confirmed", companion_confirmed);
++        obs_data_set_bool(data, "companion_remote", companion_remote);
++        obs_data_set_string(data, "remote_output_id", remote_output_id.c_str());
++        obs_data_set_string(data, "remote_output_name", remote_output_name.c_str());
++        obs_data_set_bool(data, "remote_confirmed", remote_confirmed);
+         obs_data_set_int(data, "voice_source", voice_source);
+         obs_data_set_bool(data, "cable_auto_disable", cable_auto_disable);
+         obs_data_set_bool(data, "delay_follows_padding", delay_follows_padding);
+@@ -476,6 +480,10 @@ void GlobalConfig::Load() {
+         }
+         companion_mode = obs_data_get_bool(data, "companion_mode");
+         companion_confirmed = obs_data_get_bool(data, "companion_confirmed");
++        companion_remote = obs_data_get_bool(data, "companion_remote");
++        remote_output_id = obs_data_get_string(data, "remote_output_id");
++        remote_output_name = obs_data_get_string(data, "remote_output_name");
++        remote_confirmed = obs_data_get_bool(data, "remote_confirmed");
+         voice_source = (int)obs_data_get_int(data, "voice_source");
+         if (voice_source < 0 || voice_source > 2) voice_source = 0;
+         if (obs_data_has_user_value(data, "cable_auto_disable"))
+@@ -681,16 +689,47 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     QVBoxLayout *layoutCompanion = new QVBoxLayout(grpCompanion);
+     comboBroadcastMode = new QComboBox();
+     comboBroadcastMode->addItem("OBS 直接推流（B站、虎牙、斗鱼等有推流码的平台）", 0);
+-    comboBroadcastMode->addItem("直播伴侣类推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼；画面走虚拟摄像头，声音走 VB-CABLE）", 1);
++    comboBroadcastMode->addItem("直播伴侣类推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼；也包括双机推流）", 1);
+     comboBroadcastMode->setToolTip("选这一项时插件会：启动虚拟摄像头；把 OBS 监听设备设为 CABLE Input；把参与直播的音源设为“监听并输出”；\n"
+                                    "持续检查 Windows 默认播放设备，如果是 CABLE（其他程序的原声会绕过消音进入直播）就在状态栏提醒；\n"
+                                    "检查推流软件（抖音直播伴侣、直播姬、虎牙、斗鱼）实际在录的麦克风和保存的声音设置，发现它采集了系统声音、真实麦克风或程序声音时提醒。\n"
+-                                   "改回 OBS 直接推流时恢复插件改过的监听设置。需要先安装 VB-CABLE。");
++                                   "改回 OBS 直接推流时恢复插件改过的监听设置。需要先安装 VB-CABLE。\n"
++                                   "推流软件在另一台电脑（双机推流，经采集卡）时：不用虚拟摄像头和 VB-CABLE，OBS 监听设备设为采集卡的播放设备。");
+     {
+         QFormLayout *form = new QFormLayout();
+         form->addRow("开播方式：", comboBroadcastMode);
+         layoutCompanion->addLayout(form);
+     }
++    companionWhereBox = new QWidget();
++    {
++        QFormLayout *form = new QFormLayout(companionWhereBox);
++        form->setContentsMargins(0, 0, 0, 0);
++        comboCompanionWhere = new QComboBox();
++        comboCompanionWhere->addItem("这台电脑（画面走虚拟摄像头，声音走 VB-CABLE）", 0);
++        comboCompanionWhere->addItem("另一台电脑（双机推流，这台电脑经采集卡送画面和声音）", 1);
++        comboCompanionWhere->setToolTip("双机推流：游戏电脑运行 OBS 和本插件，画面和消音后的声音经采集卡送到直播机，直播机上的推流软件开播。\n"
++                                        "插件把 OBS 监听设备设为采集卡的播放设备，参与直播的音源设为“监听并输出”；\n"
++                                        "检查 Windows 默认播放设备不是采集卡、没有别的程序往采集卡放声音。直播机上的设置插件看不到，请按“直播机设置清单”完成。");
++        form->addRow("推流软件在：", comboCompanionWhere);
++    }
++    layoutCompanion->addWidget(companionWhereBox);
++    remoteDeviceBox = new QWidget();
++    {
++        QHBoxLayout *row = new QHBoxLayout(remoteDeviceBox);
++        row->setContentsMargins(0, 0, 0, 0);
++        comboRemoteDevice = new QComboBox();
++        comboRemoteDevice->setToolTip("游戏电脑连采集卡的那个播放设备，一般是 HDMI 显示器的声音（如 NVIDIA/AMD High Definition Audio 或采集卡的名字）。\n"
++                                      "消音后的声音经它送到直播机。不要选耳机或扬声器。");
++        QPushButton *btnRefresh = new QPushButton("刷新");
++        connect(btnRefresh, &QPushButton::clicked, this, [this] {
++            fillRemoteDevices(comboRemoteDevice->currentData().toString(), comboRemoteDevice->currentText());
++            updateCompanionUI();
++        });
++        row->addWidget(new QLabel("采集卡的播放设备："));
++        row->addWidget(comboRemoteDevice, 1);
++        row->addWidget(btnRefresh);
++    }
++    layoutCompanion->addWidget(remoteDeviceBox);
+     lblCompanion = new QLabel();
+     lblCompanion->setWordWrap(true);
+     lblCompanion->setTextFormat(Qt::RichText);
+@@ -705,10 +744,10 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+                                     "推流软件里选的麦克风 CABLE Output 不受影响。自己另有用途需要 VB-CABLE 时取消勾选。");
+     layoutCompanionDetails->addWidget(chkCableAutoDisable);
+     QPushButton *btnFixDefaults = new QPushButton("修复 Windows 默认播放设备");
+-    btnFixDefaults->setToolTip("如果 Windows 默认播放设备或默认通信设备被设成了 CABLE，改回真实的扬声器或耳机。");
++    btnFixDefaults->setToolTip("如果 Windows 默认播放设备或默认通信设备被设成了 CABLE（双机推流时：采集卡），改回真实的扬声器或耳机。");
+     connect(btnFixDefaults, &QPushButton::clicked, this, [this] {
+         std::string message;
+-        bool ok = RestoreDefaultPlayback(message);
++        bool ok = RestoreDefaultPlayback(message, remoteSelected() ? comboRemoteDevice->currentData().toString().toStdString() : std::string());
+         blog(LOG_INFO, "[语音消音] restore default playback: %s", message.c_str());
+         if (ok) QMessageBox::information(this, "默认播放设备", QString::fromStdString(message));
+         else QMessageBox::warning(this, "默认播放设备", QString::fromStdString(message));
+@@ -717,10 +756,11 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     btnInstallCable = new QPushButton(BundledCablePack().isEmpty() ? "下载安装 VB-CABLE…" : "安装 VB-CABLE…");
+     btnInstallCable->setToolTip("用插件自带的 VB-Audio 原版安装包安装（没有时打开官网下载页）。直播伴侣模式需要它把消音后的声音送进推流软件。");
+     connect(btnInstallCable, &QPushButton::clicked, this, [this] { openCableDownload(); });
+-    QPushButton *btnChecklist = new QPushButton("推流软件设置清单…");
++    btnChecklist = new QPushButton("推流软件设置清单…");
+     btnChecklist->setToolTip("推流软件里需要手动完成的三项设置。");
+     connect(btnChecklist, &QPushButton::clicked, this, [this] {
+-        showCompanionChecklist();
++        if (remoteSelected()) showRemoteChecklist();
++        else showCompanionChecklist();
+         updateCompanionUI();
+     });
+     QHBoxLayout *companionButtons = new QHBoxLayout();
+@@ -731,6 +771,8 @@ ConfigDialog::ConfigDialog(QWidget *parent) : QDialog(parent) {
+     layoutCompanionDetails->addLayout(companionButtons);
+     layoutCompanion->addWidget(companionDetails);
+     connect(comboBroadcastMode, &QComboBox::currentIndexChanged, this, [this] { updateCompanionUI(); });
++    connect(comboCompanionWhere, &QComboBox::currentIndexChanged, this, [this] { updateCompanionUI(); });
++    connect(comboRemoteDevice, &QComboBox::currentIndexChanged, this, [this] { updateCompanionUI(); });
+     containerLayout->addWidget(grpCompanion);
+ 
+     // 2. Which sounds get censored, and whether the current scene is set up for it
+@@ -1108,6 +1150,8 @@ void ConfigDialog::LoadToUI() {
+     }
+     chkAutoFilterMic->setChecked(cfg->auto_filter_microphones);
+     comboBroadcastMode->setCurrentIndex(cfg->companion_mode ? 1 : 0);
++    comboCompanionWhere->setCurrentIndex(cfg->companion_remote ? 1 : 0);
++    fillRemoteDevices(QString::fromStdString(cfg->remote_output_id), QString::fromStdString(cfg->remote_output_name));
+     comboVoiceSource->setCurrentIndex(comboVoiceSource->findData(cfg->voice_source));
+     chkCableAutoDisable->setChecked(cfg->cable_auto_disable);
+     updateCompanionUI();
+@@ -1464,10 +1508,12 @@ bool ConfigDialog::onApply() {
+     GlobalConfig *cfg = GetGlobalConfig();
+     
+     bool old_companion;
++    bool old_remote;
+     bool old_cable_auto_disable;
+     {
+         lock_guard<std::mutex> lock(cfg->mutex);
+         old_companion = cfg->companion_mode;
++        old_remote = cfg->companion_remote;
+         old_cable_auto_disable = cfg->cable_auto_disable;
+         
+         cfg->global_enable = chkGlobalEnable->isChecked();
+@@ -1485,6 +1531,10 @@ bool ConfigDialog::onApply() {
+         cfg->sync_mode = comboSyncMode->currentData().toInt();
+         cfg->auto_filter_microphones = chkAutoFilterMic->isChecked();
+         cfg->companion_mode = comboBroadcastMode->currentData().toInt() == 1;
++        cfg->companion_remote = comboCompanionWhere->currentData().toInt() == 1;
++        cfg->remote_output_id = comboRemoteDevice->currentData().toString().toStdString();
++        cfg->remote_output_name = cfg->remote_output_id.empty() ? std::string()
++                                  : comboRemoteDevice->currentData(Qt::UserRole + 1).toString().toStdString();
+         cfg->voice_source = comboVoiceSource->currentData().toInt();
+         cfg->cable_auto_disable = chkCableAutoDisable->isChecked();
+         cfg->delay_follows_padding = chkDelayAuto->isChecked();
+@@ -1494,7 +1544,12 @@ bool ConfigDialog::onApply() {
+     cfg->Save();
+ 
+     // Apply state change ONLY if switch toggled
+-    if (cfg->companion_mode && !old_companion) {
++    bool remote_now = cfg->companion_mode && cfg->companion_remote;
++    if (remote_now && !(old_companion && old_remote)) {
++        // 双机: the default device is not changed automatically (see maintain_companion);
++        // the computer that streams is set up by hand.
++        showRemoteChecklist();
++    } else if (cfg->companion_mode && !remote_now && !(old_companion && !old_remote)) {
+         // Turning the mode on fixes a cable default device right away (the VB-CABLE
+         // installer or Windows often makes the cable the default communications device).
+         auto st = QueryCompanionAudio();
+@@ -1607,6 +1662,70 @@ void ConfigDialog::openCableDownload() {
+     }
+ }
+ 
++// Capture card playback devices as OBS lists them for monitoring (same ids), without the
++// cable. A saved device that is gone stays selectable so the setting is not lost.
++void ConfigDialog::fillRemoteDevices(const QString &keep_id, const QString &keep_name) {
++    QSignalBlocker block(comboRemoteDevice);
++    comboRemoteDevice->clear();
++    comboRemoteDevice->addItem("（请选择）", QString());
++    std::vector<std::pair<std::string, std::string>> devices;
++    obs_enum_audio_monitoring_devices(
++        [](void *p, const char *name, const char *id) {
++            if (name && id && !IsCableEndpointName(name))
++                static_cast<std::vector<std::pair<std::string, std::string>> *>(p)->push_back({name, id});
++            return true;
++        },
++        &devices);
++    int selected = 0;
++    for (auto &d : devices) {
++        comboRemoteDevice->addItem(QString::fromStdString(d.first), QString::fromStdString(d.second));
++        comboRemoteDevice->setItemData(comboRemoteDevice->count() - 1, QString::fromStdString(d.first), Qt::UserRole + 1);
++        if (!keep_id.isEmpty() && keep_id == QString::fromStdString(d.second)) selected = comboRemoteDevice->count() - 1;
++    }
++    if (!keep_id.isEmpty() && !selected) {
++        QString name = keep_name;
++        if (name.endsWith("（未找到）")) name.chop(QString("（未找到）").size());
++        comboRemoteDevice->addItem(name + "（未找到）", keep_id);
++        comboRemoteDevice->setItemData(comboRemoteDevice->count() - 1, name, Qt::UserRole + 1);
++        selected = comboRemoteDevice->count() - 1;
++    }
++    comboRemoteDevice->setCurrentIndex(selected);
++}
++
++bool ConfigDialog::remoteSelected() const {
++    return comboBroadcastMode->currentData().toInt() == 1 && comboCompanionWhere->currentData().toInt() == 1;
++}
++
++// 双机: the streaming computer is not visible to the plugin at all.
++bool ConfigDialog::showRemoteChecklist() {
++    QMessageBox box(this);
++    box.setWindowTitle("直播机设置清单");
++    box.setIcon(QMessageBox::Information);
++    box.setText("双机推流时插件只能检查这台游戏电脑。请完成以下设置：");
++    box.setInformativeText(
++        "直播机（推流的电脑）：\n"
++        "① 推流软件添加采集卡素材，画面和声音都用采集卡的\n"
++        "② 关闭推流软件的“系统声音/桌面音频”，不要再添加直播机上的麦克风（麦克风接在游戏电脑，经 OBS 消音）\n\n"
++        "游戏电脑（这台）：\n"
++        "③ 在采集卡对应的屏幕上打开 OBS 的“全屏投影（节目）”，直播机收到的才是经过画面同步的节目画面\n"
++        "④ Windows 默认播放设备、语音软件（KOOK 等）的输出设备都选耳机或扬声器，不要选采集卡\n\n"
++        "否则麦克风、队友语音的原声会绕过消音直接进入直播。\n"
++        "第④项和采集卡是否连好插件会自动检查；直播机上的设置和采集卡实际收到的声音插件看不到，开播前请在直播机上试听一次。");
++    QPushButton *done = box.addButton("我已完成", QMessageBox::AcceptRole);
++    box.addButton("稍后", QMessageBox::RejectRole);
++    box.exec();
++    bool confirmed = box.clickedButton() == done;
++    GlobalConfig *cfg = GetGlobalConfig();
++    if (cfg && confirmed) {
++        {
++            lock_guard<std::mutex> lock(cfg->mutex);
++            cfg->remote_confirmed = true;
++        }
++        cfg->Save();
++    }
++    return confirmed;
++}
++
+ // Checklist for the companion app side, which the plugin cannot configure. Confirming
+ // clears the status-bar reminder; settings it can read are still checked every few seconds.
+ bool ConfigDialog::showCompanionChecklist() {
+@@ -1664,18 +1783,64 @@ void ConfigDialog::onCheckAction(const QString &link) {
+ }
+ 
+ void ConfigDialog::updateCompanionUI() {
+-    auto st = QueryCompanionAudio();
++    const bool companion = comboBroadcastMode->currentData().toInt() == 1;
++    const bool remote = remoteSelected();
++    const std::string remote_id = comboRemoteDevice->currentData().toString().toStdString();
++    auto st = QueryCompanionAudio(remote ? remote_id : std::string());
+     std::string text;
+-    btnInstallCable->setVisible(comboBroadcastMode->currentData().toInt() == 1 && st.supported &&
++    companionWhereBox->setVisible(companion);
++    remoteDeviceBox->setVisible(remote);
++    chkCableAutoDisable->setVisible(!remote);
++    btnChecklist->setText(remote ? "直播机设置清单…" : "推流软件设置清单…");
++    btnChecklist->setToolTip(remote ? "直播机和游戏电脑上需要手动完成的设置。" : "推流软件里需要手动完成的三项设置。");
++    btnInstallCable->setVisible(companion && !remote && st.supported &&
+                                 GetCableRenderState() == CableRenderState::NotInstalled);
+-    if (comboBroadcastMode->currentData().toInt() != 1) {
+-        lblCompanion->setText(ColorCheckLines({"· OBS 自己推流，不需要 VB-CABLE，也不需要其他推流软件。"}));
++    if (!companion) {
++        lblCompanion->setText(ColorCheckLines({"· OBS 自己推流，不需要 VB-CABLE，也不需要其他推流软件。",
++                                               "· 双机推流（另一台电脑经采集卡推流）请选“直播伴侣类推流软件”，再选推流软件在“另一台电脑”。"}));
+         companionDetails->setVisible(false);
+         companionProblems = 0;
+         return;
+     }
+     companionDetails->setVisible(true);
+     int problem_count = 0;
++    if (remote) {
++        if (!st.supported) {
++            text = "✗ 双机推流模式只支持 Windows。";
++            ++problem_count;
++        } else if (remote_id.empty()) {
++            text = "✗ 请在上面选择采集卡的播放设备（游戏电脑连采集卡的 HDMI/显示器声音），消音后的声音经它送到直播机。";
++            ++problem_count;
++        } else if (!st.target_found) {
++            text = "✗ 找不到“" + comboRemoteDevice->currentData(Qt::UserRole + 1).toString().toStdString() +
++                   "”，直播机收不到声音 → 检查采集卡和线是否连好，再点“刷新”。";
++            ++problem_count;
++        } else {
++            text = "✓ OBS 监听设备会设为“" + st.target_name + "”，参与直播的音源经它和采集卡送到直播机。";
++            if (st.console_is_target || st.communications_is_target) {
++                text += std::string("\n✗ Windows 默认") + (st.console_is_target ? "播放" : "通信") +
++                        "设备是采集卡，所有程序的原声都会经采集卡进入直播 → 点下方“修复 Windows 默认播放设备”。";
++                ++problem_count;
++            }
++            auto others = OtherProgramsPlayingTo(remote_id);
++            if (!others.empty()) {
++                std::string list;
++                for (auto &o : others) list += (list.empty() ? "" : "、") + o;
++                text += "\n✗ 别的程序（" + list + "）也在往采集卡放声音，会不经消音进入直播 → 在这些程序里把输出设备改成耳机或扬声器。";
++                ++problem_count;
++            }
++            if (config_t *profile = obs_frontend_get_profile_config()) {
++                const char *prev = config_get_string(profile, "SpeechFilter", "PrevMonitoringDeviceName");
++                const char *prev_id = config_get_string(profile, "SpeechFilter", "PrevMonitoringDeviceId");
++                if (prev && *prev && prev_id && strcmp(prev_id, "default") != 0)
++                    text += std::string("\n· OBS 监听设备原来是“") + prev + "”，改回 OBS 直接推流时恢复。";
++            }
++        }
++        text += "\n· 直播机上的设置插件看不到 → 按“直播机设置清单…”完成，开播前在直播机上试听一次。";
++        companionProblems = problem_count;
++        lblCompanion->setText(ColorCheckLines(QString::fromStdString(text).split('\n')));
++        return;
++    }
+     if (!st.supported) text = "✗ 直播伴侣模式只支持 Windows。";
+     else if (!st.cable_found && GetCableRenderState() == CableRenderState::Disabled)
+         text = "· VB-CABLE 已安装，目前停用（不影响其他软件），应用本模式后插件会自动启用。";
+diff --git a/src/plugin-config.hpp b/src/plugin-config.hpp
+index 7ec230b..66825fa 100644
+--- a/src/plugin-config.hpp
++++ b/src/plugin-config.hpp
+@@ -80,6 +80,13 @@ struct GlobalConfig {
+     // OBS audio monitoring into VB-CABLE; guarded by checks in UpdateVideoDelayFiltersState.
+     bool companion_mode = false;
+     bool companion_confirmed = false; // user confirmed the companion-app checklist
++    // 双机: the streaming program runs on another computer that receives this one through a
++    // capture card. OBS monitoring then goes to the capture card's playback device (chosen by
++    // the user) instead of VB-CABLE; no virtual camera, no cable, no streaming program checks.
++    bool companion_remote = false;
++    std::string remote_output_id;   // OBS monitoring device id of the capture card
++    std::string remote_output_name;
++    bool remote_confirmed = false;  // user confirmed the checklist for the streaming computer
+     // Where teammates' voices come from, which decides how desktop audio and game sound
+     // must be set up: 0 = none (solo), 1 = voice chat program (KOOK…), 2 = in-game voice.
+     int voice_source = 0;
+@@ -167,6 +174,14 @@ private:
+     QCheckBox *chkAutoFilterMic;
+     QComboBox *comboBroadcastMode; // 0 = OBS streams itself, 1 = companion app
+     bool showCompanionChecklist();
++    bool showRemoteChecklist();
++    QComboBox *comboCompanionWhere; // 0 = this computer (VB-CABLE), 1 = another computer (capture card)
++    QComboBox *comboRemoteDevice;   // capture card playback device (OBS monitoring device id)
++    QWidget *companionWhereBox;
++    QWidget *remoteDeviceBox;
++    void fillRemoteDevices(const QString &keep_id, const QString &keep_name);
++    bool remoteSelected() const;
++    QPushButton *btnChecklist;
+     QLabel *lblCompanion;
+     QComboBox *comboVoiceSource;
+     QCheckBox *chkCableAutoDisable;
+diff --git a/src/plugin-main.cpp b/src/plugin-main.cpp
+index 2fa4f47..927774f 100644
+--- a/src/plugin-main.cpp
++++ b/src/plugin-main.cpp
+@@ -115,11 +115,12 @@ static void start_filter_warning() {
+             items = sync_warnings;
+         }
+         GlobalConfig *cfg = GetGlobalConfig();
+-        bool syncing = false, companion = false;
++        bool syncing = false, companion = false, remote = false;
+         if (cfg) {
+             std::lock_guard<std::mutex> lock(cfg->mutex);
+             syncing = cfg->global_enable && cfg->video_delay_enabled;
+             companion = cfg->companion_mode;
++            remote = cfg->companion_remote;
+         }
+         if (status.second.find("未生效") != std::string::npos) items.push_back({WARN_LEAK, status.second});
+         add_joined(items, WARN_LEAK, ProfanityFilter::GetRecognitionWarning());
+@@ -131,7 +132,8 @@ static void start_filter_warning() {
+                          [](const StatusItem &a, const StatusItem &b) { return a.level < b.level; });
+ 
+         std::string latency = GetViewerLatencyText();
+-        if (companion && !latency.empty()) latency += "；直播伴侣模式（虚拟摄像头+CABLE）";
++        if (companion && !latency.empty())
++            latency += remote ? "；双机推流（监听声音经采集卡送直播机）" : "；直播伴侣模式（虚拟摄像头+CABLE）";
+         QString main, suffix, color;
+         if (items.empty()) {
+             main = QString::fromStdString(latency.empty() ? std::string("语音消音已关闭") : latency);
+@@ -435,6 +437,10 @@ static CompanionAudioState companion_state;
+ // problems as status-bar lines (broken = the stream has no filtered voice).
+ static bool companion_app_readable = false;
+ static std::vector<std::pair<bool, std::string>> companion_app_problems;
++// 双机 (the streaming program on another computer, fed by a capture card): OBS monitors into
++// the capture card's playback device instead of the cable; other programs playing there.
++static bool companion_was_remote = false;
++static std::vector<std::string> remote_other_programs;
+ 
+ static int cable_tick = 0;
+ // Monitors opened while the cable was disabled (e.g. OBS started with it disabled) fail
+@@ -457,6 +463,20 @@ static void save_prev_monitoring(const char *name, const char *id) {
+     config_set_string(profile, kPrevSection, "PrevMonitoringDeviceId", id ? id : "");
+     config_save_safe(profile, "tmp", nullptr);
+ }
++// The capture card device that 双机 mode made the monitoring device (empty: none), so
++// turning the mode off restores only a device the plugin set, and never saves it as the
++// previous device.
++static std::string remote_set_monitoring() {
++    config_t *profile = obs_frontend_get_profile_config();
++    const char *v = profile ? config_get_string(profile, kPrevSection, "RemoteMonitoringDeviceId") : nullptr;
++    return v ? v : "";
++}
++static void save_remote_set_monitoring(const std::string &id) {
++    config_t *profile = obs_frontend_get_profile_config();
++    if (!profile) return;
++    config_set_string(profile, kPrevSection, "RemoteMonitoringDeviceId", id.c_str());
++    config_save_safe(profile, "tmp", nullptr);
++}
+ 
+ // Companion mode on: the cable playback side must be enabled. Off (and the option on):
+ // disabled, so Windows cannot fall back to it as a default device and other programs do
+@@ -618,7 +638,12 @@ static void unhook_mute_signals() {
+     mute_hooked.clear();
+ }
+ 
+-static void maintain_companion(const std::vector<obs_source_t *> &sources, bool on) {
++// `remote`: 双机, the streaming program runs on another computer and receives the sound
++// through a capture card whose playback device here is `remote_id` (chosen in the settings).
++// The plugin cannot see that computer; the virtual camera, VB-CABLE and the streaming
++// program checks are skipped, the monitoring device is the capture card instead.
++static void maintain_companion(const std::vector<obs_source_t *> &sources, bool on, bool remote,
++                               const std::string &remote_id, const std::string &remote_name) {
+     static bool first_tick = true;
+     bool first = first_tick;
+     first_tick = false;
+@@ -652,18 +677,75 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             }
+             const char *name = nullptr, *id = nullptr;
+             obs_get_audio_monitoring_device(&name, &id);
+-            if (name && IsCableEndpointName(name)) {
++            // The capture card is restored only when 双机 mode set it and a previous device
++            // was saved; a cable is always restored (no other use in this plugin's modes).
++            std::string remote_set = remote_set_monitoring();
++            bool ours_remote = !remote_set.empty() && id && remote_set == id && !prev_id.empty();
++            if ((name && IsCableEndpointName(name)) || ours_remote) {
+                 if (prev_id.empty()) set_monitoring_device("Default", "default");
+                 else set_monitoring_device(prev_name.c_str(), prev_id.c_str());
+                 blog(LOG_INFO, "[语音消音] monitoring device restored to %s",
+                      prev_id.empty() ? "Default" : prev_name.c_str());
+             }
+             if (!prev_id.empty()) save_prev_monitoring("", "");
++            if (!remote_set.empty()) save_remote_set_monitoring("");
+             blog(LOG_INFO, "[语音消音] companion mode off");
+         }
+         companion_was_on = false;
+         return;
+     }
++    if (companion_was_on && remote != companion_was_remote) {
++        blog(LOG_INFO, "[语音消音] companion mode: streaming program %s", remote ? "on another computer (capture card)" : "on this computer (VB-CABLE)");
++        companion_tick = 0;
++        companion_app_problems.clear();
++        companion_app_readable = false;
++        remote_other_programs.clear();
++    }
++    if (remote) {
++        if (!companion_was_on || companion_tick++ % 3 == 0) {
++            companion_state = QueryCompanionAudio(remote_id);
++            auto others = OtherProgramsPlayingTo(remote_id);
++            if (others != remote_other_programs && !others.empty()) {
++                std::string list;
++                for (auto &o : others) list += (list.empty() ? "" : ", ") + o;
++                blog(LOG_INFO, "[语音消音] dual PC: other programs playing to the capture card: %s", list.c_str());
++            }
++            remote_other_programs = others;
++        }
++        if (!companion_was_on || !companion_was_remote) blog(LOG_INFO, "[语音消音] companion mode on (dual PC, capture card %s)", remote_name.c_str());
++        companion_was_on = true;
++        companion_was_remote = true;
++        const auto &st = companion_state;
++        if (!st.supported) {
++            add_warning(WARN_BROKEN, "双机推流模式仅支持Windows");
++            return;
++        }
++        if (remote_id.empty()) {
++            add_warning(WARN_BROKEN, "双机推流：请在插件设置里选择采集卡的播放设备，否则直播机收不到消音后的声音");
++            return;
++        }
++        if (!st.target_found) {
++            // Monitors opened while the device was gone fail and are not reopened by OBS.
++            cable_reinit_pending = true;
++            add_warning(WARN_BROKEN, "双机推流：找不到采集卡的播放设备“" + remote_name + "”，直播机收不到声音（检查采集卡和线是否连好）");
++            return;
++        }
++        const char *name = nullptr, *id = nullptr;
++        obs_get_audio_monitoring_device(&name, &id);
++        if (!id || remote_id != id) {
++            std::string remote_set = remote_set_monitoring();
++            // Never remember the cable or the capture card itself as the device to restore.
++            if (!(name && IsCableEndpointName(name)) && !(id && remote_set == id)) {
++                save_prev_monitoring(name, id);
++                if (id && strcmp(id, "default") != 0 && name) {
++                    cable_notice = std::string("双机推流：OBS监听设备已从“") + name + "”改为采集卡，改回OBS直接推流时恢复";
++                    cable_notice_ticks = 10;
++                }
++            }
++            set_monitoring_device(st.target_name.c_str(), remote_id.c_str());
++            save_remote_set_monitoring(remote_id);
++        }
++    } else {
+     if (!companion_was_on || companion_tick++ % 3 == 0) {
+         companion_state = QueryCompanionAudio();
+         StreamingReport report = CheckStreamingApps("CABLE Output", true);
+@@ -681,11 +763,12 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             for (auto &p : problems) blog(LOG_INFO, "[语音消音] streaming app: %s", p.second.c_str());
+         companion_app_problems = problems;
+     }
+-    if (!companion_was_on) {
++    if (!companion_was_on || companion_was_remote) {
+         blog(LOG_INFO, "[语音消音] companion mode on");
+         if (!obs_frontend_virtualcam_active()) obs_frontend_start_virtualcam();
+     }
+     companion_was_on = true;
++    companion_was_remote = false;
+     const auto &st = companion_state;
+     if (!st.supported) {
+         add_warning(WARN_BROKEN, "直播伴侣模式仅支持Windows");
+@@ -702,8 +785,10 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+     const char *name = nullptr, *id = nullptr;
+     obs_get_audio_monitoring_device(&name, &id);
+     if (!id || st.cable_id != id) {
+-        // Remember what it was (OBS has one monitoring device; the cable takes it over).
+-        if (!(name && IsCableEndpointName(name))) {
++        // Remember what it was (OBS has one monitoring device; the cable takes it over),
++        // unless it is the capture card 双机 mode had set.
++        std::string remote_set = remote_set_monitoring();
++        if (!(name && IsCableEndpointName(name)) && !(id && !remote_set.empty() && remote_set == id)) {
+             save_prev_monitoring(name, id);
+             if (id && strcmp(id, "default") != 0 && name) {
+                 cable_notice = std::string("直播伴侣模式：OBS监听设备已从“") + name + "”改为CABLE，改回OBS直接推流时恢复";
+@@ -711,6 +796,8 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             }
+         }
+         set_monitoring_device(st.cable_name.c_str(), st.cable_id.c_str());
++        if (!remote_set.empty()) save_remote_set_monitoring("");
++    }
+     }
+     if (cable_reinit_pending) {
+         cable_reinit_pending = false;
+@@ -723,7 +810,7 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+             set_monitoring(s, type);
+             ++count;
+         }
+-        blog(LOG_INFO, "[语音消音] VB-CABLE enabled: reopened monitoring of %d sources", count);
++        blog(LOG_INFO, "[语音消音] %s: reopened monitoring of %d sources", remote ? "capture card back" : "VB-CABLE enabled", count);
+     }
+     // Mirror the OBS output mix (see companion_apply_monitoring).
+     for (auto *s : sources) {
+@@ -733,9 +820,37 @@ static void maintain_companion(const std::vector<obs_source_t *> &sources, bool
+         if (get_monitoring(s) == OBS_MONITORING_TYPE_MONITOR_ONLY && obs_source_active(s) &&
+             !obs_source_muted(s)) {
+             add_warning(WARN_LEAK, std::string("“") + obs_source_get_name(s) +
+-                                "”设为仅监听，伴侣模式下它也会进入直播");
++                                (remote ? "”设为仅监听，双机推流时它也会进入直播" : "”设为仅监听，伴侣模式下它也会进入直播"));
++        }
++    }
++    if (remote) {
++        // Not changed automatically: a capture card as the Windows default can be deliberate
++        // (e.g. to hear the game through the card's passthrough), but every program's raw
++        // sound then reaches the broadcast.
++        const auto &st = companion_state;
++        if (st.console_is_target || st.communications_is_target)
++            add_warning(WARN_LEAK, std::string("原声会绕过消音进入直播：Windows默认") +
++                                (st.console_is_target ? "播放" : "通信") +
++                                "设备是采集卡，请在插件设置点“修复 Windows 默认播放设备”或在Windows声音设置里改成耳机/扬声器");
++        if (!remote_other_programs.empty()) {
++            std::string list;
++            for (auto &o : remote_other_programs) list += (list.empty() ? "" : "、") + o;
++            add_warning(WARN_LEAK, "别的程序（" + list + "）也在往采集卡放声音，不经消音进入直播，请把它们的输出设备改成耳机/扬声器");
++        }
++        if (cable_notice_ticks > 0) {
++            --cable_notice_ticks;
++            add_warning(WARN_NOTICE, cable_notice);
++        }
++        bool confirmed = false;
++        if (GlobalConfig *cfg = GetGlobalConfig()) {
++            std::lock_guard<std::mutex> lock(cfg->mutex);
++            confirmed = cfg->remote_confirmed;
+         }
++        if (!confirmed)
++            add_warning(WARN_BROKEN, "双机推流：请在插件设置点“直播机设置清单”，确认直播机只用采集卡的声音、游戏电脑在投影节目画面");
++        return;
+     }
++    const auto &st = companion_state;
+     // A default device that is the cable (VB-CABLE installer, Windows replacing an
+     // unplugged headset, or re-enabling the cable) sends other programs' raw sound into
+     // the broadcast; it has no legitimate use in this mode, so it is changed back.
+@@ -898,7 +1013,10 @@ static void scan_mic_devices(const std::vector<obs_source_t *> &sources) {
+     }
+ }
+ 
+-static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode, bool companion, int sync_mode) {
++// `companion`: the stream mix goes out through OBS monitoring (直播伴侣 mode); `cable`: into
++// VB-CABLE on this computer (not 双机).
++static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mode, bool companion, bool cable,
++                              int sync_mode) {
+     if (voice_app_tick++ % 3 == 0) voice_apps = ActiveVoiceApps();
+     const std::string F = "“语音消音”";
+     std::vector<std::string> lines;
+@@ -950,17 +1068,29 @@ static void check_audio_setup(const std::vector<obs_source_t *> &sources, int mo
+         bool on = audible(m);
+         if (on && dev != mic_devices.end() && dev->second.default_is_cable)
+             bad("麦克风" + name(m) + "设备选的是“默认”，而 Windows 默认录音设备现在是 CABLE Output，录不到你的声音" +
+-                (companion ? "，还会把直播声音再录回来形成回声" : "") +
++                (cable ? "，还会把直播声音再录回来形成回声" : "") +
+                 " → Windows 声音设置 → 输入，把默认设备改回真实麦克风");
+-        else if (on && companion && dev != mic_devices.end() && dev->second.explicit_cable)
++        else if (on && cable && dev != mic_devices.end() && dev->second.explicit_cable)
+             bad("麦克风" + name(m) + "录的是 CABLE Output，伴侣模式下会把直播声音再录回来形成回声 → 双击它，把设备改为真实麦克风；用变声器时让变声器输出到别的虚拟声卡");
+         else if (!on) lines.push_back("· 麦克风" + name(m) + "已静音");
+         else if (has_recognizing_filter(m)) lines.push_back("✓ 麦克风" + name(m) + "已消音");
+         else bad("麦克风" + name(m) + "没有消音 → 点“加消音”，或开启上面的“自动给麦克风加消音滤镜”" + act("add", m));
+     }
+     if (mics.empty()) lines.push_back("· 没有找到麦克风音源");
+-    if (!companion && cable_used_by_source)
++    if (!cable && cable_used_by_source)
+         lines.push_back("· 有麦克风音源录的是 CABLE Output（变声器等软件经 VB-CABLE 送进 OBS），插件不会停用 VB-CABLE");
++    // OBS streams itself, is not streaming, and monitors a microphone into a device other than
++    // the default: typically a capture card feeding a second computer that does the streaming.
++    if (!companion && !obs_frontend_streaming_active()) {
++        const char *mon_name = nullptr, *mon_id = nullptr;
++        obs_get_audio_monitoring_device(&mon_name, &mon_id);
++        bool monitored_mic = false;
++        for (auto *m : mics) monitored_mic |= audible(m) && get_monitoring(m) != OBS_MONITORING_TYPE_NONE;
++        if (monitored_mic && mon_id && strcmp(mon_id, "default") != 0 && !(mon_name && IsCableEndpointName(mon_name)) &&
++            !QueryCompanionAudio(mon_id).console_is_target)
++            lines.push_back(std::string("· OBS 在把麦克风监听送到“") + (mon_name ? mon_name : "") +
++                            "”。如果这是双机推流（另一台电脑经采集卡收声音），开播方式请选“直播伴侣类推流软件”，推流软件在“另一台电脑”，插件会检查采集卡这一路");
++    }
+ 
+     bool desktop_on = false;
+     for (auto *d : desktops) {
+@@ -1160,10 +1290,15 @@ void UpdateVideoDelayFiltersState() {
+     int sync_mode;
+     int voice_source;
+     bool cable_auto_disable;
++    bool remote;
++    std::string remote_id, remote_name;
+     {
+         std::lock_guard<std::mutex> lock(cfg->mutex);
+         global_enable = cfg->global_enable;
+         companion = cfg->companion_mode;
++        remote = cfg->companion_remote;
++        remote_id = cfg->remote_output_id;
++        remote_name = cfg->remote_output_name;
+         sync_mode = cfg->sync_mode;
+         voice_source = cfg->voice_source;
+         cable_auto_disable = cfg->cable_auto_disable;
+@@ -1201,9 +1336,9 @@ void UpdateVideoDelayFiltersState() {
+         }
+         SetSyncSummary(reason, voices);
+         scan_mic_devices(sources);
+-        maintain_cable(companion, cable_auto_disable);
+-        maintain_companion(sources, companion);
+-        check_audio_setup(sources, voice_source, companion, sync_mode);
++        maintain_cable(companion && !remote, cable_auto_disable);
++        maintain_companion(sources, companion, remote, remote_id, remote_name);
++        check_audio_setup(sources, voice_source, companion, companion && !remote, sync_mode);
+         if (changed)
+             blog(LOG_INFO, "[语音消音] picture sync %s (%s)", enable ? "on" : "off",
+                  enable ? reason.c_str() : (voices.empty() ? "no filtered voice" : voices.c_str()));
+-- 
+2.55.0.windows.5
+

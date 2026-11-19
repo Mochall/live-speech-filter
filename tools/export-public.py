@@ -1,6 +1,9 @@
 """Export the public part of this project into work/public-repo (its own git repository).
 
-    .venv/Scripts/python.exe -X utf8 tools/export-public.py
+    .venv/Scripts/python.exe -X utf8 tools/export-public.py [--out DIR]
+
+--out  the public repository folder (default work/public-repo of this checkout; from a git worktree
+       pass the main checkout's work/public-repo).
 
 The development repository keeps its full history and internal notes (PLAN.md, test records)
 and has no remote. Only the files listed here are copied; the public repository is a separate
@@ -16,6 +19,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / 'work/public-repo'
+if '--out' in sys.argv:
+    OUT = pathlib.Path(sys.argv[sys.argv.index('--out') + 1]).resolve()
 PUBLIC = ROOT / 'packaging/public'          # files that exist only for the public repository
 
 FILES = [
@@ -30,6 +35,7 @@ FILES = [
     'tools/make-obs28-sdk.sh',
     'tools/check-plugin-imports.py',
     'tools/export-public.py',
+    'update/latest.json',  # read by the programs' update check (raw on Gitee/GitHub, branch main)
 ]
 DIRS = ['standalone', 'docs/design/app-icon', 'docs/images', 'docs/dual-pc', 'tools/tests']
 # public-only files: source in packaging/public -> path in the export

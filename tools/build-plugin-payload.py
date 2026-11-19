@@ -1,6 +1,10 @@
 """Assembles the payload of the plugin-only installer (no OBS inside) and writes a manifest.
 
-    .venv/Scripts/python.exe tools/build-plugin-payload.py <version>
+    .venv/Scripts/python.exe tools/build-plugin-payload.py <version> [--data-root DIR]
+
+--data-root  checkout holding the ignored work/ and downloads/ folders (default: this checkout; a git
+             worktree has none of them). Patches, standalone/ and the plugin sources come from this
+             checkout (its upstream/obs-profanity-filter clone when it has one, else the data root's).
 
 Layout (installed as C:/ProgramData/obs-studio/plugins/obs-profanity-filter):
     bin/64bit/  plugin DLL + its DLLs      (OBS 28-32, still read by OBS 33)
@@ -20,14 +24,23 @@ import pathlib
 import shutil
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-version = sys.argv[1]
+SRC = pathlib.Path(__file__).resolve().parents[1]  # this checkout: patches/, standalone/
+args = sys.argv[1:]
+ROOT = SRC
+if '--data-root' in args:
+    i = args.index('--data-root')
+    ROOT = pathlib.Path(args[i + 1]).resolve()
+    del args[i:i + 2]
+ENG = SRC / 'upstream/obs-profanity-filter'
+if not (ENG / 'src').is_dir():
+    ENG = ROOT / 'upstream/obs-profanity-filter'
+version = args[0]
 NAME = 'obs-profanity-filter'
 old = ROOT / 'work/installer-payload-0.7.0'
 out = ROOT / f'work/installer-payload-plugin-{version}'
 if out.exists():
     shutil.rmtree(out)
-last_patch = sorted(p.name[:4] for p in (ROOT / 'patches').glob('[0-9][0-9][0-9][0-9]-*.patch'))[-1]
+last_patch = sorted(p.name[:4] for p in (SRC / 'patches').glob('[0-9][0-9][0-9][0-9]-*.patch'))[-1]
 dlls = {NAME + '.dll': ROOT / 'work/obs-compat' / ('build-' + last_patch) / (NAME + '.dll')}
 # The sponsor QR is compiled into the plugin DLL (cmake -DSPONSOR_IMAGE=work/sponsor/sponsor-qr.png),
 # not shipped as a file; the image itself stays in the ignored work folder.
@@ -40,13 +53,13 @@ for sub in ('bin/64bit', '.'):
 shutil.copytree(old / 'data/obs-plugins' / NAME, out / 'data')
 # The word list follows the plugin sources (0039 removed 渣滓); the rest of data/ (dictionary, locale,
 # model, models.json, runtime.json) is unchanged since 0.7.0.
-src_data = ROOT / 'upstream/obs-profanity-filter/data'
+src_data = ENG / 'data'
 shutil.copy2(src_data / 'builtin_dirty_words.txt', out / 'data/builtin_dirty_words.txt')
 for f in ('models.json', 'runtime.json'):
     assert (src_data / f).read_bytes() == (out / 'data' / f).read_bytes(), f
 
 # Animal replacement sounds (0050): the standalone app's CC0 files and their attribution README.
-shutil.copytree(ROOT / 'standalone/data/sounds', out / 'data/sounds')
+shutil.copytree(SRC / 'standalone/data/sounds', out / 'data/sounds')
 assert sorted(p.name for p in (out / 'data/sounds').iterdir()) == ['README.md', 'bird.wav', 'cat.wav', 'dog.wav', 'duck.wav', 'sheep.wav']
 
 VBCABLE_ZIP = ROOT /'downloads/vbcable-pack46/VBCABLE_Driver_Pack46.zip'
@@ -57,9 +70,9 @@ shutil.copy2(VBCABLE_ZIP, out / 'data/vbcable')
 lic = out / 'licenses'
 shutil.copytree(old / 'licenses', lic, ignore=shutil.ignore_patterns('patches', 'modified-src', 'SOURCES.txt'))
 (lic / 'patches').mkdir()
-for p in sorted((ROOT / 'patches').glob('*')):
+for p in sorted((SRC / 'patches').glob('*')):
     shutil.copy2(p, lic / 'patches' / p.name)
-src = ROOT / 'upstream/obs-profanity-filter'
+src = ENG
 shutil.copytree(src / 'src', lic / 'modified-src')
 shutil.copy2(src / 'CMakeLists.txt', lic / 'modified-src/CMakeLists.txt')
 

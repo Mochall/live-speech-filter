@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(live-speech-filter-lite VERSION 0.10.2 LANGUAGES C CXX RC)
+project(live-speech-filter-lite VERSION 0.10.3 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +33,18 @@ add_library(censor-core STATIC
 target_include_directories(censor-core PUBLIC "${UPSTREAM}/src" "${SHERPA_ONNX_ROOT}/include")
 target_link_directories(censor-core PUBLIC "${SHERPA_ONNX_ROOT}/lib")
 target_link_libraries(censor-core PUBLIC sherpa-onnx-c-api cpp-pinyin::cpp-pinyin)
+
+# bzip2 1.0.8 (https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz, SHA256 ab5a0317…2269), decompression
+# only: the recommended model is a .tar.bz2 and the tar.exe of Windows 10 cannot read bzip2.
+set(BZIP2_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../downloads/bzip2-1.0.8/bzip2-1.0.8" CACHE PATH "bzip2 1.0.8 sources")
+add_library(bz2-decompress STATIC
+  "${BZIP2_ROOT}/bzlib.c" "${BZIP2_ROOT}/decompress.c" "${BZIP2_ROOT}/huffman.c"
+  "${BZIP2_ROOT}/crctable.c" "${BZIP2_ROOT}/randtable.c" "${BZIP2_ROOT}/blocksort.c" "${BZIP2_ROOT}/compress.c")
+target_include_directories(bz2-decompress PUBLIC "${BZIP2_ROOT}")
+target_compile_definitions(bz2-decompress PRIVATE BZ_NO_STDIO)
+if(MSVC)
+  target_compile_options(bz2-decompress PRIVATE /W0)
+endif()
 
 add_library(lite-core STATIC
   src/audio-io.cpp
@@ -70,6 +82,8 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 set(CMAKE_AUTOMOC ON)
 
 add_executable(LiveSpeechFilter WIN32
+  src/gui/bz2-unpack.cpp
+  src/gui/bz2-unpack.hpp
   src/gui/cable-setup.cpp
   src/gui/cable-setup.hpp
   src/gui/main.cpp
@@ -84,13 +98,20 @@ add_executable(LiveSpeechFilter WIN32
   src/pipeline.cpp
   src/lite-checks.cpp
   "${UPSTREAM}/src/companion-audio.cpp"
-  "${UPSTREAM}/src/streaming-apps.cpp")
+  "${UPSTREAM}/src/streaming-apps.cpp"
+  "${UPSTREAM}/src/update-check.cpp")
 target_sources(LiveSpeechFilter PRIVATE resources/icons.qrc resources/app.rc)
 set_source_files_properties(resources/app.rc PROPERTIES COMPILE_DEFINITIONS
   "LSF_VERSION_COMMA=${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0;LSF_VERSION_STR=\"${PROJECT_VERSION}\"")
 target_compile_definitions(LiveSpeechFilter PRIVATE LSF_VERSION="${PROJECT_VERSION}")
+# Test builds only: the one latest.json address (http://127.0.0.1 allowed). Empty for real builds.
+set(LSF_UPDATE_TEST_URL "" CACHE STRING "test address of latest.json (test builds only)")
+if(LSF_UPDATE_TEST_URL)
+  target_compile_definitions(LiveSpeechFilter PRIVATE LSF_UPDATE_TEST_URL="${LSF_UPDATE_TEST_URL}")
+  message(WARNING "Update check test build: ${LSF_UPDATE_TEST_URL}")
+endif()
 target_include_directories(LiveSpeechFilter PRIVATE src src/gui)
-target_link_libraries(LiveSpeechFilter PRIVATE lite-core Qt6::Widgets Qt6::Network winmm dwmapi wintrust crypt32)
+target_link_libraries(LiveSpeechFilter PRIVATE lite-core bz2-decompress Qt6::Widgets Qt6::Network winmm dwmapi wintrust crypt32 winhttp)
 set_target_properties(LiveSpeechFilter PROPERTIES AUTOMOC ON AUTORCC ON)
 
 # Sponsor QR (Qt resource :/sponsor/sponsor-qr.png), compiled in as in the plugin so it cannot be

@@ -27,7 +27,10 @@
 #endif
 #define PluginName "obs-profanity-filter"
 #define Version "0.10.3"
-#define Payload "..\work\installer-payload-plugin-" + Version
+#ifndef WorkDir
+  #define WorkDir "..\work"
+#endif
+#define Payload WorkDir + "\installer-payload-plugin-" + Version
 
 [Setup]
 #ifdef TestRoot
@@ -53,7 +56,7 @@ DisableProgramGroupPage=yes
 DisableWelcomePage=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir=..\work\installer-output
+OutputDir={#WorkDir}\installer-output
 Compression=lzma2/fast
 SolidCompression=yes
 CloseApplications=no

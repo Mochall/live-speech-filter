@@ -57,3 +57,5 @@
 | [0051](0051-version-0.10.3.patch) | Plugin version 0.10.3 |
 | [0052](0052-replacement-sound-preview.patch) | 试听 button for the replacement sound (PlaySound, as in the standalone app); warning text buffer 512 bytes |
 | [0053](0053-recognizer-lanes-setting.patch) | 识别路数 setting (1/2/4, default 1): more recognizer streams with 40 ms chunks as in the standalone app; backlog warning suggests fewer |
+| [0054](0054-dual-pc-capture-card.patch) | 双机 sub-option in companion mode: monitoring into the capture card's playback device, no virtual camera/VB-CABLE/streaming app checks; warns when the Windows default device is the card or other programs play to it; hint in direct mode |
+| [0055](0055-plugin-update-check.patch) | 检查更新 (plugin): shared WinHTTP update module (also used by the standalone app), check at most once a day 30 s after start with an off switch and a button, notice in the status bar and settings page only, download with size/SHA256 check into the plugin config folder; never starts the installer (exit OBS first) |

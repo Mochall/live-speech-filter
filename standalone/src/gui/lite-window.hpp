@@ -7,18 +7,24 @@
 
 #include "pipeline.hpp"
 #include "ui-kit.hpp"
+#include "update-check.hpp"
 
 #include <QByteArray>
+#include <QDateTime>
+#include <QCryptographicHash>
 #include <QMainWindow>
 #include <QString>
 #include <QStringList>
 #include <QSystemTrayIcon>
 
+#include <atomic>
 #include <deque>
 #include <memory>
+#include <thread>
 #include <vector>
 
 class CableSetup;
+class QAction;
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
@@ -28,6 +34,7 @@ class QFile;
 class QLineEdit;
 class QNetworkAccessManager;
 class QNetworkReply;
+class QProcess;
 class QPushButton;
 class QRadioButton;
 class QSpinBox;
@@ -35,6 +42,9 @@ class QStackedWidget;
 class QTimer;
 class QVBoxLayout;
 class TrayPopup;
+
+// main.cpp: closes the "LiveSpeechFilter.Running" mutex (Inno Setup AppMutex) before an update installer starts.
+void ReleaseRunningMutex();
 
 struct LitePaths {
     QString config_dir;       // %APPDATA%/LiveSpeechFilter (or --config-dir)
@@ -83,7 +93,9 @@ private:
     struct ModelEntry {
         QString id;              // catalog id (folder name), empty for other folders
         QString path;            // installed folder, empty when not installed
-        QString name, size, note, url;
+        QString name, size, note;
+        QStringList urls;        // download addresses, tried in order; empty: cannot be downloaded
+        QString sha256, source;  // expected SHA256 of the download (empty: not checked); shown source
         bool bundled = false;    // in <exe_dir>/models (installed with the program)
         bool downloaded = false; // in <config_dir>/models (can be deleted)
         QRadioButton *radio = nullptr;
@@ -116,16 +128,26 @@ private:
     void FillDevices();
     void ScanModels();
     void ChooseModelFolder();
-    void DownloadModel(const QString &id, const QString &url);
+    void DownloadModel(const QString &id);
+    void StartDownload();     // download_urls_[download_index_]
     void DownloadFinished();
-    void InstallDownloaded(const QString &id, const QString &zip);
+    void InstallDownloaded(const QString &id, const QString &archive);
     void DeleteModel(const QString &id, const QString &path);
     QString DownloadDir() const { return paths_.config_dir + "/models"; }
+    QString UpdateDir() const { return paths_.config_dir + "/updates"; }
     // VB-CABLE playback side (CABLE Input): enabled while filtering when cable_auto_ is on.
     bool EnableCable();
     void DisableCableIfAuto();
     void RefreshOutputs();
     void InstallCable(); // 下载并安装 in the checks
+    // Update check (the plugin sources' src/update-check.cpp on a worker thread; results come back on the GUI thread).
+    void CheckForUpdate(bool manual);
+    void UpdateChecked(bool ok, const lsfupdate::Release &release, const QString &error, bool manual);
+    void DownloadUpdate();
+    void UpdateDownloaded(bool ok, const QString &path, const QString &error);
+    void InstallUpdate();
+    void ShowUpdateState();
+    void StopUpdateWork();
     void CableSetupFinished(bool ran, const QString &error);
     QString ModelPath() const;
     void PreviewEffect();
@@ -172,6 +194,15 @@ private:
     QNetworkReply *download_ = nullptr;
     QFile *download_file_ = nullptr;
     QString download_id_;
+    QStringList download_urls_;   // addresses of download_id_, tried in order
+    int download_index_ = 0;
+    QString download_sha256_;     // expected, empty: not checked
+    QCryptographicHash *download_hash_ = nullptr;
+    bool unpacking_ = false;      // download_id_ downloaded, tar.exe running (download_ is null then)
+    QProcess *unpack_ = nullptr;  // that tar.exe
+    std::thread bunzip_;          // .tar.bz2 -> .tar before tar.exe (Windows 10's tar.exe has no bzip2)
+    std::atomic<bool> bunzip_cancel_{false};
+    QString unpack_archive_;
     QString download_text_;  // "正在下载 42%" / "正在解压…"
     QLabel *download_label_ = nullptr;
     std::vector<ui::CheckItem> checks_;
@@ -232,6 +263,22 @@ private:
 
     // 支持项目
     ui::Switch *debug_log_ = nullptr;
+    ui::Switch *update_auto_ = nullptr;
+    QLabel *update_text_ = nullptr;
+    QPushButton *update_check_ = nullptr, *update_get_ = nullptr, *update_cancel_ = nullptr, *update_page_ = nullptr;
+    QLabel *support_badge_ = nullptr;
+    QAction *update_action_ = nullptr; // tray menu, shown when there is a new version
+    enum class UpdateState { Idle, Checking, Available, Downloading, Ready };
+    UpdateState update_state_ = UpdateState::Idle;
+    QString update_message_;       // result of the last check / download, shown in 关于
+    lsfupdate::Release update_;    // the newer release, when one was found
+    QString update_file_;          // downloaded and checked installer
+    QString update_run_;           // installer to start after quitting
+    QDateTime last_update_check_;
+    QString update_found_;         // newer version found by the last successful check (kept across restarts)
+    bool UpdateFoundNewer() const { return !update_found_.isEmpty() && lsfupdate::CompareVersions(update_found_, LSF_VERSION) > 0; }
+    std::thread update_thread_;
+    std::unique_ptr<lsfupdate::Http> update_http_;
     ui::Switch *cable_auto_ = nullptr;
     QWidget *title_bar_ = nullptr;
     ui::WindowButton *max_button_ = nullptr;

@@ -13,7 +13,7 @@
 - `src/cli.cpp`：命令行原型 `lsf-lite-cli`。
 - `src/pipeline.*`：窗口程序用的运行部分（麦克风和所选程序各一个 `Source`、`Mixer`、到 CABLE Input 的输出流）。
 - `src/lite-checks.*`：只读检查，列出正在出声的程序、正在往某个播放设备出声的程序。
-- `src/gui/`：窗口程序 `LiveSpeechFilter`（Qt 6 Widgets）。另用插件的 `companion-audio.cpp`（VB-CABLE状态、Windows默认设备是否是CABLE）。
+- `src/gui/`：窗口程序 `LiveSpeechFilter`（Qt 6 Widgets）。另用插件的 `companion-audio.cpp`（VB-CABLE状态、Windows默认设备是否是CABLE）、`streaming-apps.cpp` 和检查更新模块 `update-check.cpp`（补丁0055 起放在插件源码，所以 `UPSTREAM` 要指向带 0055 的插件源码）。
 
 许可：链接了 GPL-2.0 的插件代码，本目录按 GPL-2.0 发布。
 
@@ -39,6 +39,7 @@ Qt 默认取插件用的 `upstream/obs-profanity-filter/.deps/obs-deps-qt6-2025-
 - 开播前检查（每2秒刷新，只在用户点按钮时改设置）：VB-CABLE未装（“下载并安装”：从vb-audio.com找最新的Driver Pack，下载后校验 VBCABLE_Setup_x64.exe 是VB-Audio作者的有效Authenticode签名，用tar.exe解压，以管理员打开VB-Audio自己的安装程序，用户点Install Driver，之后提示重启；见 `src/gui/cable-setup.cpp`）或被禁用（“启用”）、CABLE是Windows默认播放或通信设备（“改回”，用插件的 RestoreDefaultPlayback）、别的程序也在往CABLE Input出声、直播伴侣设置（采集了系统声音或别的麦克风、没采CABLE Output、采集了程序声音）、所选程序没运行、没选来源、找不到模型。有红色问题时点开始会再确认一次。
 - 关闭窗口时若正在过滤则缩到托盘，托盘菜单“退出”才停止；同一配置目录只允许运行一个。
 - 设置、词库和日志在 `%APPDATA%/LiveSpeechFilter`（`config.json`、`custom_words.txt`、`pinyin_words.txt`、`logs/`，保留最近10个日志）。
+- 识别模型页：四个模型都能下载到 `%APPDATA%/LiveSpeechFilter/models`。推荐（X-ASR int8）从 GitHub sherpa-onnx 发布页下载 `.tar.bz2` 并核对 SHA256，另外三个从 ModelScope 下载 zip（同插件的 models.json）；每个模型可写多个地址按顺序尝试；推荐模型的 .tar.bz2 先在程序里用 bzip2 1.0.8 解成 .tar（`src/gui/bz2-unpack.cpp`；Windows 10 自带的 tar.exe 不支持 bzip2），再用 tar.exe 解压，下载完自动选用。编译需要 bzip2 源码：`downloads/bzip2-1.0.8/bzip2-1.0.8`（https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz ，SHA256 `ab5a0317…2269`），或用 `-DBZIP2_ROOT=` 指定。程序旁有 `models/` 时（完整安装包）直接用它。
 - 测试用参数：`--config-dir <目录>`、`--companion-config <audioStore.json>`、`--model <目录>`。
 
 ## 命令行原型

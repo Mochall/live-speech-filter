@@ -1,6 +1,7 @@
 #include "lite-window.hpp"
 
 #include "audio-io.hpp"
+#include "bz2-unpack.hpp"
 #include "cable-setup.hpp"
 #include "censor-engine.hpp"
 #include "censor-log.hpp"
@@ -8,6 +9,7 @@
 #include "lite-checks.hpp"
 #include "streaming-apps.hpp"
 #include "tray-popup.hpp"
+#include "update-check.hpp"
 #include "utils.hpp"
 
 #include <windows.h>
@@ -15,6 +17,7 @@
 #include <mmdeviceapi.h>
 #include <mmsystem.h>
 #include <windowsx.h>
+#include <shellapi.h>
 
 #include <QAction>
 #include <QApplication>
@@ -181,19 +184,28 @@ QVBoxLayout *FormRow(QVBoxLayout *body, const QString &label) {
     return v;
 }
 
-// Same models and download addresses as the plugin's data/models.json (ModelScope, zip files).
+// Download addresses: tried in order ('|' between them) until one works. The three ModelScope zips are
+// the plugin's data/models.json. 推荐 (X-ASR int8) is not on ModelScope as this file (the X-ASR repo there
+// has only the fp32 export), so it comes from the sherpa-onnx release page, a .tar.bz2 that tar.exe
+// unpacks like the zips. sha256: of the downloaded file, checked when known (empty: not checked).
 struct CatalogModel {
-    const char *id, *name, *size, *note, *url;
+    const char *id, *name, *size, *note, *url, *sha256, *source;
 };
+const char kRecommendedId[] = "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05";
 const CatalogModel kCatalog[] = {
-    {"sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05", "推荐", "130 MB",
-     "中英双语，160 毫秒流式识别。延迟、漏词和误消音之间最平衡，本程序的测试都用它。", ""},
+    {kRecommendedId, "推荐", "130 MB", "中英双语，160 毫秒流式识别。延迟、漏词和误消音之间最平衡，本程序的测试都用它。",
+     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+     "sherpa-onnx-x-asr-160ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05.tar.bz2",
+     "bdf2c0f2474d34bf479871b0f298c74a6f6bf15f24a492dc5401aa3041811915", "GitHub（sherpa-onnx 发布页）"},
     {"sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23", "轻量", "54 MB", "只认中文，占用最少，漏词比推荐模型多。",
-     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.zip"},
+     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.zip",
+     "", "ModelScope"},
     {"sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20", "标准", "357 MB", "中英双语。",
-     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.zip"},
+     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.zip",
+     "", "ModelScope"},
     {"sherpa-onnx-streaming-zipformer-zh-2025-06-30", "最强", "597 MB", "只认中文，最准，最占 CPU。",
-     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-2025-06-30.zip"},
+     "https://modelscope.cn/models/cloud370/obs-profanity-filter/resolve/master/sherpa-onnx-streaming-zipformer-zh-2025-06-30.zip",
+     "", "ModelScope"},
 };
 
 QString FolderSize(const QString &dir) {
@@ -388,11 +400,40 @@ LiteWindow::LiteWindow(const LitePaths &paths, QWidget *parent) : QMainWindow(pa
     check_timer_->start(2000);
     UpdateChecks();
     Tick();
+
+    // Installers downloaded in an earlier run have been used or given up; start clean.
+    QDir(UpdateDir()).removeRecursively();
+    ShowUpdateState();
+    QTimer::singleShot(15000, this, [this] {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        // Not when a check or download was already started by hand.
+        if (update_state_ == UpdateState::Idle && update_message_.isEmpty() && update_auto_->isChecked() &&
+            (UpdateFoundNewer() || !last_update_check_.isValid() || last_update_check_.secsTo(now) >= 20 * 3600 ||
+             last_update_check_ > now))
+            CheckForUpdate(false);
+    });
 }
 
 LiteWindow::~LiteWindow() {
     PlaySoundW(nullptr, nullptr, 0);
     if (download_) download_->abort();
+    StopUpdateWork();
+    delete download_hash_;
+    if (bunzip_.joinable()) { // quitting while the .tar.bz2 is decompressed
+        bunzip_cancel_ = true;
+        bunzip_.join();
+        QFile::remove(DownloadDir() + "/" + download_id_ + ".tar");
+        QFile::remove(DownloadDir() + "/" + download_id_ + ".tar.bz2");
+    }
+    if (unpack_) {
+        // Quitting while a model is unpacked: QProcess would report finished from its own destructor,
+        // after this window's members are gone. Stop it here; the half-unpacked files are removed.
+        unpack_->disconnect(this);
+        unpack_->kill();
+        unpack_->waitForFinished(3000);
+        QDir(DownloadDir() + "/" + download_id_ + "_temp").removeRecursively();
+        QFile::remove(unpack_archive_);
+    }
     pipeline_.Stop();
     delete popup_;
 }
@@ -441,7 +482,10 @@ QWidget *LiteWindow::BuildSidebar() {
     foot->setWordWrap(true);
     foot->setContentsMargins(8, 0, 8, 6);
     v->addWidget(foot);
-    add("支持项目", ui::Glyph::Heart, kSupport);
+    support_badge_ = new QLabel("新版本");
+    support_badge_->setProperty("role", "badge");
+    support_badge_->hide();
+    add("支持项目", ui::Glyph::Heart, kSupport)->addWidget(support_badge_);
     nav_->button(kFilter)->setChecked(true);
     connect(nav_, &QButtonGroup::idClicked, this, [this](int id) { pages_->setCurrentIndex(id); });
     return side;
@@ -801,7 +845,7 @@ QWidget *LiteWindow::BuildModelPage() {
     c->addWidget(ui::Help("消音总是比屏蔽词早或晚时再调，负数往前、正数往后。一般不用改。"));
     connect(offset_, &QSpinBox::editingFinished, this, [this] { ApplySettings(); SaveConfig(); });
     p.body->addWidget(card2);
-    p.body->addWidget(ui::Help("下载来源 ModelScope。下载的模型存在 " + QDir::toNativeSeparators(DownloadDir()) + "。"));
+    p.body->addWidget(ui::Help("推荐模型从 GitHub（sherpa-onnx 发布页）下载，其他从 ModelScope 下载。下载的模型存在 " + QDir::toNativeSeparators(DownloadDir()) + "。"));
     p.body->addStretch();
     return p.page;
 }
@@ -903,7 +947,36 @@ QWidget *LiteWindow::BuildSupportPage() {
     QVBoxLayout *ab = CardBody(aboutCard, 6);
     ab->setSpacing(14);
     c = FormRow(ab, "程序");
-    c->addWidget(ui::Help("直播消音 " LSF_VERSION "。说的话在本机识别，不上传；只有下载模型时会联网（ModelScope）。"));
+    c->addWidget(ui::Help("直播消音 " LSF_VERSION "。说的话在本机识别，不上传；只有下载模型和检查更新时会联网"
+                          "（模型：GitHub、ModelScope；更新：Gitee、GitHub。检查更新只读取版本信息文件，不上传任何东西）。"));
+    c = FormRow(ab, "更新");
+    update_text_ = ui::Help("");
+    c->addWidget(update_text_);
+    auto *uh = new QHBoxLayout;
+    uh->setSpacing(8);
+    update_check_ = ui::Pill("检查更新", "sec", "s");
+    update_get_ = ui::Pill("下载更新", "acc", "s");
+    update_cancel_ = ui::Pill("取消", "sec", "s");
+    update_page_ = ui::Pill("打开下载页", "sec", "s");
+    for (auto *b : {update_check_, update_get_, update_cancel_, update_page_}) uh->addWidget(b);
+    uh->addStretch();
+    c->addLayout(uh);
+    update_auto_ = new ui::Switch("启动后自动检查（每天最多一次）");
+    c->addWidget(update_auto_);
+    c->addWidget(ui::Help("有新版本时只在这里、左边“支持项目”和托盘菜单里提示，不弹窗。"));
+    connect(update_check_, &QPushButton::clicked, this, [this] { CheckForUpdate(true); });
+    connect(update_get_, &QPushButton::clicked, this, [this] {
+        if (update_state_ == UpdateState::Ready) InstallUpdate();
+        else DownloadUpdate();
+    });
+    connect(update_cancel_, &QPushButton::clicked, this, [this] {
+        if (update_http_) update_http_->Cancel();
+    });
+    connect(update_page_, &QPushButton::clicked, this, [this] {
+        const QString page = update_.page.isEmpty() ? QString("https://github.com/Mochall/live-speech-filter/releases") : update_.page;
+        QDesktopServices::openUrl(QUrl(page));
+    });
+    connect(update_auto_, &ui::Switch::toggled, this, [this] { SaveConfig(); });
     c = FormRow(ab, "许可");
     c->addWidget(ui::Help("基于 Cloud370/obs-profanity-filter（GPL-2.0）修改。源代码与第三方许可见程序文件夹里的 licenses。"));
     p.body->addWidget(aboutCard);
@@ -924,6 +997,8 @@ void LiteWindow::BuildTray() {
     menu->addAction("打开主窗口", this, [this] { ShowPage(kFilter); });
     auto *toggle = menu->addAction("开始过滤", this, &LiteWindow::ToggleFilter);
     toggle->setObjectName("toggle");
+    update_action_ = menu->addAction("有新版本…", this, [this] { ShowPage(kSupport); });
+    update_action_->setVisible(false);
     menu->addSeparator();
     menu->addAction("退出（停止输出）", this, [this] {
         quitting_ = true;
@@ -1070,6 +1145,12 @@ void LiteWindow::LoadConfig() {
     use_pinyin_->setChecked(o.value("use_pinyin").toBool(true));
     offset_->setValue(o.value("model_offset_ms").toInt(0));
     debug_log_->setChecked(o.value("debug_logging").toBool(false));
+    {
+        const QSignalBlocker bu(update_auto_);
+        update_auto_->setChecked(o.value("check_updates").toBool(true));
+    }
+    last_update_check_ = QDateTime::fromString(o.value("last_update_check").toString(), Qt::ISODate);
+    update_found_ = o.value("update_found").toString();
     cable_auto_->setChecked(o.value("cable_auto").toBool(true));
     model_path_ = o.value("model_path").toString();
     custom_model_ = o.value("custom_model").toString();
@@ -1117,6 +1198,9 @@ void LiteWindow::SaveConfig() {
     o["use_pinyin"] = use_pinyin_->isChecked();
     o["model_offset_ms"] = offset_->value();
     o["debug_logging"] = debug_log_->isChecked();
+    o["check_updates"] = update_auto_->isChecked();
+    if (last_update_check_.isValid()) o["last_update_check"] = last_update_check_.toString(Qt::ISODate);
+    if (!update_found_.isEmpty()) o["update_found"] = update_found_;
     o["cable_auto"] = cable_auto_->isChecked();
     o["model_path"] = model_path_;
     o["custom_model"] = custom_model_;
@@ -1230,7 +1314,9 @@ void LiteWindow::ScanModels() {
         e.name = k.name;
         e.size = k.size;
         e.note = k.note;
-        e.url = k.url;
+        e.urls = QString(k.url).split('|', Qt::SkipEmptyParts);
+        e.sha256 = k.sha256;
+        e.source = k.source;
         const QString bundled = paths_.exe_dir + "/models/" + e.id, downloaded = DownloadDir() + "/" + e.id;
         if (QFile::exists(bundled + "/tokens.txt")) {
             e.path = local(bundled);
@@ -1239,7 +1325,7 @@ void LiteWindow::ScanModels() {
         } else if (QFile::exists(downloaded + "/tokens.txt")) {
             e.path = local(downloaded);
             e.downloaded = true;
-        } else if (e.url.isEmpty()) {
+        } else {
             // The OBS plugin installs the same recommended model; use its copy instead of a second one.
             QDir plugins(qEnvironmentVariable("ProgramData", "C:/ProgramData") + "/obs-studio/plugins");
             for (const QString &plugin : plugins.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
@@ -1316,7 +1402,7 @@ void LiteWindow::ScanModels() {
         top->addStretch();
         v->addLayout(top);
         QString note = e.note;
-        if (!installed && e.url.isEmpty()) note += "程序文件夹里没有这个模型，重新安装程序可以恢复。";
+        if (!installed && e.urls.isEmpty()) note += "程序文件夹里没有这个模型，重新安装程序可以恢复。";
         auto *n = ui::Help(note);
         n->setContentsMargins(24, 0, 0, 0);
         v->addWidget(n);
@@ -1325,20 +1411,22 @@ void LiteWindow::ScanModels() {
         ui::SetChip(e.chip, Tone::Ok, "正在使用");
         e.chip->setVisible(in_use);
         h->addWidget(e.chip, 0, Qt::AlignVCenter);
-        const QString id = e.id, url = e.url, path = e.path;
-        if (!id.isEmpty() && download_ && download_id_ == id) {
+        const QString id = e.id, path = e.path;
+        if (!id.isEmpty() && (download_ || unpacking_) && download_id_ == id) {
             download_label_ = ui::Help(download_text_);
             h->addWidget(download_label_, 0, Qt::AlignVCenter);
-            auto *cancel = ui::Pill("取消", "sec", "s");
-            connect(cancel, &QPushButton::clicked, this, [this] {
-                if (download_) download_->abort();
-            });
-            h->addWidget(cancel, 0, Qt::AlignVCenter);
-        } else if (!installed && !url.isEmpty()) {
+            if (download_) { // no cancel while unpacking (a few seconds)
+                auto *cancel = ui::Pill("取消", "sec", "s");
+                connect(cancel, &QPushButton::clicked, this, [this] {
+                    if (download_) download_->abort();
+                });
+                h->addWidget(cancel, 0, Qt::AlignVCenter);
+            }
+        } else if (!installed && !e.urls.isEmpty()) {
             auto *get = ui::Pill("下载", "sec", "s");
-            get->setEnabled(!download_);
-            get->setToolTip(download_ ? "等正在下载的模型下完" : "从 ModelScope 下载，约 " + e.size);
-            connect(get, &QPushButton::clicked, this, [this, id, url] { DownloadModel(id, url); });
+            get->setEnabled(!download_ && !unpacking_);
+            get->setToolTip(download_ || unpacking_ ? "等正在下载的模型下完" : "从 " + e.source + " 下载，约 " + e.size);
+            connect(get, &QPushButton::clicked, this, [this, id] { DownloadModel(id); });
             h->addWidget(get, 0, Qt::AlignVCenter);
         } else if (e.downloaded) {
             auto *del = ui::Pill("删除", "sec", "s");
@@ -1360,23 +1448,42 @@ void LiteWindow::ScanModels() {
     }
 }
 
-void LiteWindow::DownloadModel(const QString &id, const QString &url) {
-    if (download_) return;
+void LiteWindow::DownloadModel(const QString &id) {
+    if (download_ || unpacking_) return;
+    for (auto &e : models_)
+        if (e.id == id && !e.urls.isEmpty()) {
+            download_id_ = id;
+            download_urls_ = e.urls;
+            download_sha256_ = e.sha256;
+            download_index_ = 0;
+            StartDownload();
+            return;
+        }
+}
+
+void LiteWindow::StartDownload() {
+    const QString url = download_urls_[download_index_];
     QDir().mkpath(DownloadDir());
-    download_file_ = new QFile(DownloadDir() + "/" + id + ".zip.part", this);
+    download_file_ = new QFile(DownloadDir() + "/" + download_id_ + ".download.part", this);
     if (!download_file_->open(QIODevice::WriteOnly)) {
         QMessageBox::warning(this, "无法下载", "不能在模型文件夹里写文件：\n" + QDir::toNativeSeparators(DownloadDir()));
         delete download_file_;
         download_file_ = nullptr;
+        ScanModels();
         return;
     }
+    delete download_hash_;
+    download_hash_ = new QCryptographicHash(QCryptographicHash::Sha256);
     QNetworkRequest request{QUrl(url)};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
     download_ = net_->get(request);
-    download_id_ = id;
     download_text_ = "正在连接…";
     CLOG(censor::kLogInfo, "[Lite] model download started: %s", url.toUtf8().constData());
-    connect(download_, &QNetworkReply::readyRead, this, [this] { download_file_->write(download_->readAll()); });
+    connect(download_, &QNetworkReply::readyRead, this, [this] {
+        const QByteArray data = download_->readAll();
+        download_file_->write(data);
+        download_hash_->addData(data);
+    });
     connect(download_, &QNetworkReply::downloadProgress, this, [this](qint64 got, qint64 total) {
         download_text_ = total > 0 ? QString("正在下载 %1%").arg(got * 100 / total)
                                    : QString("正在下载 %1 MB").arg(got / (1024 * 1024));
@@ -1388,43 +1495,94 @@ void LiteWindow::DownloadModel(const QString &id, const QString &url) {
 
 void LiteWindow::DownloadFinished() {
     QNetworkReply *reply = download_;
-    const QString id = download_id_;
-    download_file_->write(reply->readAll());
+    const QString id = download_id_, url = download_urls_[download_index_];
+    const QByteArray rest = reply->readAll();
+    download_file_->write(rest);
+    download_hash_->addData(rest);
+    const bool written = download_file_->error() == QFileDevice::NoError;
     download_file_->close();
-    const QString part = download_file_->fileName(), zip = DownloadDir() + "/" + id + ".zip";
+    const QString part = download_file_->fileName();
     download_file_->deleteLater();
     download_file_ = nullptr;
-    const auto error = reply->error();
-    const QString error_text = reply->errorString();
+    const QString sha = QString::fromLatin1(download_hash_->result().toHex());
+    auto error = reply->error();
+    QString error_text = reply->errorString();
     reply->deleteLater();
+    if (error == QNetworkReply::NoError && !written) {
+        error = QNetworkReply::UnknownContentError;
+        error_text = "写文件失败（磁盘满了？）";
+    }
+    if (error == QNetworkReply::NoError && !download_sha256_.isEmpty() && sha.compare(download_sha256_, Qt::CaseInsensitive) != 0) {
+        error = QNetworkReply::UnknownContentError;
+        error_text = "下载的文件和原文件不一样（SHA256 " + sha + "）";
+    }
     if (error != QNetworkReply::NoError) {
         download_ = nullptr;
         QFile::remove(part);
         const bool cancelled = error == QNetworkReply::OperationCanceledError;
-        CLOG(censor::kLogWarning, "[Lite] model download %s: %s", id.toUtf8().constData(),
+        CLOG(censor::kLogWarning, "[Lite] model download %s from %s: %s", id.toUtf8().constData(), url.toUtf8().constData(),
              cancelled ? "cancelled" : error_text.toUtf8().constData());
+        if (!cancelled && !quitting_ && download_index_ + 1 < download_urls_.size()) {
+            download_index_++;
+            StartDownload(); // the next address
+            return;
+        }
         if (!quitting_) ScanModels();
         if (!cancelled && !quitting_) QMessageBox::warning(this, "下载失败", "模型没有下载成功，可以稍后再试。\n" + error_text);
         return;
     }
-    QFile::remove(zip);
-    QFile::rename(part, zip);
-    InstallDownloaded(id, zip);
+    // tar.exe recognises the format by its content; keep the real extension anyway (.zip / .tar.bz2).
+    const QString name = QUrl(url).fileName();
+    const QString ext = name.endsWith(".tar.bz2", Qt::CaseInsensitive) ? QString(".tar.bz2") : QString(".zip");
+    const QString archive = DownloadDir() + "/" + id + ext;
+    CLOG(censor::kLogInfo, "[Lite] model download %s finished, SHA256 %s", id.toUtf8().constData(), sha.toUtf8().constData());
+    QFile::remove(archive);
+    QFile::rename(part, archive);
+    download_ = nullptr;
+    unpacking_ = true;
+    InstallDownloaded(id, archive);
 }
 
 void LiteWindow::InstallDownloaded(const QString &id, const QString &zip) {
-    // Windows 10 1803+ ships tar.exe (libarchive), which reads zip files. It runs inside a temporary
-    // folder next to the zip with relative names, so the user's path never passes through it.
+    // Windows 10 1803+ ships tar.exe (libarchive), which reads zip and plain tar files. It runs inside a
+    // temporary folder next to the archive with relative names, so the user's path never passes through it.
     download_text_ = "正在解压…";
     if (download_label_) download_label_->setText(download_text_);
+    if (zip.endsWith(".tar.bz2", Qt::CaseInsensitive)) {
+        // Windows 10's tar.exe has no bzip2: decompress to .tar here first (a few seconds, off the GUI thread).
+        const QString tar_file = zip.left(zip.size() - 4);
+        if (bunzip_.joinable()) bunzip_.join();
+        bunzip_cancel_ = false;
+        bunzip_ = std::thread([this, id, zip, tar_file] {
+            QString error;
+            const bool ok = Bunzip2File(zip, tar_file, bunzip_cancel_, error);
+            QFile::remove(zip);
+            QMetaObject::invokeMethod(this, [this, id, tar_file, ok, error] {
+                if (bunzip_.joinable()) bunzip_.join();
+                if (ok) {
+                    InstallDownloaded(id, tar_file);
+                    return;
+                }
+                unpacking_ = false;
+                CLOG(censor::kLogWarning, "[Lite] model %s could not be decompressed: %s", id.toUtf8().constData(),
+                     error.toUtf8().constData());
+                ScanModels();
+                QMessageBox::warning(this, "安装失败", "模型下载了，但没能解压（" + error + "）。可以稍后重新下载。");
+            }, Qt::QueuedConnection);
+        });
+        return;
+    }
     const QString temp = id + "_temp";
     QDir models(DownloadDir());
     QDir(models.filePath(temp)).removeRecursively();
     models.mkpath(temp);
     auto *tar = new QProcess(this);
+    unpack_ = tar;
+    unpack_archive_ = zip;
     tar->setWorkingDirectory(models.filePath(temp));
     auto done = [this, tar, id, zip, temp](bool started_ok) {
         tar->deleteLater();
+        unpack_ = nullptr;
         QDir models(DownloadDir());
         QString root;
         QDirIterator it(models.filePath(temp), {"tokens.txt"}, QDir::Files, QDirIterator::Subdirectories);
@@ -1437,7 +1595,7 @@ void LiteWindow::InstallDownloaded(const QString &id, const QString &zip) {
         }
         QDir(models.filePath(temp)).removeRecursively();
         QFile::remove(zip);
-        download_ = nullptr;
+        unpacking_ = false;
         CLOG(ok ? censor::kLogInfo : censor::kLogWarning, "[Lite] model %s %s", id.toUtf8().constData(),
              ok ? "installed" : "could not be unpacked");
         if (ok && !pipeline_.running()) model_path_ = QDir::toNativeSeparators(final_dir); // use what was just downloaded
@@ -1452,7 +1610,7 @@ void LiteWindow::InstallDownloaded(const QString &id, const QString &zip) {
     connect(tar, &QProcess::errorOccurred, this, [done](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) done(false);
     });
-    tar->start(qEnvironmentVariable("SystemRoot", "C:\\Windows") + "\\System32\\tar.exe", {"-xf", "../" + id + ".zip"});
+    tar->start(qEnvironmentVariable("SystemRoot", "C:\\Windows") + "\\System32\\tar.exe", {"-xf", "../" + QFileInfo(zip).fileName()});
 }
 
 void LiteWindow::DeleteModel(const QString &id, const QString &path) {
@@ -1873,7 +2031,7 @@ LiteWindow::Status LiteWindow::CurrentStatus() const {
             st.subtitle = start_error_;
         } else if (no_model) {
             st.title = "没法开始过滤";
-            st.subtitle = "找不到识别模型，选好模型后才能过滤。";
+            st.subtitle = "找不到识别模型。到“识别模型”里下载“推荐”模型后才能过滤。";
         } else {
             st.title = "未在过滤";
             st.subtitle = "现在推流软件收不到你的麦克风。开播前点“开始过滤”。";
@@ -1905,7 +2063,7 @@ LiteWindow::Status LiteWindow::CurrentStatus() const {
             break;
         }
     if (no_model && !running) {
-        st.note_tone = Tone::Bad, st.note = "找不到识别模型", st.note_action = "去选择", st.note_page = kModel;
+        st.note_tone = Tone::Bad, st.note = "找不到识别模型", st.note_action = "去下载", st.note_page = kModel;
     } else if (!start_error_.isEmpty() && !running) {
         st.note_tone = Tone::Bad, st.note = start_error_;
     } else if (first_bad) {
@@ -1936,7 +2094,7 @@ void LiteWindow::UpdateStatus() {
     if (!running && !start_error_.isEmpty())
         banner = "<b>没有开始过滤：</b>" + start_error_.toHtmlEscaped(), tone = "bad";
     else if (!running && ModelPath().isEmpty())
-        banner = QString("<b>找不到识别模型。</b> <a href='%1' style='color:#9c2113'>去识别模型里选择</a>").arg(kModel), tone = "bad";
+        banner = QString("<b>找不到识别模型。</b> <a href='%1' style='color:#9c2113'>去识别模型里下载</a>").arg(kModel), tone = "bad";
     else if (running && st.chip_tone == Tone::Wait)
         banner = "正在加载识别模型，加载完之前不会消音。", tone = "wait";
     if (banner_->text() != banner) banner_->setText(banner);
@@ -1975,6 +2133,7 @@ void LiteWindow::UpdateStatus() {
 // ============================================================================= checks
 
 void LiteWindow::UpdateChecks() {
+    if (update_state_ == UpdateState::Ready) ShowUpdateState(); // "正在过滤：…" follows the filter state
     std::vector<ui::CheckItem> items;
     auto add = [&](Tone tone, const char *group, const QString &title, const QString &detail = {},
                    const QString &action = {}, std::function<void()> act = {}, bool primary = false) {
@@ -2058,7 +2217,8 @@ void LiteWindow::UpdateChecks() {
             QStringList names;
             for (auto &o : others) names << Q(o);
             add(Tone::Bad, gCable, "别的程序也在往 CABLE Input 放声音：" + names.join("、"),
-                "这些声音会不经过滤进入直播。例如输出设成 CABLE 的 KOOK，或开着直播伴侣模式的 OBS 插件。");
+                "这些声音会不经过滤进入直播。例如输出设成 CABLE 的 KOOK，或开着直播伴侣模式的 OBS 插件"
+                "（插件推流软件选“另一台电脑”时不用 CABLE，不冲突）。");
         }
     }
     CompanionAudioState q = QueryCompanionAudio();
@@ -2088,7 +2248,7 @@ void LiteWindow::UpdateChecks() {
     for (auto &e : models_)
         if (!e.path.isEmpty() && QFileInfo(e.path) == QFileInfo(ModelPath())) model_name = e.name;
     if (ModelPath().isEmpty())
-        add(Tone::Bad, gAsr, "找不到识别模型", "到“识别模型”里选一个模型，或选择模型文件夹。", "去选择", [this] { ShowPage(kModel); }, true);
+        add(Tone::Bad, gAsr, "找不到识别模型", "到“识别模型”里下载“推荐”模型（约 130 MB），或选择模型文件夹。", "去下载", [this] { ShowPage(kModel); }, true);
     else {
         bool lag = false;
         for (auto &r : rows_) {
@@ -2150,6 +2310,180 @@ void LiteWindow::RenderChecks() {
     }
 }
 
+// ============================================================================= update check
+
+void LiteWindow::StopUpdateWork() {
+    if (update_http_) update_http_->Cancel();
+    if (update_thread_.joinable()) update_thread_.join();
+}
+
+void LiteWindow::CheckForUpdate(bool manual) {
+    // Ready: the installer is downloaded and checked; a new check would throw that away.
+    if (update_state_ != UpdateState::Idle && update_state_ != UpdateState::Available) return;
+    if (update_thread_.joinable()) update_thread_.join();
+    update_http_ = std::make_unique<lsfupdate::Http>("LiveSpeechFilter/" LSF_VERSION);
+    lsfupdate::Http *http = update_http_.get();
+    update_state_ = UpdateState::Checking;
+    ShowUpdateState();
+    CLOG(censor::kLogInfo, "[Lite] update check (%s)", manual ? "button" : "automatic");
+    update_thread_ = std::thread([this, http, manual] {
+        lsfupdate::Release release;
+        QString error;
+        const bool ok = lsfupdate::FetchLatest(*http, lsfupdate::InfoUrls(), "lite", release, error);
+        QMetaObject::invokeMethod(
+            this, [this, ok, release, error, manual] { UpdateChecked(ok, release, error, manual); }, Qt::QueuedConnection);
+    });
+}
+
+void LiteWindow::UpdateChecked(bool ok, const lsfupdate::Release &release, const QString &error, bool manual) {
+    if (update_thread_.joinable()) update_thread_.join();
+    const QString time = QDateTime::currentDateTime().toString("M月d日 HH:mm");
+    if (!ok) {
+        CLOG(censor::kLogWarning, "[Lite] update check failed: %s", error.toUtf8().constData());
+        update_state_ = update_.version.isEmpty() ? UpdateState::Idle : UpdateState::Available;
+        update_message_ = error == "已取消" ? QString("已取消检查。")
+                                            : QString("%1 没查到版本信息（%2）。").arg(time, error);
+        if (!manual) update_message_ = QString("%1 自动检查没连上，可以稍后点“检查更新”。").arg(time);
+        ShowUpdateState();
+        return;
+    }
+    last_update_check_ = QDateTime::currentDateTimeUtc();
+    const bool newer = lsfupdate::CompareVersions(release.version, LSF_VERSION) > 0;
+    update_found_ = newer ? release.version : QString();
+    SaveConfig();
+    if (newer) {
+        CLOG(censor::kLogInfo, "[Lite] update available: %s", release.version.toUtf8().constData());
+        update_ = release;
+        update_state_ = UpdateState::Available;
+        update_message_.clear();
+    } else {
+        CLOG(censor::kLogInfo, "[Lite] no update (latest %s)", release.version.toUtf8().constData());
+        update_ = lsfupdate::Release();
+        update_state_ = UpdateState::Idle;
+        update_message_ = QString("%1 检查过，已是最新版本。").arg(time);
+    }
+    ShowUpdateState();
+}
+
+void LiteWindow::DownloadUpdate() {
+    if (update_state_ != UpdateState::Available) return;
+    if (update_thread_.joinable()) update_thread_.join();
+    update_http_ = std::make_unique<lsfupdate::Http>("LiveSpeechFilter/" LSF_VERSION);
+    lsfupdate::Http *http = update_http_.get();
+    QDir(UpdateDir()).removeRecursively();
+    const QString dest = UpdateDir() + "/" + update_.file;
+    const lsfupdate::Release release = update_;
+    update_state_ = UpdateState::Downloading;
+    update_message_ = "正在连接…";
+    ShowUpdateState();
+    CLOG(censor::kLogInfo, "[Lite] update download started: %s", release.file.toUtf8().constData());
+    update_thread_ = std::thread([this, http, release, dest] {
+        int last_percent = -1;
+        auto progress = [this, &last_percent, &release](qint64 got, qint64) {
+            const int percent = (int)(got * 100 / release.size);
+            if (percent == last_percent) return;
+            last_percent = percent;
+            QMetaObject::invokeMethod(this, [this, percent] {
+                if (update_state_ != UpdateState::Downloading) return;
+                update_message_ = QString("正在下载 %1%").arg(percent);
+                ShowUpdateState();
+            }, Qt::QueuedConnection);
+        };
+        QString error;
+        const bool ok = lsfupdate::DownloadRelease(*http, release, dest, progress, error);
+        QMetaObject::invokeMethod(this, [this, ok, dest, error] { UpdateDownloaded(ok, dest, error); }, Qt::QueuedConnection);
+    });
+}
+
+void LiteWindow::UpdateDownloaded(bool ok, const QString &path, const QString &error) {
+    if (update_thread_.joinable()) update_thread_.join();
+    if (ok && !error.isEmpty()) CLOG(censor::kLogWarning, "[Lite] update download: skipped %s", error.toUtf8().constData());
+    CLOG(ok ? censor::kLogInfo : censor::kLogWarning, "[Lite] update download %s%s", ok ? "finished and checked: " : "failed: ",
+         (ok ? path : error).toUtf8().constData());
+    if (!ok) {
+        update_state_ = UpdateState::Available;
+        update_message_ = error == "已取消" ? QString("已取消下载。")
+                                            : "下载失败（" + error + "）。可以再试，或点“打开下载页”手动下载。";
+        ShowUpdateState();
+        return;
+    }
+    update_state_ = UpdateState::Ready;
+    update_file_ = path;
+    update_message_.clear();
+    ShowUpdateState();
+    if (isVisible() && !pipeline_.running()) InstallUpdate();
+}
+
+void LiteWindow::InstallUpdate() {
+    if (update_state_ != UpdateState::Ready || !QFile::exists(update_file_)) return;
+    if (pipeline_.running()) {
+        QMessageBox::information(this, "先停止过滤",
+                                 "正在过滤，现在安装会让推流软件收不到声音。下播后停止过滤，再点“安装”。");
+        return;
+    }
+    QMessageBox box(QMessageBox::Question, "安装更新",
+                    "新版本 " + update_.version + " 已下载并核对。\n\n安装时直播消音会先退出，"
+                    "安装程序结束时可以选择重新打开。设置、屏蔽词和下载的模型都会保留。\n\n现在安装？",
+                    QMessageBox::NoButton, this);
+    QPushButton *go = box.addButton("退出并安装", QMessageBox::AcceptRole);
+    box.addButton("以后再说", QMessageBox::RejectRole);
+    box.setDefaultButton(go);
+    box.exec();
+    // Filtering may have been started from the tray while the box was open.
+    if (box.clickedButton() != go || pipeline_.running() || !QFile::exists(update_file_)) return;
+    update_run_ = update_file_;
+    quitting_ = true;
+    close();
+}
+
+void LiteWindow::ShowUpdateState() {
+    if (!update_text_) return;
+    const bool running = pipeline_.running();
+    QString text;
+    switch (update_state_) {
+    case UpdateState::Idle:
+        text = !update_message_.isEmpty() ? update_message_
+               : UpdateFoundNewer()
+                   ? "上次检查发现新版本 " + update_found_.toHtmlEscaped() + "，启动后会自动重新获取；也可以点“检查更新”。"
+               : last_update_check_.isValid()
+                   ? "上次检查：" + last_update_check_.toLocalTime().toString("M月d日 HH:mm") + "，当时已是最新版本。"
+                   : QString("还没检查过。");
+        break;
+    case UpdateState::Checking:
+        text = "正在检查…";
+        break;
+    case UpdateState::Available:
+        text = QString("<b>有新版本 %1</b>（现在是 %2）").arg(update_.version.toHtmlEscaped(), LSF_VERSION);
+        if (!update_.notes.isEmpty()) text += "<br>" + update_.notes.toHtmlEscaped().replace("\n", "<br>");
+        if (!update_message_.isEmpty()) text += "<br>" + update_message_.toHtmlEscaped();
+        break;
+    case UpdateState::Downloading:
+        text = QString("新版本 %1：%2").arg(update_.version.toHtmlEscaped(), update_message_.toHtmlEscaped());
+        break;
+    case UpdateState::Ready:
+        text = QString("新版本 %1 已下载，大小和 SHA256 都核对过。").arg(update_.version.toHtmlEscaped());
+        if (running) text += "<br>正在过滤：下播后停止过滤，再点“安装”。";
+        break;
+    }
+    update_text_->setTextFormat(Qt::RichText);
+    if (update_text_->text() != text) update_text_->setText(text);
+    update_check_->setVisible(update_state_ != UpdateState::Downloading && update_state_ != UpdateState::Ready);
+    update_check_->setEnabled(update_state_ != UpdateState::Checking);
+    update_get_->setVisible(update_state_ == UpdateState::Available || update_state_ == UpdateState::Ready);
+    update_get_->setText(update_state_ == UpdateState::Ready
+                             ? QString("安装")
+                             : QString("下载更新（%1 MB）").arg((update_.size + 512 * 1024) / (1024 * 1024)));
+    update_cancel_->setVisible(update_state_ == UpdateState::Checking || update_state_ == UpdateState::Downloading);
+    update_page_->setVisible(update_state_ == UpdateState::Available);
+    const bool newer = update_state_ == UpdateState::Available || update_state_ == UpdateState::Downloading ||
+                       update_state_ == UpdateState::Ready;
+    support_badge_->setVisible(newer);
+    if (update_action_) {
+        update_action_->setVisible(newer);
+        update_action_->setText("有新版本 " + update_.version + "…");
+    }
+}
+
 // ============================================================================= window
 
 void LiteWindow::closeEvent(QCloseEvent *event) {
@@ -2169,6 +2503,16 @@ void LiteWindow::closeEvent(QCloseEvent *event) {
     pipeline_.Stop();
     DisableCableIfAuto();
     SaveConfig();
+    StopUpdateWork();
+    if (!update_run_.isEmpty()) {
+        // The installer waits for the program to quit (AppMutex); release the mutex now, the process
+        // is gone before setup copies files.
+        ReleaseRunningMutex();
+        const HINSTANCE r = ShellExecuteW(nullptr, L"open", (const wchar_t *)update_run_.utf16(), nullptr,
+                                          (const wchar_t *)QFileInfo(update_run_).absolutePath().utf16(), SW_SHOWNORMAL);
+        CLOG((INT_PTR)r > 32 ? censor::kLogInfo : censor::kLogWarning, "[Lite] update installer %s: %s",
+             (INT_PTR)r > 32 ? "started" : "could not be started", update_run_.toUtf8().constData());
+    }
     event->accept();
     QApplication::quit();
 }

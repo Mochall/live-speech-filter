@@ -1,0 +1,26 @@
+{
+ "format": 1,
+ "lite": {
+  "version": "0.10.3",
+  "notes": "检查更新（每天最多一次，可以关掉），有新版本时在“支持项目”页下载安装。\n双机推流的提示和设置清单。",
+  "page": "https://github.com/Mochall/live-speech-filter/releases/tag/v0.10.3",
+  "file": "LiveSpeechFilter-0.10.3-NoModel-Windows-x64.exe",
+  "size": 15917442,
+  "sha256": "747119D44D7308EE18B7DC389C12E654A95DF909058B43C9FD6941F836A264DE",
+  "urls": [
+   "https://gitee.com/mochall/live-speech-filter/releases/download/v0.10.3/LiveSpeechFilter-0.10.3-NoModel-Windows-x64.exe",
+   "https://github.com/Mochall/live-speech-filter/releases/download/v0.10.3/LiveSpeechFilter-0.10.3-NoModel-Windows-x64.exe"
+  ]
+ },
+ "plugin": {
+  "version": "0.10.3",
+  "notes": "检查更新（每天最多一次，可以关掉）；双机推流：伴侣模式里选“推流软件在另一台电脑”。\n替换音加动物叫声和试听，高级里可选识别路数。",
+  "page": "https://github.com/Mochall/live-speech-filter/releases/tag/v0.10.3",
+  "file": "LiveSpeechFilter-OBS-Plugin-0.10.3-Windows-x64.exe",
+  "size": 147345481,
+  "sha256": "9BFE7FA16A7CC500A62813D1DFE8050265879F73422EC28AA782BBC20FD1D949",
+  "urls": [
+   "https://github.com/Mochall/live-speech-filter/releases/download/v0.10.3/LiveSpeechFilter-OBS-Plugin-0.10.3-Windows-x64.exe"
+  ]
+ }
+}

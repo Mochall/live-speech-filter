@@ -43,6 +43,13 @@ QString Arg(const QStringList &args, const QString &name) {
 
 } // namespace
 
+static HANDLE g_running_mutex = nullptr;
+
+void ReleaseRunningMutex() {
+    if (g_running_mutex) CloseHandle(g_running_mutex);
+    g_running_mutex = nullptr;
+}
+
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("LiveSpeechFilter");
@@ -51,7 +58,7 @@ int main(int argc, char **argv) {
 
     // Lets the installer and uninstaller see that the program is running (Inno Setup AppMutex) and
     // ask to quit it first; never checked by the program itself. Kept open until exit.
-    CreateMutexW(nullptr, FALSE, L"LiveSpeechFilter.Running");
+    g_running_mutex = CreateMutexW(nullptr, FALSE, L"LiveSpeechFilter.Running");
 
     const QStringList args = QApplication::arguments();
     const QString appdata = qEnvironmentVariable("APPDATA");
